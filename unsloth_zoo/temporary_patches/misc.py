@@ -569,3 +569,72 @@ def patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward():
     patch_function(transformers.models.granitemoehybrid.modeling_granitemoehybrid.GraniteMoeHybridMambaLayer, "cuda_kernels_forward", cuda_kernels_forward)
 pass
 TEMPORARY_PATCHES.append(patch_GraniteMoeHybridMambaLayer_cuda_kernels_forward)
+
+
+def patch_GraniteMoeHybridMoE_init():
+    try:
+        import transformers.models.granitemoehybrid.modeling_granitemoehybrid
+        from transformers.models.granitemoehybrid.modeling_granitemoehybrid import (
+            GraniteMoeHybridConfig,
+            ACT2FN,
+            GraniteMoeHybridTopKGating,
+        )
+    except:
+        return
+    try:
+        from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm
+    except:
+        return
+    
+    class GroupedGemmExperts(nn.Module):
+        def __init__(self, num_experts: int, input_size: int, output_size: int, top_k: int) -> None:
+            super().__init__()
+            self.weight   = nn.Parameter(torch.empty(num_experts, output_size, input_size))
+            self.num_experts = num_experts
+            self.input_size = input_size
+            self.output_size = output_size
+            self.top_k    = top_k
+            self.autotune = True
+
+        @torch.autocast('cuda', enabled=False)
+        def forward(self, x: torch.Tensor, expert_size: list[int]) -> torch.Tensor:
+            if x.numel() == 0:
+                return x.new_empty(0, self.weight.size(1))
+
+            m_sizes = torch.as_tensor(expert_size, device=x.device, dtype=torch.int32)
+
+            y = grouped_gemm(
+                X=x,
+                W=self.weight,
+                m_sizes=m_sizes,
+                topk=self.top_k,
+                permute_x=False,
+                permute_y=False,
+                autotune=self.autotune,
+                kernel_config_fwd=None,
+            )
+            return y
+
+
+    def __init__(self, config: GraniteMoeHybridConfig):
+        super().__init__()
+
+        self.input_size = config.hidden_size
+        self.hidden_size = config.intermediate_size
+        self.activation = ACT2FN[config.hidden_act]
+        self.input_linear = GroupedGemmExperts(
+            config.num_local_experts, self.input_size, self.hidden_size * 2
+        )
+        self.output_linear = GroupedGemmExperts(
+            config.num_local_experts, self.hidden_size, self.input_size
+        )
+
+        self.router = GraniteMoeHybridTopKGating(
+            input_size=self.input_size,
+            num_experts=config.num_local_experts,
+            top_k=config.num_experts_per_tok,
+        )
+
+    patch_function(transformers.models.granitemoehybrid.modeling_granitemoehybrid.GraniteMoeHybridMoE, "__init__", __init__)
+pass
+TEMPORARY_PATCHES.append(patch_GraniteMoeHybridMoE_init)
