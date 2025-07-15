@@ -595,7 +595,7 @@ def patch_GraniteMoeHybridMoE_init():
     
     class GroupedGemmExperts(nn.Module):
         def __init__(self, num_experts: int, input_size: int, output_size: int, top_k: int) -> None:
-            super(GraniteMoeHybridMoE, self).__init__()
+            super(GroupedGemmExperts, self).__init__()
             self.weight   = nn.Parameter(torch.empty(num_experts, output_size, input_size))
             self.num_experts = num_experts
             self.input_size = input_size
@@ -629,7 +629,7 @@ def patch_GraniteMoeHybridMoE_init():
 
 
     def __init__(self, config: GraniteMoeHybridConfig):
-        super().__init__()
+        super(GraniteMoeHybridMoE, self).__init__()
 
         self.input_size = config.hidden_size
         self.hidden_size = config.intermediate_size
