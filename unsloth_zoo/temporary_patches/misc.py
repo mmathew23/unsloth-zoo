@@ -583,7 +583,8 @@ def patch_GraniteMoeHybridMoE_init():
         return
     try:
         from unsloth.kernels.moe.grouped_gemm.interface import grouped_gemm
-    except:
+    except Exception as e:
+        print(f"GroupedGemmExperts not found, skipping patch_GraniteMoeHybridMoE_init: {e}")
         return
     
     class GroupedGemmExperts(nn.Module):
