@@ -368,7 +368,8 @@ def get_cuda_kernels_source(module, source):
     disable = False
     if "cuda_kernels_forward" in source:
         disable = True
-    if module == "FalconH1Mixer" and OLD_CUDA_ARCH_VERSION:
+    major, minor = torch.cuda.get_device_capability()
+    if module == "FalconH1Mixer" and (major <= 7 and minor <= 5):
         # remove the cuda_kernels_forward call
         try:
             new_source = source
