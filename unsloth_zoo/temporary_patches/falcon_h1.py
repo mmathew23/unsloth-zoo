@@ -83,7 +83,7 @@ def patch_FalconH1Mixer_torch_forward():
         # D_residual = self.D[..., None] * pad_tensor_by_size(hidden_states, pad_size)
         pad_size = (-seq_len) % self.chunk_size          # SymInt 0 ≤ pad < chunk
         pad = hidden_states.new_zeros(
-            batch_size, pad_size, hidden_states.shape[-1]
+            batch_size, pad_size, hidden_states.shape[-2], hidden_states.shape[-1]
         )
         hidden_states = torch.cat((hidden_states, pad), dim=1)
         D_residual = self.D[..., None] * hidden_states
