@@ -123,7 +123,7 @@ def patch_FalconH1Mixer_torch_forward():
 
         return y, ssm_state
 
-    # 3’) SSM – streaming --------------------------------------------------
+
     def _ssm_gen(self, H, B, C, dt, prev_state, batch_size):
         A = -torch.exp(self.A_log.float())
         cache_device = prev_state.device
@@ -187,10 +187,8 @@ def patch_FalconH1Mixer_torch_forward():
             and seq_len == 1 and cache_position is not None and cache_position[0] > 0
         )
 
-        # ---------- 1. projection (always the same) -----------------------
         gate, hidden_BC, dt = _projection(self, input_states, attention_mask)
 
-        # ---------- 2. depth‑wise causal conv ----------------------------
         if streaming:
             hidden_BC, new_conv = _conv_gen(self, hidden_BC, cache_params.conv_states[self.layer_idx])
             if cache_params is not None:
@@ -200,7 +198,6 @@ def patch_FalconH1Mixer_torch_forward():
             if cache_params is not None:
                 cache_params.conv_states[self.layer_idx].copy_(new_conv)
 
-        # split into H, B, C
         hidden, B, C = torch.split(
             hidden_BC,
             [self.intermediate_size,
@@ -209,7 +206,6 @@ def patch_FalconH1Mixer_torch_forward():
             dim=-1,
         )
 
-        # ---------- 3. state‑space kernel --------------------------------
         if streaming:
             y, new_ssm = _ssm_gen(self, hidden, B, C, dt,
                                        cache_params.ssm_states[self.layer_idx])
