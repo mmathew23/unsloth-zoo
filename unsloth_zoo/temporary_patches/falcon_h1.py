@@ -219,7 +219,7 @@ def patch_FalconH1Mixer_torch_forward():
         return _post(self, y, gate)
 
     return patch_function(
-        "FalconH1Mixer", "torch_forward", torch_forward,
+        transformers.models.falcon_h1.modeling_falcon_h1.FalconH1Mixer, "torch_forward", torch_forward,
     )
 pass
 
