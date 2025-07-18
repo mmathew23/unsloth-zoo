@@ -47,8 +47,7 @@ def patch_FalconH1Mixer_torch_forward():
     except Exception as e:
         return raise_error("FalconH1Mixer.torch_forward", e)
 
-    def _projection(self, x, attn_mask):
-        x = apply_mask_to_padding_states(x, attn_mask).mul_(self.ssm_in_multiplier)
+    def _projection(self, x):
         proj = self.in_proj(x) * self.mup_vector
         return proj.split(
             [self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
@@ -58,11 +57,7 @@ def patch_FalconH1Mixer_torch_forward():
         t = self.act(
             self.conv1d(hidden_BC.transpose(1, 2))[..., :seq_len].transpose(1, 2)
         )
-
-        conv_state_full = nn.functional.pad(
-            hidden_BC.transpose(1, 2), (self.conv_kernel_size - seq_len, 0)
-        )
-        return t, conv_state_full  # output, new_conv_state
+        return t
 
     def _conv_gen(self, hidden_BC, prev_state):
         # prev_state: [bs, channels, k]  (already on correct device)
@@ -73,18 +68,25 @@ def patch_FalconH1Mixer_torch_forward():
             out = out + self.conv1d.bias
         return self.act(out.unsqueeze(1)), rolled
 
-    def _ssm_train(self, H, B, C, dt, seq_len: int, batch_size: int):
+    def _ssm_train(self, H, B, C, dt, batch_size: int):
         dt = nn.functional.softplus(dt + self.dt_bias)
         dt = torch.clamp(dt, self.time_step_limit[0], self.time_step_limit[1])
 
+        seq_len = H.shape[1]
         hidden_states = H.reshape(batch_size, seq_len, -1, self.head_dim).float()
         B = B.reshape(batch_size, seq_len, -1, self.ssm_state_size).float()
         C = C.reshape(batch_size, seq_len, -1, self.ssm_state_size).float()
-        B = B.repeat_interleave(self.num_heads // self.n_groups, dim=2, output_size=self.num_heads)
-        C = C.repeat_interleave(self.num_heads // self.n_groups, dim=2, output_size=self.num_heads)
+        B = B.repeat_interleave(self.num_heads // self.n_groups, dim=2)
+        C = C.repeat_interleave(self.num_heads // self.n_groups, dim=2)
 
-        pad_size   = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
-        D_residual = self.D[..., None] * pad_tensor_by_size(hidden_states, pad_size)
+        # pad_size   = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
+        # D_residual = self.D[..., None] * pad_tensor_by_size(hidden_states, pad_size)
+        pad_size = (-seq_len) % self.chunk_size          # SymInt 0 ≤ pad < chunk
+        pad = hidden_states.new_zeros(
+            batch_size, pad_size, hidden_states.shape[-1]
+        )
+        hidden_states = torch.cat((hidden_states, pad), dim=1)
+        D_residual = self.D[..., None] * hidden_states
 
         hidden_states = hidden_states * dt[..., None]
         A = (-torch.exp(self.A_log.float())).to(hidden_states.dtype) * dt
@@ -117,8 +119,8 @@ def patch_FalconH1Mixer_torch_forward():
         y = Y_diag + Y_off
         y = y.reshape(batch_size, -1, self.num_heads, self.head_dim)
         y = y + D_residual
-        if pad_size > 0:
-            y = y[:, :seq_len, :, :]
+
+        y = y[:, :seq_len, :, :]
         y = y.reshape(batch_size, seq_len, -1)
 
         return y, ssm_state
@@ -187,14 +189,18 @@ def patch_FalconH1Mixer_torch_forward():
             and seq_len == 1 and cache_position is not None and cache_position[0] > 0
         )
 
-        gate, hidden_BC, dt = _projection(self, input_states, attention_mask)
+        input_states = apply_mask_to_padding_states(input_states, attention_mask).mul_(self.ssm_in_multiplier)
+        gate, hidden_BC, dt = _projection(self, input_states)
 
         if streaming:
             hidden_BC, new_conv = _conv_gen(self, hidden_BC, cache_params.conv_states[self.layer_idx])
             if cache_params is not None:
                 cache_params.conv_states[self.layer_idx].copy_(new_conv)
         else:
-            hidden_BC, new_conv = _conv_train(self, hidden_BC, seq_len)
+            hidden_BC = _conv_train(self, hidden_BC, seq_len)
+            new_conv = nn.functional.pad(
+                hidden_BC.transpose(1, 2), (self.conv_kernel_size - seq_len, 0)
+            )
             if cache_params is not None:
                 cache_params.conv_states[self.layer_idx].copy_(new_conv)
 
@@ -212,7 +218,7 @@ def patch_FalconH1Mixer_torch_forward():
             if cache_params is not None:
                 cache_params.ssm_states[self.layer_idx].copy_(new_ssm)
         else:
-            y, new_ssm = _ssm_train(self, hidden, B, C, dt, seq_len, bs)
+            y, new_ssm = _ssm_train(self, hidden, B, C, dt, bs)
             if cache_params is not None:
                 cache_params.ssm_states[self.layer_idx].copy_(new_ssm)
 
