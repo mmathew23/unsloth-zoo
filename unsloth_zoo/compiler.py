@@ -1798,6 +1798,31 @@ def compile_causal_conv1d():
         return False
 pass
 
+def compile_mamba_ssm():
+    # For Liquid, Falcon and other Mamba type models
+    # We disable compiling on them!
+    try:
+        import mamba_ssm
+
+        mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined        = \
+            torch.compiler.disable(
+                mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined,
+                recursive = True
+            )
+        mamba_ssm.ops.triton.ssd_combined.mamba_split_conv1d_scan_combined = \
+            torch.compiler.disable(
+               mamba_ssm.ops.triton.ssd_combined.mamba_split_conv1d_scan_combined,
+               recursive = True
+            )
+        mamba_ssm.ops.triton.selective_state_update.selective_state_update = \
+            torch.compiler.disable(
+                mamba_ssm.ops.triton.selective_state_update.selective_state_update,
+                recursive = True
+            )
+        return True
+    except:
+        return False
+pass
 
 # if module ends with any of these, disable compile
 DISABLE_COMPILE_MODULES = [
@@ -1899,6 +1924,7 @@ def unsloth_compile_transformers(
 
     # Disable compiling mamba type models
     has_causal_conv1d = compile_causal_conv1d()
+    has_mamba_ssm = compile_mamba_ssm()
 
     # Return logits
     UNSLOTH_RETURN_LOGITS = "0" if not return_logits else "1"
@@ -1937,6 +1963,17 @@ def unsloth_compile_transformers(
         print(
             "**********\n"\
             "Unsloth: Please install `causal_conv1d` to speed up Mamba training via `pip install causal_conv1d`\n"\
+            "If you don't, training will still work, just might be slower for Mamba type models.\n"\
+            "**********\n"
+        )
+    pass
+
+    # If mamba type, but no fast causal functions, warn!
+    if not has_mamba_ssm and \
+        ("mamba_chunk_scan_combined" in full_source or "mamba_split_conv1d_scan_combined" in full_source or "selective_state_update" in full_source):
+        print(
+            "**********\n"\
+            "Unsloth: Please install `mamba_ssm` to speed up Mamba training via `pip install mamba_ssm`\n"\
             "If you don't, training will still work, just might be slower for Mamba type models.\n"\
             "**********\n"
         )
