@@ -1784,17 +1784,27 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
 pass
 
 
-def compile_causal_conv1d():
+def compile_causal_conv1d(compile_ref, UNSLOTH_ENABLE_LOGGING, torch_compile_options = None):
     # For Liquid, Falcon and other Mamba type models
     # We disable compiling on them!
     try:
         import causal_conv1d
-        causal_conv1d.causal_conv1d_fn     = \
-            torch.compiler.disable(causal_conv1d.causal_conv1d_fn,     recursive = True)
-        causal_conv1d.causal_conv1d_update = \
-            torch.compiler.disable(causal_conv1d.causal_conv1d_update, recursive = True)
+        if compile_ref:
+            if UNSLOTH_ENABLE_LOGGING:
+                print(f"Unsloth: Compiling causal_conv1d with reference functions")
+            causal_conv1d.causal_conv1d_fn     = \
+                torch.compile(causal_conv1d.causal_conv1d_ref, fullgraph = True, dynamic = True, options = torch_compile_options)
+            causal_conv1d.causal_conv1d_update = \
+                torch.compile(causal_conv1d.causal_conv1d_update_ref, fullgraph = True, dynamic = True, options = torch_compile_options)
+        else:
+            causal_conv1d.causal_conv1d_fn     = \
+                torch.compiler.disable(causal_conv1d.causal_conv1d_fn,     recursive = True)
+            causal_conv1d.causal_conv1d_update = \
+                torch.compiler.disable(causal_conv1d.causal_conv1d_update, recursive = True)
         return True
     except:
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Failed compiling causal_conv1d")
         return False
 pass
 
@@ -1923,7 +1933,7 @@ def unsloth_compile_transformers(
     compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options)
 
     # Disable compiling mamba type models
-    has_causal_conv1d = compile_causal_conv1d()
+    has_causal_conv1d = compile_causal_conv1d(True if model_type == "falcon_h1" else False, UNSLOTH_ENABLE_LOGGING, torch_compile_options)
     has_mamba_ssm = compile_mamba_ssm()
 
     # Return logits
