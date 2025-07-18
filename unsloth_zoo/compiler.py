@@ -1784,23 +1784,17 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
 pass
 
 
-def compile_causal_conv1d(compile_ref, UNSLOTH_ENABLE_LOGGING, torch_compile_options = None):
+def compile_causal_conv1d(UNSLOTH_ENABLE_LOGGING):
     # For Liquid, Falcon and other Mamba type models
     # We disable compiling on them!
     try:
         import causal_conv1d
-        if compile_ref:
-            if UNSLOTH_ENABLE_LOGGING:
-                print(f"Unsloth: Compiling causal_conv1d with reference functions")
-            causal_conv1d.causal_conv1d_fn     = \
-                torch.compile(causal_conv1d.causal_conv1d_interface.causal_conv1d_ref, fullgraph = True, dynamic = True, options = torch_compile_options)
-            causal_conv1d.causal_conv1d_update = \
-                torch.compile(causal_conv1d.causal_conv1d_interface.causal_conv1d_update_ref, fullgraph = True, dynamic = True, options = torch_compile_options)
-        else:
-            causal_conv1d.causal_conv1d_fn     = \
-                torch.compiler.disable(causal_conv1d.causal_conv1d_fn,     recursive = True)
-            causal_conv1d.causal_conv1d_update = \
-                torch.compiler.disable(causal_conv1d.causal_conv1d_update, recursive = True)
+        causal_conv1d.causal_conv1d_fn     = \
+            torch.compiler.disable(causal_conv1d.causal_conv1d_fn,     recursive = True)
+        causal_conv1d.causal_conv1d_update = \
+            torch.compiler.disable(causal_conv1d.causal_conv1d_update, recursive = True)
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Disabled compiling causal_conv1d")
         return True
     except Exception as e:
         print(e, str(e))
@@ -1809,47 +1803,32 @@ def compile_causal_conv1d(compile_ref, UNSLOTH_ENABLE_LOGGING, torch_compile_opt
         return False
 pass
 
-def compile_mamba_ssm(compile_ref, UNSLOTH_ENABLE_LOGGING, torch_compile_options = None):
+def compile_mamba_ssm(UNSLOTH_ENABLE_LOGGING):
     # For Liquid, Falcon and other Mamba type models
     # We disable compiling on them!
     try:
         import mamba_ssm
-        if compile_ref:
-            if UNSLOTH_ENABLE_LOGGING:
-                print(f"Unsloth: Compiling mamba_ssm with reference functions")
-            mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined        = \
-                torch.compile(
-                    mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined,
-                    fullgraph = True, dynamic = True, options = torch_compile_options
-                )
-            mamba_ssm.ops.triton.ssd_combined.mamba_split_conv1d_scan_combined = \
-                torch.compile(
-                    mamba_ssm.ops.triton.ssd_combined.mamba_split_conv1d_scan_combined_ref,
-                    fullgraph = True, dynamic = True, options = torch_compile_options
-                )
-            mamba_ssm.ops.triton.selective_state_update.selective_state_update = \
-                torch.compile(
-                    mamba_ssm.ops.triton.selective_state_update.selective_state_update_ref,
-                    fullgraph = True, dynamic = True, options = torch_compile_options
-                )
-        else:
-            mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined        = \
-                torch.compiler.disable(
-                    mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined,
-                    recursive = True
-                )
-            mamba_ssm.ops.triton.ssd_combined.mamba_split_conv1d_scan_combined = \
-                torch.compiler.disable(
-                mamba_ssm.ops.triton.ssd_combined.mamba_split_conv1d_scan_combined,
+        mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined        = \
+            torch.compiler.disable(
+                mamba_ssm.ops.triton.ssd_combined.mamba_chunk_scan_combined,
                 recursive = True
-                )
-            mamba_ssm.ops.triton.selective_state_update.selective_state_update = \
-                torch.compiler.disable(
-                    mamba_ssm.ops.triton.selective_state_update.selective_state_update,
-                    recursive = True
-                )
+            )
+        mamba_ssm.ops.triton.ssd_combined.mamba_split_conv1d_scan_combined = \
+            torch.compiler.disable(
+            mamba_ssm.ops.triton.ssd_combined.mamba_split_conv1d_scan_combined,
+            recursive = True
+            )
+        mamba_ssm.ops.triton.selective_state_update.selective_state_update = \
+            torch.compiler.disable(
+                mamba_ssm.ops.triton.selective_state_update.selective_state_update,
+                recursive = True
+            )
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Disabled compiling mamba_ssm")
         return True
     except:
+        if UNSLOTH_ENABLE_LOGGING:
+            print(f"Unsloth: Failed compiling mamba_ssm")
         return False
 pass
 
@@ -1952,8 +1931,8 @@ def unsloth_compile_transformers(
     compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options)
 
     # Disable compiling mamba type models
-    has_causal_conv1d = compile_causal_conv1d(False, UNSLOTH_ENABLE_LOGGING, torch_compile_options)
-    has_mamba_ssm = compile_mamba_ssm(False, UNSLOTH_ENABLE_LOGGING, torch_compile_options)
+    has_causal_conv1d = compile_causal_conv1d(UNSLOTH_ENABLE_LOGGING)
+    has_mamba_ssm = compile_mamba_ssm(UNSLOTH_ENABLE_LOGGING)
 
     # Return logits
     UNSLOTH_RETURN_LOGITS = "0" if not return_logits else "1"
