@@ -85,8 +85,8 @@ def patch_FalconH1Mixer_torch_forward():
         pad = hidden_states.new_zeros(
             batch_size, pad_size, hidden_states.shape[-2], hidden_states.shape[-1]
         )
-        hidden_states = torch.cat((hidden_states, pad), dim=1)
-        D_residual = self.D[..., None] * hidden_states
+        hidden_states_padded = torch.cat((hidden_states, pad), dim=1)
+        D_residual = self.D[..., None] * hidden_states_padded
 
         hidden_states = hidden_states * dt[..., None]
         A = (-torch.exp(self.A_log.float())).to(hidden_states.dtype) * dt
