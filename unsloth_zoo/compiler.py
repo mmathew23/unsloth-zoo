@@ -341,7 +341,7 @@ pass
 class RemoveCudaFastPath(ast.NodeTransformer):
     """Strip the fast‑path `if … return self.cuda_kernels_forward(…)`."""
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        if node.name != "forward":
+        if not node.name.endswith("_forward"):
             return node
 
         pruned_body = []
