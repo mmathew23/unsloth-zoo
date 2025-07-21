@@ -299,6 +299,7 @@ def patch_FalconH1Mixer_torch_forward():
         # decay from previous chunk boundary -------------------------------
         padded_A_cumsum = torch.nn.functional.pad(A_cumsum[:, :, :, -1], (1,0))
         decay_chunk = torch.exp(segment_sum(padded_A_cumsum)).transpose(1, 3)
+        print(decay_chunk.shape, states.shape, padded_A_cumsum.shape, A_cumsum.shape)
         new_states = (decay_chunk[..., None, None] * states[:, :, None, ...]).sum(dim=1)
         states, ssm_state = new_states[:, :-1], new_states[:, -1]
 
@@ -536,11 +537,12 @@ def patch_FalconH1Mixer_torch_forward():
             hs, A, B, C = [reshape_into_chunks(t, pad_size, self.chunk_size)
                                 for t in (hs, A, B, C)]
 
-
+            print(hs.shape, A.shape, B.shape, C.shape)
             # ---- 4. compiled (B) intra‑chunk SSM -----------------------------
             Y_diag, states_chunks, A_cumsum = _kern_intra_chunk(
                 self, hs, B, C, A, dt_scaled
             )                                    # Y_diag: (B,C,Lc,H,D)
+            print(Y_diag.shape, states_chunks.shape, A_cumsum.shape)
 
             # ---- 5. cache / previous states (still eager) --------------------
             if use_precomputed_states:
@@ -548,6 +550,7 @@ def patch_FalconH1Mixer_torch_forward():
             else:
                 prev_states = torch.zeros_like(states_chunks[:, :1])
             states_chunks = torch.cat([prev_states, states_chunks], dim=1)  # prepend
+            print(states_chunks.shape)
 
             # ---- 6. compiled (C) inter‑chunk + output ------------------------
             Y_off, ssm_state = _kern_inter_chunk(
