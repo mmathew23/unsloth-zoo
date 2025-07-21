@@ -337,53 +337,22 @@ def get_mask_functions():
         return []
 pass
 
-# helper to remove fast path option for certain models on sm 75 or lower
-class RemoveCudaFastPath(ast.NodeTransformer):
-    """Strip the fast‑path `if … return self.cuda_kernels_forward(…)`."""
-    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-        if not node.name.endswith("_forward"):
-            return node
 
-        pruned_body = []
-        for stmt in node.body:
-            # Detect an `if` whose body immediately returns cuda_kernels_forward
-            if (isinstance(stmt, ast.If)
-                    and any(
-                        isinstance(s, ast.Return)
-                        and isinstance(s.value, ast.Call)
-                        and getattr(s.value.func, "attr", "") == "cuda_kernels_forward"
-                        for s in stmt.body
-                    )):
-                # Skip this whole `if` block
-                continue
-            pruned_body.append(stmt)
-
-        node.body = pruned_body
-        return node
-    pass
-pass
-
-# had cuda_kernels source and disable
 def get_cuda_kernels_source(module, source):
     disable = False
     if "cuda_kernels_forward" in source:
         disable = True
     major, minor = torch.cuda.get_device_capability()
     if module == "FalconH1Mixer" and (major <= 7 and minor <= 5):
-        # remove the cuda_kernels_forward call
         try:
             new_source = source
-            # tree = ast.parse(new_source)
-            # tree = RemoveCudaFastPath().visit(tree)
-            # ast.fix_missing_locations(tree)
-            # new_source = ast.unparse(tree)
 
             # train with compiled torch_forward, but inference with cuda_kernels_forward
             new_source = new_source.replace(
                 'if is_fast_path_available and "cuda" in self.in_proj.weight.device.type:',
                 'if is_fast_path_available and "cuda" in self.in_proj.weight.device.type and not self.training:'
             )
-                                            
+
         except Exception as e:
             if os.getenv("UNSLOTH_ENABLE_LOGGING", "0") == "1":
                 print(f"Unsloth: Error removing cuda_kernels_forward for {module}: {e}")
