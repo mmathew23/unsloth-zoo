@@ -236,52 +236,93 @@ def patch_FalconH1Mixer_torch_forward():
         hidden_states_B_C = self.act(self.conv1d(hidden_states_B_C.transpose(1, 2))[..., :seq_len].transpose(1, 2))
         return hidden_states_B_C
 
-    def _ssm(self, hidden_states, B, C, dt, pad_size):
-        dt = torch.clamp(
-            torch.nn.functional.softplus(dt + self.dt_bias),
-            self.time_step_limit[0],
-            self.time_step_limit[1],
-        )
+    def _kern_dt_and_A(self, dt, A_log, time_lim):
+        """
+        dt:  (B, C, Lc, 1)   after broadcasting into chunk shape
+        A_log: (H,)          constant
+        Return:
+          dt_scaled  (B, C, Lc, 1)
+          A_scaled   (B, C, Lc, H)
+        """
+        dt = torch.nn.functional.softplus(dt + self.dt_bias)
+        dt = torch.clamp(dt, time_lim[0], time_lim[1])
+        A  = -torch.exp(A_log).to(dt.dtype) * dt                # broadcast over (B,C,L)
+        return dt, A
 
-        bs, seq_len, _ = hidden_states.shape
-        # ---- Tensorised padding math ----------------------------------------
-        seq_len_t = torch.tensor(seq_len, device=hidden_states.device)
+    def _kern_intra_chunk(self, hs, B, C, A, dt):
+        """
+        Inputs all shaped (B, C, Lc, H, ?):
+          hs: (B,C,Lc,H,D)
+          B : (B,C,Lc,H,S)   S = ssm_state_size
+          C : (B,C,Lc,H,S)
+          A : (B,C,Lc,H)     after permute -> (B,H,C,Lc)
+          dt: (B,C,Lc,1)
+        Returns:
+          Y_diag  (B,C,Lc,H,D)
+          states  (B,C,H,S)
+          A_cum   (B,H,C,Lc)
+        """
+        B  = B * dt                                             # discretise x
+        hs = hs * dt
 
-        # dtype is FP32 from here onward (or AMP autocast) ---------------------
-        hs = hidden_states.reshape(bs, seq_len, -1, self.head_dim)
-        B  = B.reshape(bs, seq_len, -1, self.ssm_state_size)
-        C  = C.reshape(bs, seq_len, -1, self.ssm_state_size)
+        # rearrange A  ------------------------------------------------------
+        A = A.permute(0, 3, 1, 2)                               # (B,H,C,L)
+        A_cumsum = torch.cumsum(A, dim=-1)                      # for later
 
-        heads_per_group = self.num_heads // self.n_groups
-        B = B.repeat_interleave(heads_per_group, dim=2)
-        C = C.repeat_interleave(heads_per_group, dim=2)
+        # ----------- diagonal blocks (mask) -------------------------------
+        L = torch.exp(A_cumsum[..., -1:] - A_cumsum)            # segment_sum equiv
 
-        D_residual = self.D[..., None] * torch.nn.functional.pad(hs, (0, 0, 0, pad_size), value=0)
+        G = (C[:, :, :, None] * B[:, :, None]).sum(dim=-1)      # (B,C,Lc,H)
+        M = (G[..., None] * L.permute(0, 2, 3, 1)[..., None]).sum(dim=-1)
+        Y_diag = (M[..., None] * hs[:, :, None]).sum(dim=3)     # (B,C,Lc,H,D)
 
-        dt_expanded = dt[..., None]
-        A = (-torch.exp(self.A_log)) * dt_expanded     # all FP32
+        # ------------- decay states inside chunk --------------------------
+        decay_states = torch.exp(A_cumsum[..., -1:] - A_cumsum)           # (B,H,C,L)
+        B_decay = B * decay_states.permute(0, 2, 3, 1)[..., None]         # align dims
+        states = (B_decay[..., None, :] * hs[..., None]).sum(dim=2)       # (B,C,H,S)
 
-        hs   = hs * dt_expanded
-        A, B, C, hs = [reshape_into_chunks(t, pad_size, self.chunk_size) for t in (A, B, C, hs)]
+        return Y_diag, states, A_cumsum          # keep A_cumsum for inter‑chunk
 
-        # --- remaining math exactly as before, now fully tensorised ----------
-        A = A.permute(0, 3, 1, 2)
-        A_cumsum = torch.cumsum(A, dim=-1)
-        L  = torch.exp(segment_sum(A))
+    def _kern_inter_chunk(
+        self,
+        states,
+        A_cumsum,
+        C_chunks,
+    ):
+        """
+        states   : (B,C,H,S)
+        A_cumsum : (B,H,C,Lc)
+        C_chunks : (B,C,Lc,H,S)
 
-        G  = (C[:, :, :, None] * B[:, :, None]).sum(dim=-1)
-        M  = (G[..., None] * L.permute(0, 2, 3, 4, 1)[..., None]).sum(dim=-1)
-        Y_diag = (M[..., None] * hs[:, :, None]).sum(dim=3)
+        Returns:
+           Y_off : (B,C,Lc,H,D)
+           ssm_state_out : (B,H,S)
+        """
+        # decay from previous chunk boundary -------------------------------
+        decay_chunk = torch.exp(A_cumsum[..., -1])                 # (B,H,C)
+        # Running recurrence across chunks (prefix sum style) --------------
+        decay_prefix = torch.cumprod(decay_chunk, dim=2)           # (B,H,C)
+        # states has C chunks; prepend dummy 1 for cumprod alignment
+        decay_prefix = torch.cat([torch.ones_like(decay_prefix[:, :, :1]), decay_prefix], dim=2)
+        # prefix[i] multiplies states[i-1], so roll
+        decay_prefix = decay_prefix.roll(1, dims=2)[:, :, :-1]     # shift right by 1
 
-        decay = torch.exp(A_cumsum[..., -1:] - A_cumsum)
-        B_decay = B * decay.permute(0, 3, 2, 1)[..., None]
-        states = (B_decay[..., None, :] * hs[..., None]).sum(dim=2)
-        # ---------------------------------------------------------------------
-        return Y_diag, states, D_residual, A_cumsum
+        new_states = (decay_prefix[..., None, None] * states.permute(0, 2, 1, 3)).sum(dim=2)
+        ssm_state_out = new_states                                    # (B,H,S)
+
+        # -------- state→output for each chunk -----------------------------
+        state_decay_out = torch.exp(A_cumsum)                          # (B,H,C,Lc)
+        C_times_states = (C_chunks[..., None, :] *
+                          states[:, :, None, ...])                     # (B,C,Lc,H,S)
+        Y_off = (C_times_states.sum(-1) *
+                 state_decay_out.permute(0, 2, 3, 1)[..., None])       # (B,C,Lc,H,D)
+        return Y_off, ssm_state_out[:, -1]
 
     _get_data_hidden_states_dt = torch.compile(_get_data_hidden_states_dt, fullgraph = True, dynamic = True, options = torch_compile_options)
     _conv1d = torch.compile(_conv1d, fullgraph = True, dynamic = True, options = torch_compile_options)
-    _ssm = torch.compile(_ssm, fullgraph = True, dynamic = True, options = torch_compile_options)
+    _kern_dt_and_A = torch.compile(_kern_dt_and_A, fullgraph = True, dynamic = True, options = torch_compile_options)
+    _kern_intra_chunk = torch.compile(_kern_intra_chunk, fullgraph = True, dynamic = True, options = torch_compile_options)
+    _kern_inter_chunk = torch.compile(_kern_inter_chunk, fullgraph = True, dynamic = True, options = torch_compile_options)
 
     def torch_forward(
         self,
@@ -452,39 +493,95 @@ def patch_FalconH1Mixer_torch_forward():
             # decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
             # B_decay = B * decay_states.permute(0, -2, -1, 1)[..., None]
             # states = (B_decay[..., None, :] * hidden_states[..., None]).sum(dim=2)
-            pad_size = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
-            Y_diag, states, D_residual, A_cumsum = _ssm(self, hidden_states, B, C, dt, pad_size)
 
-            # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
-            # (middle term of factorization of off-diag blocks; A terms)
+            # # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
+            # # (middle term of factorization of off-diag blocks; A terms)
+            # if use_precomputed_states:
+            #     previous_states = cache_params.ssm_states[self.layer_idx][:, None, ...].to(device=states.device)
+            # else:
+            #     previous_states = torch.zeros_like(states[:, :1])
+            # states = torch.cat([previous_states, states], dim=1)
+            # decay_chunk = torch.exp(segment_sum(nn.functional.pad(A_cumsum[:, :, :, -1], (1, 0))))
+            # decay_chunk = decay_chunk.transpose(1, 3)
+            # new_states = (decay_chunk[..., None, None] * states[:, :, None, ...]).sum(dim=1)
+            # states, ssm_state = new_states[:, :-1], new_states[:, -1]
+
+            # # 4. Compute state -> output conversion per chunk
+            # # (left term of low-rank factorization of off-diagonal blocks; C terms)
+            # state_decay_out = torch.exp(A_cumsum)
+            # C_times_states = (C[..., None, :] * states[:, :, None, ...])
+            # state_decay_out_permuted = state_decay_out.permute(0, 2, 3, 1)
+            # Y_off = (C_times_states.sum(-1) * state_decay_out_permuted[..., None])
+
+            # # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
+            # y = Y_diag + Y_off
+            # # [bsz, -1, self.chunk_size, num_heads, head_dim] -> [bsz, (padded) seq_len, num_heads, head_dim]
+            # y = y.reshape(batch_size, -1, self.num_heads, self.head_dim)
+
+            # y = y + D_residual
+            # # Cutting off padded chunks
+            # if pad_size > 0:
+            #     y = y[:, :seq_len, :, :]
+            # y = y.reshape(batch_size, seq_len, -1)
+            H, D        = self.num_heads, self.head_dim
+            S           = self.ssm_state_size
+            pad_size    = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
+
+            hs = hidden_states.view(batch_size, seq_len, H, D)                # (B,L,H,D)
+            B  = B.view(batch_size, seq_len, self.n_groups, S)                # (B,L,G,S)
+            C  = C.view(batch_size, seq_len, self.n_groups, S)
+            heads_per_group = H // self.n_groups
+            B = B.repeat_interleave(heads_per_group, dim=2, output_size=H)    # (B,L,H,S)
+            C = C.repeat_interleave(heads_per_group, dim=2, output_size=H)
+
+            D_residual = self.D.view(1, 1, H, D) * pad_tensor_by_size(hs, pad_size)
+
+            # ---- 2. chunkify -------------------------------------------------
+            hs, B, C, dt_chunks = [reshape_into_chunks(t, pad_size, self.chunk_size)
+                                for t in (hs, B, C, dt)]
+            # shapes now (B,C,Lc,H,…) except dt (B,C,Lc,1)
+
+            # ---- 3. compiled (A) dt / A scaling ------------------------------
+            if self._kern_dt_and_A is None:
+                self._kern_dt_and_A = torch.compile(
+                    self._kern_dt_and_A_impl, dynamic=True, fullgraph=False
+                )
+            dt_scaled, A_scaled = self._kern_dt_and_A(
+                dt_chunks, self.A_log, self.time_step_limit
+            )                                    # dt: (B,C,Lc,1) / A: (B,C,Lc,H)
+
+            # ---- 4. compiled (B) intra‑chunk SSM -----------------------------
+            if self._kern_intra_chunk is None:
+                self._kern_intra_chunk = torch.compile(
+                    self._kern_intra_chunk_impl, dynamic=True, fullgraph=False
+                )
+            Y_diag, states_chunks, A_cumsum = self._kern_intra_chunk(
+                hs, B, C, A_scaled, dt_scaled
+            )                                    # Y_diag: (B,C,Lc,H,D)
+
+            # ---- 5. cache / previous states (still eager) --------------------
             if use_precomputed_states:
-                previous_states = cache_params.ssm_states[self.layer_idx][:, None, ...].to(device=states.device)
+                prev_states = cache_params.ssm_states[self.layer_idx][:, None, ...].to(hidden_states.device)
             else:
-                previous_states = torch.zeros_like(states[:, :1])
-            states = torch.cat([previous_states, states], dim=1)
-            decay_chunk = torch.exp(segment_sum(nn.functional.pad(A_cumsum[:, :, :, -1], (1, 0))))
-            decay_chunk = decay_chunk.transpose(1, 3)
-            new_states = (decay_chunk[..., None, None] * states[:, :, None, ...]).sum(dim=1)
-            states, ssm_state = new_states[:, :-1], new_states[:, -1]
+                prev_states = torch.zeros_like(states_chunks[:, :1])
+            states_chunks = torch.cat([prev_states, states_chunks], dim=1)  # prepend
 
-            # 4. Compute state -> output conversion per chunk
-            # (left term of low-rank factorization of off-diagonal blocks; C terms)
-            state_decay_out = torch.exp(A_cumsum)
-            C_times_states = (C[..., None, :] * states[:, :, None, ...])
-            state_decay_out_permuted = state_decay_out.permute(0, 2, 3, 1)
-            Y_off = (C_times_states.sum(-1) * state_decay_out_permuted[..., None])
+            # ---- 6. compiled (C) inter‑chunk + output ------------------------
+            if self._kern_inter_chunk is None:
+                self._kern_inter_chunk = torch.compile(
+                    self._kern_inter_chunk_impl, dynamic=True, fullgraph=False
+                )
+            Y_off, ssm_state = self._kern_inter_chunk(
+                states_chunks, A_cumsum, C
+            )                                    # (B,C,Lc,H,D) / (B,H,S)
 
-            # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
-            y = Y_diag + Y_off
-            # [bsz, -1, self.chunk_size, num_heads, head_dim] -> [bsz, (padded) seq_len, num_heads, head_dim]
-            y = y.reshape(batch_size, -1, self.num_heads, self.head_dim)
-
+            # ---- 7. combine + unchunk + final pad slice ----------------------
+            y = Y_diag + Y_off                                   # (B,C,Lc,H,D)
+            y = y.view(batch_size, -1, H, D)                     # (B,Lpad,H,D)
             y = y + D_residual
-            # Cutting off padded chunks
-            if pad_size > 0:
-                y = y[:, :seq_len, :, :]
-            y = y.reshape(batch_size, seq_len, -1)
-
+            if pad_size:
+                y = y[:, :seq_len]                               # remove pad
+            y = y.view(batch_size, seq_len, -1)
             # Init cache
             if ssm_state is not None and cache_params is not None:
                 cache_params.ssm_states[self.layer_idx].copy_(ssm_state)
