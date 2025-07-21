@@ -262,8 +262,7 @@ def patch_FalconH1Mixer_torch_forward():
           states  (B,C,H,S)
           A_cum   (B,H,C,Lc)
         """
-        B  = B * dt                                             # discretise x
-        hs = hs * dt
+        hs = hs * dt[..., None]
 
         # rearrange A  ------------------------------------------------------
         A = A.permute(0, 3, 1, 2)                               # (B,H,C,L)
@@ -527,9 +526,9 @@ def patch_FalconH1Mixer_torch_forward():
             S           = self.ssm_state_size
             pad_size    = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
 
-            hs = hidden_states.view(batch_size, seq_len, H, D)                # (B,L,H,D)
-            B  = B.view(batch_size, seq_len, self.n_groups, S)                # (B,L,G,S)
-            C  = C.view(batch_size, seq_len, self.n_groups, S)
+            hs = hidden_states.view(batch_size, seq_len, H, D).float()                # (B,L,H,D)
+            B  = B.view(batch_size, seq_len, self.n_groups, S).float()                # (B,L,G,S)
+            C  = C.view(batch_size, seq_len, self.n_groups, S).float()
             heads_per_group = H // self.n_groups
             B = B.repeat_interleave(heads_per_group, dim=2, output_size=H)    # (B,L,H,S)
             C = C.repeat_interleave(heads_per_group, dim=2, output_size=H)
@@ -543,12 +542,12 @@ def patch_FalconH1Mixer_torch_forward():
 
             # ---- 3. compiled (A) dt / A scaling ------------------------------
             dt_scaled, A_scaled = _kern_dt_and_A(
-                dt_chunks, self.A_log, self.time_step_limit
+                self, dt_chunks, self.A_log, self.time_step_limit
             )                                    # dt: (B,C,Lc,1) / A: (B,C,Lc,H)
 
             # ---- 4. compiled (B) intra‑chunk SSM -----------------------------
             Y_diag, states_chunks, A_cumsum = _kern_intra_chunk(
-                hs, B, C, A_scaled, dt_scaled
+                self, hs, B, C, A_scaled, dt_scaled
             )                                    # Y_diag: (B,C,Lc,H,D)
 
             # ---- 5. cache / previous states (still eager) --------------------
@@ -560,7 +559,7 @@ def patch_FalconH1Mixer_torch_forward():
 
             # ---- 6. compiled (C) inter‑chunk + output ------------------------
             Y_off, ssm_state = _kern_inter_chunk(
-                states_chunks, A_cumsum, C
+                self, states_chunks, A_cumsum, C
             )                                    # (B,C,Lc,H,D) / (B,H,S)
 
             # ---- 7. combine + unchunk + final pad slice ----------------------
