@@ -534,7 +534,7 @@ def patch_FalconH1Mixer_torch_forward():
             B = B.repeat_interleave(heads_per_group, dim=2, output_size=H)    # (B,L,H,S)
             C = C.repeat_interleave(heads_per_group, dim=2, output_size=H)
 
-            D_residual = self.D.view(1, 1, H, D) * pad_tensor_by_size(hs, pad_size)
+            D_residual = self.D[..., None] * pad_tensor_by_size(hs, pad_size)
 
             # ---- 2. chunkify -------------------------------------------------
             hs, B, C, dt_chunks = [reshape_into_chunks(t, pad_size, self.chunk_size)
@@ -542,20 +542,12 @@ def patch_FalconH1Mixer_torch_forward():
             # shapes now (B,C,Lc,H,…) except dt (B,C,Lc,1)
 
             # ---- 3. compiled (A) dt / A scaling ------------------------------
-            if self._kern_dt_and_A is None:
-                self._kern_dt_and_A = torch.compile(
-                    self._kern_dt_and_A_impl, dynamic=True, fullgraph=False
-                )
-            dt_scaled, A_scaled = self._kern_dt_and_A(
+            dt_scaled, A_scaled = _kern_dt_and_A(
                 dt_chunks, self.A_log, self.time_step_limit
             )                                    # dt: (B,C,Lc,1) / A: (B,C,Lc,H)
 
             # ---- 4. compiled (B) intra‑chunk SSM -----------------------------
-            if self._kern_intra_chunk is None:
-                self._kern_intra_chunk = torch.compile(
-                    self._kern_intra_chunk_impl, dynamic=True, fullgraph=False
-                )
-            Y_diag, states_chunks, A_cumsum = self._kern_intra_chunk(
+            Y_diag, states_chunks, A_cumsum = _kern_intra_chunk(
                 hs, B, C, A_scaled, dt_scaled
             )                                    # Y_diag: (B,C,Lc,H,D)
 
@@ -567,11 +559,7 @@ def patch_FalconH1Mixer_torch_forward():
             states_chunks = torch.cat([prev_states, states_chunks], dim=1)  # prepend
 
             # ---- 6. compiled (C) inter‑chunk + output ------------------------
-            if self._kern_inter_chunk is None:
-                self._kern_inter_chunk = torch.compile(
-                    self._kern_inter_chunk_impl, dynamic=True, fullgraph=False
-                )
-            Y_off, ssm_state = self._kern_inter_chunk(
+            Y_off, ssm_state = _kern_inter_chunk(
                 states_chunks, A_cumsum, C
             )                                    # (B,C,Lc,H,D) / (B,H,S)
 
@@ -591,7 +579,6 @@ def patch_FalconH1Mixer_torch_forward():
         else:
             scan_output = y * torch.nn.functional.silu(gate)
 
-        # end ssd naive
 
         # 4. Final linear projection
         contextualized_states = self.out_proj(scan_output.to(dtype))  # [batch, seq_len, hidden_size]
