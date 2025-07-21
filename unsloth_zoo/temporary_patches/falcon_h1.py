@@ -314,7 +314,7 @@ def patch_FalconH1Mixer_torch_forward():
     _conv1d = torch.compile(_conv1d, fullgraph = True, dynamic = True, options = torch_compile_options)
     _kern_dt_and_A_and_hs = torch.compile(_kern_dt_and_A_and_hs, fullgraph = True, dynamic = True, options = torch_compile_options)
     _kern_intra_chunk = torch.compile(_kern_intra_chunk, fullgraph = True, dynamic = True, options = torch_compile_options)
-    _kern_inter_chunk = torch.compile(_kern_inter_chunk, fullgraph = True, dynamic = True, options = torch_compile_options)
+    _kern_inter_chunk = torch.compile(_kern_inter_chunk, fullgraph = False, dynamic = True, options = torch_compile_options)
 
     def torch_forward(
         self,
