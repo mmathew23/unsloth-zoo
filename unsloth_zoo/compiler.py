@@ -373,10 +373,17 @@ def get_cuda_kernels_source(module, source):
         # remove the cuda_kernels_forward call
         try:
             new_source = source
-            tree = ast.parse(new_source)
-            tree = RemoveCudaFastPath().visit(tree)
-            ast.fix_missing_locations(tree)
-            new_source = ast.unparse(tree)
+            # tree = ast.parse(new_source)
+            # tree = RemoveCudaFastPath().visit(tree)
+            # ast.fix_missing_locations(tree)
+            # new_source = ast.unparse(tree)
+
+            # train with compiled torch_forward, but inference with cuda_kernels_forward
+            new_source = new_source.replace(
+                'if is_fast_path_available and "cuda" in self.in_proj.weight.device.type:',
+                'if is_fast_path_available and "cuda" in self.in_proj.weight.device.type and not self.training:'
+            )
+                                            
         except Exception as e:
             if os.getenv("UNSLOTH_ENABLE_LOGGING", "0") == "1":
                 print(f"Unsloth: Error removing cuda_kernels_forward for {module}: {e}")
