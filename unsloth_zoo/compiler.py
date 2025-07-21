@@ -338,8 +338,8 @@ def get_mask_functions():
 pass
 
 
-def get_cuda_kernels_source(module, source):
-    disable = False
+def get_cuda_kernels_source(module, source, current_disable_value):
+    disable = current_disable_value
     if "cuda_kernels_forward" in source:
         disable = True
     major, minor = torch.cuda.get_device_capability()
@@ -567,7 +567,7 @@ def create_standalone_class(
     source = "\n".join(x[spaces:] for x in source)
 
     # For cuda_kernels_forward, we disable
-    source, disable = get_cuda_kernels_source(module, source)
+    source, disable = get_cuda_kernels_source(module, source, disable)
 
     if disable is not None:
         compile = \
