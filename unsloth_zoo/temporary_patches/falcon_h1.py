@@ -532,6 +532,7 @@ def patch_FalconH1Mixer_torch_forward():
             dt_scaled, A, hs = _kern_dt_and_A_and_hs(
                 self, dt, A_log, hs, self.time_step_limit
             )
+            print('ashape', A.shape)
 
             # ---- 2. chunkify -------------------------------------------------
             hs, A, B, C = [reshape_into_chunks(t, pad_size, self.chunk_size)
@@ -549,6 +550,7 @@ def patch_FalconH1Mixer_torch_forward():
                 prev_states = cache_params.ssm_states[self.layer_idx][:, None, ...].to(device=hidden_states.device)
             else:
                 prev_states = torch.zeros_like(states_chunks[:, :1])
+            print('prev_states.shape', prev_states.shape, 'states_chunks.shape', states_chunks.shape)
             states_chunks = torch.cat([prev_states, states_chunks], dim=1)  # prepend
             print(states_chunks.shape)
 
