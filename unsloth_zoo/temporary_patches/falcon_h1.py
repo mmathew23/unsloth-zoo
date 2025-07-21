@@ -16,22 +16,11 @@
 
 import torch
 import torch.nn as nn
-import inspect
-from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
+from typing import Optional
 from .common import TEMPORARY_PATCHES, torch_compile_options
 from .utils import (
     patch_function,
-    process_output_options,
-    process_return,
-    KWARGS_TYPE,
     raise_error,
-    ImageInput,
-    PreTokenizedInput,
-    TextInput,
-    Cache,
-    StaticCache,
-    HybridCache,
-    Unpack,
 )
 
 def patch_FalconH1Mixer_torch_forward():
