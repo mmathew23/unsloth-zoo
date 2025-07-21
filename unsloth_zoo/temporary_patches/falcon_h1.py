@@ -236,7 +236,7 @@ def patch_FalconH1Mixer_torch_forward():
         hidden_states_B_C = self.act(self.conv1d(hidden_states_B_C.transpose(1, 2))[..., :seq_len].transpose(1, 2))
         return hidden_states_B_C
 
-    def _kern_dt_and_A(self, dt, A_log, time_lim):
+    def _kern_dt_and_A_and_hs(self, dt, A_log, hs, time_lim):
         """
         dt:  (B, C, Lc, 1)   after broadcasting into chunk shape
         A_log: (H,)          constant
@@ -246,8 +246,9 @@ def patch_FalconH1Mixer_torch_forward():
         """
         dt = torch.nn.functional.softplus(dt + self.dt_bias)
         dt = torch.clamp(dt, time_lim[0], time_lim[1])
-        A  = -torch.exp(A_log).to(dt.dtype) * dt                # broadcast over (B,C,L)
-        return dt, A
+        hs = hs * dt[..., None]
+        A  = -torch.exp(A_log).to(torch.float32) * dt               # broadcast over (B,C,L).dt
+        return dt, A, hs
 
     def _kern_intra_chunk(self, hs, B, C, A, dt):
         """
@@ -262,22 +263,20 @@ def patch_FalconH1Mixer_torch_forward():
           states  (B,C,H,S)
           A_cum   (B,H,C,Lc)
         """
-        hs = hs * dt[..., None]
-
         # rearrange A  ------------------------------------------------------
         A = A.permute(0, 3, 1, 2)                               # (B,H,C,L)
         A_cumsum = torch.cumsum(A, dim=-1)                      # for later
 
         # ----------- diagonal blocks (mask) -------------------------------
-        L = torch.exp(A_cumsum[..., -1:] - A_cumsum)            # segment_sum equiv
+        L = torch.exp(segment_sum(A))
 
-        G = (C[:, :, :, None] * B[:, :, None]).sum(dim=-1)      # (B,C,Lc,H)
-        M = (G[..., None] * L.permute(0, 2, 3, 1)[..., None]).sum(dim=-1)
+        G = (C[:, :, :, None, :, :] * B[:, :, None, :, :, :]).sum(dim=-1)      # (B,C,Lc,H)
+        M = (G[..., None] * L.permute(0, 2, 3, 4, 1)[..., None]).sum(dim=-1)
         Y_diag = (M[..., None] * hs[:, :, None]).sum(dim=3)     # (B,C,Lc,H,D)
 
         # ------------- decay states inside chunk --------------------------
-        decay_states = torch.exp(A_cumsum[..., -1:] - A_cumsum)           # (B,H,C,L)
-        B_decay = B * decay_states.permute(0, 2, 3, 1)[..., None]         # align dims
+        decay_states = torch.exp(A_cumsum[:, :, :, -1] - A_cumsum)           # (B,H,C,L)
+        B_decay = B * decay_states.permute(0, -2, -1, 1)[..., None]
         states = (B_decay[..., None, :] * hs[..., None]).sum(dim=2)       # (B,C,H,S)
 
         return Y_diag, states, A_cumsum          # keep A_cumsum for inter‑chunk
@@ -298,28 +297,21 @@ def patch_FalconH1Mixer_torch_forward():
            ssm_state_out : (B,H,S)
         """
         # decay from previous chunk boundary -------------------------------
-        decay_chunk = torch.exp(A_cumsum[..., -1])                 # (B,H,C)
-        # Running recurrence across chunks (prefix sum style) --------------
-        decay_prefix = torch.cumprod(decay_chunk, dim=2)           # (B,H,C)
-        # states has C chunks; prepend dummy 1 for cumprod alignment
-        decay_prefix = torch.cat([torch.ones_like(decay_prefix[:, :, :1]), decay_prefix], dim=2)
-        # prefix[i] multiplies states[i-1], so roll
-        decay_prefix = decay_prefix.roll(1, dims=2)[:, :, :-1]     # shift right by 1
+        padded_A_cumsum = torch.nn.functional.pad(A_cumsum[:, :, :, -1], (1,0))
+        decay_chunk = torch.exp(segment_sum(padded_A_cumsum)).transpose(1, 3)
+        new_states = (decay_chunk[..., None, None] * states[:, :, None, ...]).sum(dim=1)
+        states, ssm_state = new_states[:, :-1], new_states[:, -1]
 
-        new_states = (decay_prefix[..., None, None] * states.permute(0, 2, 1, 3)).sum(dim=2)
-        ssm_state_out = new_states                                    # (B,H,S)
-
-        # -------- state→output for each chunk -----------------------------
         state_decay_out = torch.exp(A_cumsum)                          # (B,H,C,Lc)
         C_times_states = (C_chunks[..., None, :] *
                           states[:, :, None, ...])                     # (B,C,Lc,H,S)
         Y_off = (C_times_states.sum(-1) *
                  state_decay_out.permute(0, 2, 3, 1)[..., None])       # (B,C,Lc,H,D)
-        return Y_off, ssm_state_out[:, -1]
+        return Y_off, ssm_state
 
     _get_data_hidden_states_dt = torch.compile(_get_data_hidden_states_dt, fullgraph = True, dynamic = True, options = torch_compile_options)
     _conv1d = torch.compile(_conv1d, fullgraph = True, dynamic = True, options = torch_compile_options)
-    _kern_dt_and_A = torch.compile(_kern_dt_and_A, fullgraph = True, dynamic = True, options = torch_compile_options)
+    _kern_dt_and_A_and_hs = torch.compile(_kern_dt_and_A_and_hs, fullgraph = True, dynamic = True, options = torch_compile_options)
     _kern_intra_chunk = torch.compile(_kern_intra_chunk, fullgraph = True, dynamic = True, options = torch_compile_options)
     _kern_inter_chunk = torch.compile(_kern_inter_chunk, fullgraph = True, dynamic = True, options = torch_compile_options)
 
@@ -529,30 +521,30 @@ def patch_FalconH1Mixer_torch_forward():
             hs = hidden_states.view(batch_size, seq_len, H, D).float()                # (B,L,H,D)
             B  = B.view(batch_size, seq_len, self.n_groups, S).float()                # (B,L,G,S)
             C  = C.view(batch_size, seq_len, self.n_groups, S).float()
+            A_log = self.A_log.float()
             heads_per_group = H // self.n_groups
             B = B.repeat_interleave(heads_per_group, dim=2, output_size=H)    # (B,L,H,S)
             C = C.repeat_interleave(heads_per_group, dim=2, output_size=H)
 
             D_residual = self.D[..., None] * pad_tensor_by_size(hs, pad_size)
 
-            # ---- 2. chunkify -------------------------------------------------
-            hs, B, C, dt_chunks = [reshape_into_chunks(t, pad_size, self.chunk_size)
-                                for t in (hs, B, C, dt)]
-            # shapes now (B,C,Lc,H,…) except dt (B,C,Lc,1)
+            dt_scaled, A, hs = _kern_dt_and_A_and_hs(
+                self, dt, A_log, hs, self.time_step_limit
+            )
 
-            # ---- 3. compiled (A) dt / A scaling ------------------------------
-            dt_scaled, A_scaled = _kern_dt_and_A(
-                self, dt_chunks, self.A_log, self.time_step_limit
-            )                                    # dt: (B,C,Lc,1) / A: (B,C,Lc,H)
+            # ---- 2. chunkify -------------------------------------------------
+            hs, A, B, C = [reshape_into_chunks(t, pad_size, self.chunk_size)
+                                for t in (hs, A, B, C)]
+
 
             # ---- 4. compiled (B) intra‑chunk SSM -----------------------------
             Y_diag, states_chunks, A_cumsum = _kern_intra_chunk(
-                self, hs, B, C, A_scaled, dt_scaled
+                self, hs, B, C, A, dt_scaled
             )                                    # Y_diag: (B,C,Lc,H,D)
 
             # ---- 5. cache / previous states (still eager) --------------------
             if use_precomputed_states:
-                prev_states = cache_params.ssm_states[self.layer_idx][:, None, ...].to(hidden_states.device)
+                prev_states = cache_params.ssm_states[self.layer_idx][:, None, ...].to(device=hidden_states.device)
             else:
                 prev_states = torch.zeros_like(states_chunks[:, :1])
             states_chunks = torch.cat([prev_states, states_chunks], dim=1)  # prepend
