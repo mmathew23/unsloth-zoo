@@ -275,7 +275,7 @@ def patch_FalconH1Mixer_torch_forward():
         Y_diag = (M[..., None] * hs[:, :, None]).sum(dim=3)     # (B,C,Lc,H,D)
 
         # ------------- decay states inside chunk --------------------------
-        decay_states = torch.exp(A_cumsum[:, :, :, -1] - A_cumsum)           # (B,H,C,L)
+        decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)           # (B,H,C,L)
         B_decay = B * decay_states.permute(0, -2, -1, 1)[..., None]
         states = (B_decay[..., None, :] * hs[..., None]).sum(dim=2)       # (B,C,H,S)
 
@@ -299,7 +299,7 @@ def patch_FalconH1Mixer_torch_forward():
         # decay from previous chunk boundary -------------------------------
         padded_A_cumsum = torch.nn.functional.pad(A_cumsum[:, :, :, -1], (1,0))
         decay_chunk = torch.exp(segment_sum(padded_A_cumsum)).transpose(1, 3)
-        print(decay_chunk.shape, states.shape, padded_A_cumsum.shape, A_cumsum.shape)
+        # print(decay_chunk.shape, states.shape, padded_A_cumsum.shape, A_cumsum.shape)
         new_states = (decay_chunk[..., None, None] * states[:, :, None, ...]).sum(dim=1)
         states, ssm_state = new_states[:, :-1], new_states[:, -1]
 
@@ -314,7 +314,7 @@ def patch_FalconH1Mixer_torch_forward():
     _conv1d = torch.compile(_conv1d, fullgraph = True, dynamic = True, options = torch_compile_options)
     _kern_dt_and_A_and_hs = torch.compile(_kern_dt_and_A_and_hs, fullgraph = True, dynamic = True, options = torch_compile_options)
     _kern_intra_chunk = torch.compile(_kern_intra_chunk, fullgraph = True, dynamic = True, options = torch_compile_options)
-    _kern_inter_chunk = torch.compile(_kern_inter_chunk, fullgraph = False, dynamic = True, options = torch_compile_options)
+    _kern_inter_chunk = torch.compile(_kern_inter_chunk, fullgraph = True, dynamic = True, options = torch_compile_options)
 
     def torch_forward(
         self,
@@ -532,18 +532,18 @@ def patch_FalconH1Mixer_torch_forward():
             dt_scaled, A, hs = _kern_dt_and_A_and_hs(
                 self, dt, A_log, hs, self.time_step_limit
             )
-            print('ashape', A.shape)
+            # print('ashape', A.shape)
 
             # ---- 2. chunkify -------------------------------------------------
             hs, A, B, C = [reshape_into_chunks(t, pad_size, self.chunk_size)
                                 for t in (hs, A, B, C)]
 
-            print(hs.shape, A.shape, B.shape, C.shape)
+            # print(hs.shape, A.shape, B.shape, C.shape)
             # ---- 4. compiled (B) intra‑chunk SSM -----------------------------
             Y_diag, states_chunks, A_cumsum = _kern_intra_chunk(
                 self, hs, B, C, A, dt_scaled
             )                                    # Y_diag: (B,C,Lc,H,D)
-            print(Y_diag.shape, states_chunks.shape, A_cumsum.shape)
+            # print(Y_diag.shape, states_chunks.shape, A_cumsum.shape)
 
             # ---- 5. cache / previous states (still eager) --------------------
             if use_precomputed_states:
