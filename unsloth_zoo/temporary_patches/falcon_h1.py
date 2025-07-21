@@ -550,9 +550,7 @@ def patch_FalconH1Mixer_torch_forward():
                 prev_states = cache_params.ssm_states[self.layer_idx][:, None, ...].to(device=hidden_states.device)
             else:
                 prev_states = torch.zeros_like(states_chunks[:, :1])
-            print('prev_states.shape', prev_states.shape, 'states_chunks.shape', states_chunks.shape)
             states_chunks = torch.cat([prev_states, states_chunks], dim=1)  # prepend
-            print(states_chunks.shape)
 
             # ---- 6. compiled (C) inter‑chunk + output ------------------------
             Y_off, ssm_state = _kern_inter_chunk(
