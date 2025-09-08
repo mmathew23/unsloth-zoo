@@ -695,6 +695,7 @@ def patch_GptOssAttention():
         else:
             # Weirdly for inference, flex attention returns gibberish
             # Most likely due to left padding
+            print('we are inside inference')
             attn_output, attn_weights = eager_attention_forward(
                 self,
                 query_states,
