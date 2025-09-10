@@ -703,6 +703,18 @@ if hasattr(transformers.integrations.bitsandbytes, "_replace_with_bnb_linear") a
     transformers.integrations.bitsandbytes._replace_with_bnb_linear = _unsloth_replace_with_bnb_linear
 pass
 
+def unsloth_get_special_dtypes_update(self, model, dtype: "torch.dtype") -> dict[str, "torch.dtype"]:
+    return {
+        name: dtype for name, _ in model.named_parameters() if any(m == name.split('.')[-1] for m in self.modules_to_not_convert)
+    }
+try:
+    import transformers.quantizers
+    transformers.quantizers.HfQuantizer.get_special_dtypes_update = unsloth_get_special_dtypes_update
+except:
+    if os.environ.get('UNSLOTH_ENABLE_LOGGING', '0') == '1':
+        print("Unsloth: Could not patch transformers.quantizers.HfQuantizer.get_special_dtypes_update")
+
+
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
 #
