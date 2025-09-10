@@ -33,9 +33,9 @@ import subprocess
 import types
 import time
 import logging
-import tempfile
 import sys
 import textwrap
+import tempfile
 from .utils import (
     Version,
     is_main_process,
@@ -533,11 +533,44 @@ def create_new_function(
         overwrite = False
 
     # Check location
-    def write_file(function_location, write_new_source):
-        with open(function_location, "wb", buffering = 0) as file:
-            file.write(write_new_source.encode("utf-8"))
-            file.flush()
-            os.fsync(file.fileno())
+    def write_file(function_location, write_new_source, retires=2):
+        dirname = os.path.dirname(function_location) or "."
+        base = os.path.basename(function_location)
+        fd, tmp_path = tempfile.mkstemp(dir=dirname, prefix=f'.tmp-{base}')
+        try:
+            with os.fdopen(fd, 'wb', buffering = 0) as file:
+                file.write(write_new_source.encode("utf-8"))
+                file.flush()
+                os.fsync(file.fileno())
+            
+            for attempt in range(retires):
+                try:
+                    os.replace(tmp_path, function_location)
+                    break
+                except Exception as e:
+                    if attempt < retires - 1:
+                        time.sleep(0.1 * (attempt + 1))
+                        continue
+                    else:
+                        if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+                            logger.error(f"Unsloth: Failed to write file {function_location}: {e} after {retires} attempts")
+            if os.name == 'posix':
+                try:
+                    flags = os.O_RDONLY
+                    flags |= getattr(os, "O_DIRECTORY", 0)   # ensures ENOTDIR if not a dir (where supported)
+                    flags |= getattr(os, "O_CLOEXEC", 0)     # avoid leaking FD across exec (where supported) 
+                    dir_fd = os.open(dirname, flags)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except Exception as e:
+                    pass
+        finally:    
+            try:
+                os.remove(tmp_path)
+            except Exception as e:
+                pass
         return None
     pass
 
