@@ -230,7 +230,8 @@ def get_transformers_model_type(config):
             model_types = [model_type]
         elif hasattr(config, "auto_mapping"):
             # Use GptOssForCausalLM
-            model_type = config.auto_mapping.get("base_model_class", None)
+
+            model_type = config.auto_mapping.get("base_model_class", None) if isinstance(config.auto_mapping, dict) else None
             if model_type is None:
                 # Last resort use model name unsloth/gpt-oss-20b-unsloth-bnb-4bit
                 model_type = config.base_model_name_or_path
