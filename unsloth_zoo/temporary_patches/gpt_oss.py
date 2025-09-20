@@ -619,7 +619,6 @@ def patch_gpt_oss_linearized():
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
-
 def patch_GptOssAttention():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
     try:
@@ -662,6 +661,7 @@ def patch_GptOssAttention():
         attn_weights = nn.functional.dropout(scores, p=dropout, training=module.training)
         attn_output = torch.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous()
+        print('attn_output', attn_output.shape, key_states.shape, value_states.shape)
         return attn_output, attn_weights
     pass
 
@@ -688,29 +688,14 @@ def patch_GptOssAttention():
             cache_kwargs = {"cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-        if self.training:
-            attn_output = flex_attention_with_sink(
-                self,
-                query_states,
-                key_states,
-                value_states,
-            )
-            attn_weights = None
-        else:
-            # Weirdly for inference, flex attention returns gibberish
-            # Most likely due to left padding
-            attn_output, attn_weights = eager_attention_forward(
-                self,
-                query_states,
-                key_states,
-                value_states,
-                attention_mask,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                scaling=self.scaling,
-                sliding_window=self.sliding_window,
-                s_aux=self.sinks,  # diff with Llama
-                **kwargs,
-            )
+        attn_output = flex_attention_with_sink(
+            self,
+            query_states,
+            key_states,
+            value_states,
+        )
+        attn_weights = None
+
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights

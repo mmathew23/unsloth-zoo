@@ -28,6 +28,17 @@ from .utils import (
 )
 from torch.nn.attention.flex_attention import flex_attention as uncompiled_flex_attention
 
+def make_causal_mask_with_sink(q_len: int, kv_len_real: int):
+    # kv_len_real excludes the sink; kv_idx==0 is the sink
+    q_abs_start = kv_len_real - q_len
+    def mask(batch, head, q_idx, kv_idx):
+        q_kv_max = (q_abs_start + q_idx) + 1  # convert to KV index space (sink at 0)
+        allow_sink = (kv_idx == 0)
+        causal = q_kv_max >= kv_idx
+        return allow_sink | causal
+    mask.__name__ = f"causal_with_sink_q{q_len}_kv{kv_len_real}"
+    return mask
+
 def causal_mask_with_sink(batch, head, q_idx, kv_idx):
     """
       0 1 2 3     0 1 2 3
@@ -40,6 +51,18 @@ def causal_mask_with_sink(batch, head, q_idx, kv_idx):
     sink_first_column = kv_idx == 0
     return causal_mask | sink_first_column
 pass
+
+def make_sliding_window_with_sink(window_size: int, q_len: int, kv_len_real: int):
+    q_abs_start = kv_len_real - q_len
+    def mask(batch, head, q_idx, kv_idx):
+        q_kv_max = (q_abs_start + q_idx) + 1
+        allow_sink = (kv_idx == 0)
+        causal     = q_kv_max >= kv_idx
+        windowed   = (q_kv_max - kv_idx) < window_size   # matches your "< window_size" semantics
+        return allow_sink | (causal & windowed)
+    mask.__name__ = f"win{window_size}_sink_q{q_len}_kv{kv_len_real}"
+    return mask
+
 
 @functools.lru_cache
 def generate_sliding_window_with_sink(window_size: int):
@@ -96,10 +119,14 @@ def flex_attention_with_sink(
 
     # Check for sliding window
     sliding_window = sliding_window or getattr(self_attn, "sliding_window", None)
+    # mask_mod = \
+    #     generate_sliding_window_with_sink(sliding_window) \
+    #     if type(sliding_window) is int and sliding_window != 0 else \
+    #     causal_mask_with_sink
     mask_mod = \
-        generate_sliding_window_with_sink(sliding_window) \
+        make_sliding_window_with_sink(sliding_window, qlen_Q, qlen_KV) \
         if type(sliding_window) is int and sliding_window != 0 else \
-        causal_mask_with_sink
+        make_causal_mask_with_sink(qlen_Q, qlen_KV)
     score_mod = generate_sink_score_mod(sink_weights)
     block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV+1) # Add 1 since we padded
     attn_output = (flex_attention if compile else uncompiled_flex_attention)(
