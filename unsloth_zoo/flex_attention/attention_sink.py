@@ -165,14 +165,10 @@ def new_flex_attention_with_sink(
 
     # Check for sliding window
     sliding_window = sliding_window or getattr(self_attn, "sliding_window", None)
-    # mask_mod = \
-    #     generate_sliding_window(sliding_window) \
-    #     if type(sliding_window) is int and sliding_window != 0 else \
-    #     causal_mask
     mask_mod = \
-        make_sliding_window_with_sink(sliding_window, qlen_Q, qlen_KV) \
+        generate_sliding_window(sliding_window) \
         if type(sliding_window) is int and sliding_window != 0 else \
-        make_causal_mask_with_sink(qlen_Q, qlen_KV)
+        causal_mask
     block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV)
     attn_output, logsumexp = (flex_attention if compile else uncompiled_flex_attention)(
         query,
