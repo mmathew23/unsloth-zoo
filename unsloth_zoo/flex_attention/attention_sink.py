@@ -58,7 +58,7 @@ def make_sliding_window_with_sink(window_size: int, q_len: int, kv_len_real: int
         q_kv_max = (q_abs_start + q_idx) + 1
         allow_sink = (kv_idx == 0)
         causal     = q_kv_max >= kv_idx
-        windowed   = (q_kv_max - kv_idx) < window_size   # matches your "< window_size" semantics
+        windowed   = (q_kv_max - kv_idx) < window_size
         return allow_sink | (causal & windowed)
     mask.__name__ = f"win{window_size}_sink_q{q_len}_kv{kv_len_real}"
     return mask
