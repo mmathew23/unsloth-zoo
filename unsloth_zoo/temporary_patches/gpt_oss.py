@@ -624,13 +624,17 @@ def patch_GptOssAttention():
     try:
         from ..flex_attention import flex_attention_with_sink, new_flex_attention_with_sink
         assert flex_attention_with_sink is not None
+        print('import new_flex_attention_with_sink')
     except Exception as e:
+        print('import new_flex_attention_with_sink failed', e)
         return raise_error("flex_attention_with_sink", e)
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
         transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention
         from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb, repeat_kv
+        print('import transformers.models.gpt_oss.modeling_gpt_oss')
     except Exception as e:
+        print('import transformers.models.gpt_oss.modeling_gpt_oss failed', e)
         return raise_error("transformers.models.gpt_oss.modeling_gpt_oss.GptOssAttention", e)
 
     def eager_attention_forward(
