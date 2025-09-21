@@ -83,17 +83,19 @@ try:
             return mask_mod(b, h, q + _offset, kv)
         return _mask_mod
 
+    def _round_up_to_multiple(x, multiple):
+        div, mod = divmod(x, multiple)
+        return multiple*div + (multiple if mod != 0 else 0)
+
     # Used for every attention layer
     class FlexAttentionCache:
         __slots__ = "offset", "offset_tensor", "block_mask", "mask_mod", "max_length", "block_size",
 
         def __init__(self, key, mask_mod):
             bsz, heads_KV, qlen_KV, dim = key.shape
-            qlen_KV -= 1 # Minue one since we need the block mask to use the saved offset_tensor
-            self.offset = qlen_KV
-            self.offset_tensor = torch.tensor(qlen_KV, device = key.device, dtype = int)
-            div, mod = divmod(qlen_KV, FLEX_ATTENTION_KV_INCREMENT)
-            n = FLEX_ATTENTION_KV_INCREMENT*div + (FLEX_ATTENTION_KV_INCREMENT if mod != 0 else 0)
+            self.offset = qlen_KV - 1
+            self.offset_tensor = torch.tensor(qlen_KV-1, device = key.device, dtype = int)
+            n = _round_up_to_multiple(qlen_KV, FLEX_ATTENTION_KV_INCREMENT)
             self.block_mask = create_block_mask_cached(mask_mod, n, n)
             self.mask_mod = mask_mod
             self.max_length = n
@@ -101,16 +103,18 @@ try:
 
         def __call__(self, key):
             # We increment beforehand to get the correct index since offset_tensor is used
-            self.offset += 1
-            self.offset_tensor.add_(1)
-            if self.offset >= self.max_length:
-                n = self.max_length + FLEX_ATTENTION_KV_INCREMENT
+            # self.offset += 1
+            # self.offset_tensor.add_(1)
+            bsz, heads_KV, qlen_KV, dim = key.shape
+            offset = key.shape[-2] - 1
+            if offset >= self.max_length:
+                n = _round_up_to_multiple(offset + 1, FLEX_ATTENTION_KV_INCREMENT)
                 self.block_mask = create_block_mask_cached(self.mask_mod, n, n)
                 self.max_length = n
                 self.block_size = self.block_mask.BLOCK_SIZE[0]
-            bsz, heads_KV, qlen_KV, dim = key.shape
-            block_offset = self.offset // self.block_size
+            block_offset = offset // self.block_size
             block_mask_slice = self.block_mask[:, :, block_offset]
+            self.offset_tensor.fill_(offset)
             block_mask_slice.mask_mod = get_mask_mod_w_offset(self.mask_mod, self.offset_tensor)
             block_mask_slice.seq_lengths = (1, qlen_KV)
             return block_mask_slice
