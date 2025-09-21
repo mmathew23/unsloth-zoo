@@ -18,6 +18,7 @@ __all__ = [
     "flex_attention_with_sink",
 ]
 
+import os
 import torch
 import functools
 from .utils import (
@@ -77,6 +78,34 @@ def generate_sliding_window_with_sink(window_size: int):
     sliding_window.__name__ = sliding_window.__doc__ = f"sliding_window_{window_size}_sink"
     return sliding_window
 pass
+
+def make_causal_mask(q_len: int, kv_len_real: int):
+    q_abs_start = kv_len_real - q_len
+
+    def mask(batch, head, q_idx, kv_idx):
+        # Map local query index to absolute position in KV index space
+        q_abs = q_abs_start + q_idx
+        # Causal: can only attend to past or self
+        return q_abs >= kv_idx
+
+    mask.__name__ = f"causal_q{q_len}_kv{kv_len_real}"
+    mask.__doc__  = "causal, inference-aware"
+    return mask
+
+def make_sliding_window(window_size: int, q_len: int, kv_len_real: int):
+    q_abs_start = kv_len_real - q_len
+
+    def mask(batch, head, q_idx, kv_idx):
+        q_abs = q_abs_start + q_idx
+        causal = q_abs >= kv_idx
+        delta  = q_abs - kv_idx
+        windowed = delta < window_size
+
+        return causal & windowed
+
+    mask.__name__ = f"win{window_size}_q{q_len}_kv{kv_len_real}"
+    mask.__doc__  = "sliding-window, inference-aware"
+    return mask
 
 @functools.lru_cache
 def generate_sink_score_mod(sink_weights : torch.Tensor):
@@ -166,9 +195,9 @@ def new_flex_attention_with_sink(
     # Check for sliding window
     sliding_window = sliding_window or getattr(self_attn, "sliding_window", None)
     mask_mod = \
-        generate_sliding_window(sliding_window) \
+        make_sliding_window(sliding_window, qlen_Q, qlen_KV) \
         if type(sliding_window) is int and sliding_window != 0 else \
-        causal_mask
+        make_causal_mask(qlen_Q, qlen_KV)
     block_mask = create_block_mask_cached(mask_mod, qlen_Q, qlen_KV)
     attn_output, logsumexp = (flex_attention if compile else uncompiled_flex_attention)(
         query,
@@ -199,5 +228,8 @@ def new_flex_attention_with_sink(
     # To reduce error, one should do attn_output.to(torch.float32)
 
     attn_output = attn_output.transpose(1, 2).contiguous()
+    if os.environ.get("SANITY_CHECK", "0") == "1":
+        print('sanity check')
+        print('attn_output', attn_output.shape, key.shape, value.shape)
     return attn_output
 pass

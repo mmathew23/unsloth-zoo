@@ -665,6 +665,7 @@ def patch_GptOssAttention():
         attn_weights = nn.functional.dropout(scores, p=dropout, training=module.training)
         attn_output = torch.matmul(attn_weights, value_states)
         attn_output = attn_output.transpose(1, 2).contiguous()
+        print('inside eager_attention_forward')
         return attn_output, attn_weights
     pass
 
