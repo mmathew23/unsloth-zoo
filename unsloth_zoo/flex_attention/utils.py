@@ -106,7 +106,7 @@ try:
             # self.offset += 1
             # self.offset_tensor.add_(1)
             bsz, heads_KV, qlen_KV, dim = key.shape
-            offset = key.shape[-2] - 1
+            offset = qlen_KV - 1
             if offset >= self.max_length:
                 n = _round_up_to_multiple(offset + 1, FLEX_ATTENTION_KV_INCREMENT)
                 self.block_mask = create_block_mask_cached(self.mask_mod, n, n)
