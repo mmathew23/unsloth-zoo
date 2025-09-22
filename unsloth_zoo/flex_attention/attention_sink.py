@@ -180,8 +180,6 @@ def flex_attention_with_sink(
         if is_training:
             if has_flex_cache:
                 del self_attn._flex_attention_cache
-            if has_prefill_cache:
-                del self_attn._prefill_flex_attention_cache
         else:
             # Consider left padding as well for prefill
             assert attention_mask is not None
