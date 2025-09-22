@@ -136,6 +136,7 @@ first_self_attn = None
 
 import os
 os.environ['UNSLOTH_PICK_FLEX_MOD'] = 'first'
+global debug_info = []
 def flex_attention_with_sink(
     self_attn,
     query,
@@ -224,6 +225,23 @@ def flex_attention_with_sink(
     if block_mask is None:
         block_mask = create_block_mask(mask_mod, bsz, heads_Q, qlen_Q, qlen_KV, device = key.device)
 
+    if os.environ.get('UNSLOTH_DEBUG_MASK', '0') == '1':
+        global debug_info
+        layer_idx = getattr(self_attn, "layer_idx", -1)
+        debug_info.append({
+            'layer_idx': layer_idx,
+            'mask_mod': mask_mod,
+            'block_mask': block_mask,
+            'qlen_Q': qlen_Q,
+            'qlen_KV': qlen_KV,
+            'sliding_window': sliding_window,
+            'enable_gqa': enable_gqa,
+            'scale': scale,
+            'compile': compile,
+            'is_training': is_training,
+            'has_flex_cache': has_flex_cache,
+        })
+        
     attn_output, logsumexp = (flex_attention if compile else uncompiled_flex_attention)(
         query,
         key,
