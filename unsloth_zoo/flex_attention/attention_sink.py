@@ -180,6 +180,8 @@ def flex_attention_with_sink(
         if is_training:
             if has_flex_cache:
                 del self_attn._flex_attention_cache
+            if has_prefill_cache:
+                del self_attn._prefill_flex_attention_cache
         else:
             # Consider left padding as well for prefill
             assert attention_mask is not None
@@ -211,7 +213,7 @@ def flex_attention_with_sink(
                 mask_mod = prefill_mask_mod
             elif os.environ.get('UNSLOTH_PICK_FLEX_MOD', '') == 'second':
                 mask_mod = decoding_mask_mod
-            self_attn._flex_attention_cache = FlexAttentionCache(key, mask_mod, sliding_window)
+            self_attn._flex_attention_cache = FlexAttentionCache(key, decoding_mask_mod, sliding_window)
     else:
         block_mask = self_attn._flex_attention_cache(key)
     pass
