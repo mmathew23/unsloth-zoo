@@ -133,6 +133,9 @@ pass
 
 global first_self_attn
 first_self_attn = None
+
+import os
+os.environ['UNSLOTH_PICK_FLEX_MOD'] = 'first'
 def flex_attention_with_sink(
     self_attn,
     query,
@@ -185,7 +188,7 @@ def flex_attention_with_sink(
             padding_start_idx = attention_mask.argmax(1)
             print(padding_start_idx, query.shape, key.shape)
             # Use special padded mask creators
-            mask_mod = prefill_mask_mod = \
+            prefill_mask_mod = \
                 generate_sliding_window_mask_with_padding(sliding_window, padding_start_idx) \
                 if type(sliding_window) is int and sliding_window != 0 else \
                 generate_causal_mask_with_padding(padding_start_idx)
@@ -204,6 +207,10 @@ def flex_attention_with_sink(
                 generate_sliding_window_mask(sliding_window) \
                 if type(sliding_window) is int and sliding_window != 0 else \
                 generate_decoding_causal_mask_with_padding(padding_start_idx)
+            if os.environ.get('UNSLOTH_PICK_FLEX_MOD', '') == 'first':
+                mask_mod = prefill_mask_mod
+            elif os.environ.get('UNSLOTH_PICK_FLEX_MOD', '') == 'second':
+                mask_mod = decoding_mask_mod
             self_attn._flex_attention_cache = FlexAttentionCache(key, mask_mod, sliding_window)
     else:
         block_mask = self_attn._flex_attention_cache(key)
