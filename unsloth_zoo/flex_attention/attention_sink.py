@@ -136,7 +136,8 @@ first_self_attn = None
 
 import os
 os.environ['UNSLOTH_PICK_FLEX_MOD'] = 'first'
-global debug_info = []
+global debug_info
+debug_info = []
 def flex_attention_with_sink(
     self_attn,
     query,
