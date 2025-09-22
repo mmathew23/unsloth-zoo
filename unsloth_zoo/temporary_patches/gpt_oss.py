@@ -621,6 +621,8 @@ pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 
+import os
+os.environ['UNSLOTH_SANITY_CHECK'] = '0'
 def patch_GptOssAttention():
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
     try:
@@ -645,6 +647,7 @@ def patch_GptOssAttention():
         dropout: float = 0.0,
         **kwargs,
     ):
+        print('eager')
         key_states = repeat_kv(key, module.num_key_value_groups)
         value_states = repeat_kv(value, module.num_key_value_groups)
         attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
@@ -691,6 +694,8 @@ def patch_GptOssAttention():
         # flex_attention_with_sink only works for training since KV cache is wrong
         # switch to flex_attention_with_sink which allows all to work
         # print(query_states.shape, key_states.shape, value_states.shape, flush = True)
+        if os.environ.get('UNSLOTH_SANITY_CHECK', '0') == '1':
+            print('flex')
         attn_output = flex_attention_with_sink(
             self,
             query_states,
