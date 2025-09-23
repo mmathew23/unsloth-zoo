@@ -182,7 +182,7 @@ try:
             "offset", "offset_tensor", "mask_mod_with_offset", "block_mask", "mask_mod", \
             "max_length", "block_size", "sliding_window", "block_mask_slice",
 
-        def __init__(self, key, mask_mod, sliding_window):
+        def __init__(self, key, mask_mod, sliding_window, cache_len = 0):
             bsz, heads_KV, qlen_KV, dim = key.shape
             if sliding_window is None:
                 """
@@ -214,7 +214,7 @@ try:
                 https://github.com/meta-pytorch/gpt-fast/blob/6ecad9b5b6b987d17ac4303965545873d0192086/generate.py#L91
                 """
                 # Get next multiple of FLEX_ATTENTION_KV_INCREMENT
-                div, mod = divmod(qlen_KV, FLEX_ATTENTION_KV_INCREMENT)
+                div, mod = divmod(qlen_KV + cache_len, FLEX_ATTENTION_KV_INCREMENT)
                 n = FLEX_ATTENTION_KV_INCREMENT*div + (FLEX_ATTENTION_KV_INCREMENT if mod != 0 else 0)
                 self.offset = qlen_KV - 2 # Minus two since we need the block mask to use the saved offset_tensor
                 # Minus 2 and not -1 since we do pre-incrementing and not post-incrementing
