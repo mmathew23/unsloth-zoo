@@ -221,7 +221,7 @@ def flex_attention_with_sink(
             if type(sliding_window) is int and sliding_window != 0 else \
             causal_mask
     if block_mask is None:
-        block_mask = create_block_mask(mask_mod, bsz, heads_Q, qlen_KV, qlen_KV, device = key.device)
+        block_mask = create_block_mask(mask_mod, bsz, heads_Q, qlen_Q, qlen_KV, device = key.device)
 
     if os.environ.get('UNSLOTH_DEBUG_MASK', '0') == '1':
         global debug_info
