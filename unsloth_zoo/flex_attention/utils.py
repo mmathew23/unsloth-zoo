@@ -262,8 +262,11 @@ try:
                 For sliding window, it's always sliding_window - 1
                 since 128 means index 127
                 """
-                n = sliding_window
-                self.offset = min(sliding_window, qlen_KV) - 2 # Minus 2 since block mask is indexing
+                # n = sliding_window
+                div, mod = divmod(qlen_KV + cache_len, FLEX_ATTENTION_KV_INCREMENT)
+                n = FLEX_ATTENTION_KV_INCREMENT*div + (FLEX_ATTENTION_KV_INCREMENT if mod != 0 else 0)
+                # self.offset = min(sliding_window, qlen_KV) - 2 # Minus 2 since block mask is indexing
+                self.offset = qlen_KV - 2
                 if self.offset <= -2:
                     # Minimum is -1
                     self.offset = -1
@@ -285,11 +288,11 @@ try:
             if (self.sliding_window is None) or (self.offset < self.sliding_window):
                 self.offset += 1
                 self.offset_tensor.add_(1)
-            elif (self.sliding_window is not None):
-                # Quick return since sliding window mask has the same block mask always
-                # Can only enter here if (self.offset < self.sliding_window) fails
-                # ie the maximum sliding window has been reached already
-                return self.block_mask_slice
+            # elif (self.sliding_window is not None):
+            #     # Quick return since sliding window mask has the same block mask always
+            #     # Can only enter here if (self.offset < self.sliding_window) fails
+            #     # ie the maximum sliding window has been reached already
+            #     return self.block_mask_slice
             if self.offset >= self.max_length:
                 # Must be >= since offset=127, max_length=128 means size=127+1=128
                 # since we do zero indexing
