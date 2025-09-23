@@ -183,6 +183,7 @@ try:
             "max_length", "block_size", "sliding_window", "block_mask_slice",
 
         def __init__(self, key, mask_mod, sliding_window, cache_len = 0):
+            print('cache_len', cache_len)
             bsz, heads_KV, qlen_KV, dim = key.shape
             if sliding_window is None:
                 """
