@@ -265,8 +265,8 @@ try:
                 # n = sliding_window
                 div, mod = divmod(qlen_KV + cache_len, FLEX_ATTENTION_KV_INCREMENT)
                 n = FLEX_ATTENTION_KV_INCREMENT*div + (FLEX_ATTENTION_KV_INCREMENT if mod != 0 else 0)
-                self.offset = min(sliding_window, qlen_KV) - 2 # Minus 2 since block mask is indexing
-                # self.offset = qlen_KV - 2
+                # self.offset = min(sliding_window, qlen_KV) - 2 # Minus 2 since block mask is indexing
+                self.offset = qlen_KV - 2
                 if self.offset <= -2:
                     # Minimum is -1
                     self.offset = -1
