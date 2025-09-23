@@ -285,16 +285,8 @@ try:
             # We increment beforehand to get the correct index since offset_tensor is used
             #                                    Assume sliding_window=128-1 = 127
             #                                    offset=126, so offset+1 = 127
-            if (self.sliding_window is None) or (self.offset < self.sliding_window):
-                self.offset += 1
-                self.offset_tensor.add_(1)
-            elif (self.sliding_window is not None):
-                self.offset += 1
-                self.offset_tensor.add_(1)
-                # Quick return since sliding window mask has the same block mask always
-                # Can only enter here if (self.offset < self.sliding_window) fails
-                # ie the maximum sliding window has been reached already
-                # return self.block_mask_slice
+            self.offset += 1
+            self.offset_tensor.add_(1)
             if self.offset >= self.max_length:
                 # Must be >= since offset=127, max_length=128 means size=127+1=128
                 # since we do zero indexing
