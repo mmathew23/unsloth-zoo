@@ -27,7 +27,7 @@ __all__ = [
     "patch_compiled_autograd",
 ]
 
-from .compiler import UNSLOTH_COMPILE_LOCATION
+from .globals import _get_compile_folder
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config, set_dtype_in_config, HAS_TORCH_DTYPE
 
@@ -131,7 +131,7 @@ def patch_torch_compile(debug = False, O3 = False, ignore_errors = True):
     os.environ.pop("TORCHINDUCTOR_CACHE_DIR", None)
 
     # Duplicate functions will cause hashing issues
-    # os.environ["TORCHINDUCTOR_CACHE_DIR"] = UNSLOTH_COMPILE_LOCATION
+    # os.environ["TORCHINDUCTOR_CACHE_DIR"] = _get_compile_folder()[0]
 
     # https://github.com/sayakpaul/diffusers-torchao?tab=readme-ov-file#things-to-keep-in-mind-when-benchmarking
     os.environ["ENABLE_AOT_AUTOGRAD_CACHE"] = "1"

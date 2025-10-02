@@ -21,6 +21,8 @@ __all__ = [
     "is_distributed",
     "distributed_function",
     "torch_distributed_get_rank",
+    "get_compile_folder",
+    "get_lock",
 ]
 
 from packaging.version import Version as TrueVersion
@@ -32,6 +34,9 @@ import re
 import pathlib
 from typing import Optional
 from filelock import FileLock
+import tempfile
+from .log import logger
+from .globals import _get_compile_folder
 
 def Version(version):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -125,11 +130,29 @@ def distributed_function(n = 1, function = None, *args, **kwargs):
     return result
 pass
 
+def _canon_key(p: str) -> str:
+    s = os.path.abspath(p)
+    if os.name == "nt":
+        s = os.path.normcase(s)
+    return os.path.normpath(s)
+
+def _slug(name: str, maxlen: int = 100) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-")
+    return (name or "_")[:maxlen]
+
+def _lock_name_for(target: str) -> str:
+    canon = _canon_key(target)
+    base  = _slug(pathlib.Path(canon).name)
+    h8    = f"{zlib.crc32(canon.encode('utf-8')) & 0xffffffff:08x}"
+    return f"{base}.{h8}.lock"
+
 def _lock_path_for(target: str) -> str:
     """ str needs to be a valid file path """
-    locks_dir = pathlib.Path(target).parent / ".locks"
+    base_dir = _get_compile_folder()[0]
+    locks_dir = base_dir / ".locks"
     locks_dir.mkdir(parents=True, exist_ok=True)
-    return str(locks_dir / f".lock.{pathlib.Path(target).name}")
+    lock_name = _lock_name_for(target)
+    return str(locks_dir / lock_name)
 
 def get_lock(target: str, timeout: Optional[int] = None) -> FileLock:
     """
@@ -146,6 +169,43 @@ def get_lock(target: str, timeout: Optional[int] = None) -> FileLock:
     if timeout is None:
         timeout = int(os.environ.get("UNSLOTH_LOCK_TIMEOUT", "10"))
     return FileLock(lock_path, timeout=timeout)
+
+def get_compile_folder(use_tempfile = False, distributed = True):
+    if distributed:
+        location, UNSLOTH_COMPILE_USE_TEMP = distributed_function(2, _get_compile_folder, use_tempfile)
+    else:
+        location, UNSLOTH_COMPILE_USE_TEMP = _get_compile_folder(use_tempfile)
+
+    return location, UNSLOTH_COMPILE_USE_TEMP
+pass
+
+@contextlib.contextmanager
+def locked_path(path):
+    lock = get_lock(path)
+    with lock:
+        yield
+
+@contextlib.contextmanager
+def open_locked(path,
+                mode="r",
+                buffering=-1,
+                encoding=None,
+                errors=None,
+                newline=None):
+    kw = {}
+    if "b" not in mode:
+        kw["encoding"] = encoding or "utf-8"
+        if errors is not None:
+            kw["errors"] = errors
+        if newline is not None:
+            kw["newline"] = newline
+
+    with locked_path(path):
+        f = open(path, mode, buffering=buffering, **kw)
+        try:
+            yield f
+        finally:
+            f.close()
 
 # Unsloth Zoo - Utilities for Unsloth
 # Copyright 2023-present Daniel Han-Chen, Michael Han-Chen & the Unsloth team. All rights reserved.
