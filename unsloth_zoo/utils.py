@@ -34,8 +34,7 @@ import re
 import pathlib
 from typing import Optional
 from filelock import FileLock
-import tempfile
-from .log import logger
+import zlib
 from .globals import _get_compile_folder
 
 def Version(version):
@@ -149,7 +148,7 @@ def _lock_name_for(target: str) -> str:
 def _lock_path_for(target: str) -> str:
     """ str needs to be a valid file path """
     base_dir = _get_compile_folder()[0]
-    locks_dir = base_dir / ".locks"
+    locks_dir = pathlib.Path(base_dir) / ".locks"
     locks_dir.mkdir(parents=True, exist_ok=True)
     lock_name = _lock_name_for(target)
     return str(locks_dir / lock_name)
