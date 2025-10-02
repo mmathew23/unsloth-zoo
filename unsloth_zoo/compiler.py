@@ -41,6 +41,7 @@ from .utils import (
     distributed_function,
     get_lock,
     get_compile_folder,
+    write_file,
 )
 from .log import logger
 import triton
@@ -552,39 +553,6 @@ def create_new_function(
 
     if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
         overwrite = False
-
-    # Check location
-    def write_file(function_location, write_new_source):
-        lock = get_lock(function_location)
-        new_write_bytes = write_new_source.encode("utf-8")
-        try:
-            with lock:
-                # existence check
-                try:
-                    st = os.stat(function_location)
-                except Exception as e:
-                    st = None
-
-                need_write = False
-                if st is None or st.st_size != len(new_write_bytes):
-                    need_write = True
-                else:
-                    with open(function_location, "rb") as f:
-                        need_write = f.read() != new_write_bytes
-
-                if need_write:
-                    with open(function_location, "wb", buffering = 0) as file:
-                        file.write(new_write_bytes)
-                        file.flush()
-                        os.fsync(file.fileno())
-            return None
-        except Exception as e:
-            # consider adding logging to main_process only
-            # counterpoint: we may want to see errors on all processes
-            if os.environ.get("UNSLOTH_LOGGING_ENABLED", "0") == "1":
-                logger.error(f"Unsloth: Failed to write file {function_location} because {str(e)}")
-            return None
-    pass
 
     if overwrite or not os.path.isfile(function_location):
         try:
