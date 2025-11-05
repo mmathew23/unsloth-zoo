@@ -159,11 +159,13 @@ def fetch_image(
     image_obj = None
     if isinstance(image, Image.Image):
         image_obj = image
-    elif image.startswith("http://") or image.startswith("https://"):
+    elif isinstance(image, dict) and 'bytes' in image:
+        image_obj = Image.open(BytesIO(image['bytes']))
+    elif isinstance(image, str) and (image.startswith("http://") or image.startswith("https://")):
         image_obj = Image.open(requests.get(image, stream=True).raw)
-    elif image.startswith("file://"):
+    elif isinstance(image, str) and image.startswith("file://"):
         image_obj = Image.open(image[7:])
-    elif image.startswith("data:image"):
+    elif isinstance(image, str) and image.startswith("data:image"):
         if "base64," in image:
             _, base64_data = image.split("base64,", 1)
             data = base64.b64decode(base64_data)
