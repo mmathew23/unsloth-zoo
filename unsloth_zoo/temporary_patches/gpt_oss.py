@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
+from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable, NamedTuple
 import os
 import torch
 import torch.nn as nn
@@ -91,10 +91,10 @@ def detect_triton_api() -> dict:
     try:
         from triton_kernels import matmul, swiglu
         from triton_kernels.reduce import reduce
-        
+
         if hasattr(matmul, 'matmul'):
             return {
-                'version': 'new',
+                'version': 'matmul',
                 'matmul_fn': matmul.matmul,
                 'reduce_fn': reduce,
                 'FnSpecs': matmul.FnSpecs,
@@ -103,17 +103,18 @@ def detect_triton_api() -> dict:
                 'FlexCtx': matmul.FlexCtx,
                 'InFlexData': matmul.InFlexData,
                 'swiglu_fn': swiglu.swiglu_fn,
+                'RoutingInfo': matmul.RoutingInfo,
             }
     except (ImportError, AttributeError):
         pass
-    
+
     # Fall back to old API
     try:
         from triton_kernels import matmul_ogs, swiglu
-        
+
         if hasattr(matmul_ogs, 'matmul_ogs'):
             return {
-                'version': 'old',
+                'version': 'matmul_ogs',
                 'matmul_fn': matmul_ogs.matmul_ogs,
                 'FnSpecs': matmul_ogs.FnSpecs,
                 'FusedActivation': matmul_ogs.FusedActivation,
@@ -124,8 +125,15 @@ def detect_triton_api() -> dict:
             }
     except (ImportError, AttributeError):
         pass
-    
+
     raise ImportError("Could not load triton_kernels")
+
+class RoutingInfo(NamedTuple):
+    gate_scal: torch.Tensor
+    n_expts_act: int
+    raw_data: Any
+    gather_indx: Any
+    scatter_indx: Any
 
 def swizzle_mxfp4(w, w_scale, *args, **kwargs):
     from triton_kernels import tensor, tensor_details
@@ -154,9 +162,86 @@ def swizzle_mxfp4(w, w_scale, *args, **kwargs):
     w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout)
     return w, w_scale
 
+def import_replace_with_mxfp4_linear():
+    try:
+        from transformers.integrations.mxfp4 import _replace_with_mxfp4_linear
+
+        def replace_with_mxfp4_linear(
+            model,
+            modules_to_not_convert=None,
+            current_key_name=None,
+            quantization_config=None,
+            config=None,
+        ):
+            if quantization_config.dequantize: return model
+            modules_to_not_convert = ["lm_head"] if modules_to_not_convert is None else modules_to_not_convert
+            if quantization_config.modules_to_not_convert is not None:
+                modules_to_not_convert.extend(quantization_config.modules_to_not_convert)
+            modules_to_not_convert = list(set(modules_to_not_convert))
+            model, has_been_replaced = _replace_with_mxfp4_linear(
+                model,
+                modules_to_not_convert,
+                current_key_name,
+                quantization_config,
+                config=config,
+            )
+            if not has_been_replaced:
+                logger.warning_once(
+                    "You are loading your model using mixed-precision FP4 quantization but no linear modules were found in your model."
+                    " Please double check your model architecture, or submit an issue on github if you think this is"
+                    " a bug."
+                )
+
+            return model
+
+    except Exception as e:
+        # v5 doesn't define _replace_with_mxfp4_linear and refactored replace_with_mxfp4_linear
+        try:
+            from transformers.quantizers.quantizers_utils import should_convert_module
+        except Exception as e:
+            # from transformers.quantizers.quantizers_utils
+            # Fallback if it moves
+            if UNSLOTH_ENABLE_LOGGING:
+                logger.warning("transformers.quantizers.quantizers_utils.should_convert_module not found. Using fallback.")
+            import re
+            def should_convert_module(full_name, patterns: list[str] | None = None):
+                if patterns is None: return True
+
+                should_not_convert = any(
+                    re.match(f"{key}\\.", full_name) or re.match(f"{key}", full_name) or full_name.endswith(key)
+                    for key in patterns
+                )
+                return not should_not_convert
+
+        def replace_with_mxfp4_linear(model, quantization_config=None, modules_to_not_convert: list[str] | None = None):
+            if quantization_config.dequantize: return model
+
+            has_been_replaced = False
+            for module_name, module in model.named_modules():
+                if not should_convert_module(module_name, modules_to_not_convert):
+                    continue
+                if module.__class__.__name__ == "GptOssExperts" and not quantization_config.dequantize:
+                    with init_empty_weights():
+                        model.set_submodule(module_name, Mxfp4GptOssExperts(model.config))
+                        has_been_replaced = True
+                if module.__class__.__name__ == "GptOssMLP" and not quantization_config.dequantize:
+                    from types import MethodType
+
+                    module.forward = MethodType(mlp_forward, module)
+
+            if not has_been_replaced:
+                logger.warning(
+                    "You are loading your model using mixed-precision FP4 quantization but no linear modules were found in your model."
+                    " Please double check your model architecture, or submit an issue on github if you think this is"
+                    " a bug."
+                )
+
+            return model
+
+    return replace_with_mxfp4_linear
+
 class Mxfp4GptOssExpertsBase(nn.Module):
     """Base class with shared __init__. Subclasses implement forward()."""
-    
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_local_experts
@@ -193,6 +278,7 @@ class Mxfp4GptOssExpertsBase(nn.Module):
         self.down_proj_precision_config = None
         self._act = None
 
+
 def patch_gpt_oss():
     try:
         import triton_kernels
@@ -207,15 +293,13 @@ def patch_gpt_oss():
         import transformers.quantizers.quantizer_mxfp4
         def is_kernels_available(): return True
         transformers.quantizers.quantizer_mxfp4.is_kernels_available = is_kernels_available
-        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.is_kernels_available", e)
 
-    if hasattr(transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"):
-        transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = lambda *args, **kwargs: triton_kernels
-
     try:
         transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer.is_trainable = lambda *args, **kwargs: True
+        if hasattr(transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer, "_lazy_import_kernels"):
+            transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer._lazy_import_kernels = lambda *args, **kwargs: triton_kernels
     except Exception as e:
         return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
 
@@ -224,164 +308,8 @@ def patch_gpt_oss():
     except Exception as e:
         return raise_error("transformers.integrations.mxfp4", e)
 
+    # unsure if this needs to be patched early or if it can be grouped with the other patches
     patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4, match_level = "relaxed")
-
-    class Mxfp4GptOssExperts_Training(torch.autograd.Function):
-        @staticmethod
-        def forward(
-            ctx,
-            hidden_states,
-            self_class,
-            routing_data,
-            gather_idx,
-            scatter_idx,
-        ):
-            pre_activation = matmul_ogs(
-                hidden_states.to(torch.bfloat16), # tl.dot_scaled upcasts to BF16 for old hardware
-                self_class.gate_up_proj,
-                self_class.gate_up_proj_bias,
-                routing_data,
-                gather_indx=gather_idx,
-                scatter_indx=None,
-                precision_config=self_class.gate_up_proj_precision_config,
-                gammas=None,
-                fused_activation=None,
-            )
-            swiglu_output = swiglu_torch_forward(
-                pre_activation,
-                self_class.alpha,
-                self_class.limit,
-            )
-            out = matmul_ogs(
-                swiglu_output,
-                self_class.down_proj,
-                self_class.down_proj_bias,
-                routing_data,
-                gather_indx=None,
-                scatter_indx=scatter_idx,
-                precision_config=self_class.down_proj_precision_config,
-                gammas=routing_data.gate_scal,
-                fused_activation=None,
-            )
-            ctx.save_for_backward(
-                pre_activation,
-                routing_data.gate_scal,
-                gather_idx.src_indx,
-                gather_idx.dst_indx,
-                scatter_idx.src_indx,
-                scatter_idx.dst_indx,
-            )
-            ctx.self_class   = self_class
-            ctx.gather_idx   = gather_idx
-            ctx.scatter_idx  = scatter_idx
-            ctx.routing_data = routing_data
-            return out
-        pass
-
-        @staticmethod
-        def backward(ctx, grad_token):
-            raise NotImplementedError(
-                "Backwards pass using MXFP4 is still under construction!\n"\
-                "Instead, use `unsloth/gpt-oss-20b-BF16` for bfloat16 training which will work for LoRA.\n"\
-                "Or, use `load_in_4bit = True` which allows finetuning."
-            )
-            (pre_act, gamma, gather_src, gather_dst, scatter_src, scatter_dst,) = ctx.saved_tensors
-            self_class = ctx.self_class
-            limit = self_class.limit
-            alpha = self_class.alpha
-
-            # 1) token ➜ expert (reverse of forward scatter)
-            grad_exp = grad_token.index_select(0, scatter_src)
-            grad_exp.mul_(gamma.unsqueeze(-1))
-            # 2) grad_exp · Wdᵀ (reuse forward GEMM kernel)
-            Wd_T = ctx.self_class.down_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, d_model, d_ff)
-            g1   = matmul_ogs(grad_exp, Wd_T, None, ctx.routing_data, gather_indx=ctx.scatter_idx)
-            del Wd_T
-            # 3) activation derivative
-            g1 = swiglu_torch_backward(pre_act, alpha, limit, g1)
-            # 4) g1 · Wuᵀ
-            Wu_T = ctx.self_class.gate_up_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, 2*d_ff, d_model)
-            dx_exp = matmul_ogs(g1, Wu_T, None, ctx.routing_data, scatter_indx=ctx.gather_idx)
-            del Wu_T
-
-            # 5) expert ➜ token (reverse of forward gather)
-            dx_token = torch.zeros_like(grad_token)
-            dx_token.index_add_(0, gather_dst, dx_exp)
-            return (dx_token, None, None, None, None,)
-        pass
-    pass
-
-    class Mxfp4GptOssExperts(nn.Module):
-        def __init__(self, config):
-            super().__init__()
-
-            self.num_experts = config.num_local_experts
-            self.intermediate_size = config.intermediate_size
-            self.hidden_size = config.hidden_size
-
-            self.gate_up_proj_blocks = nn.Parameter(
-                torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, 16, dtype=torch.uint8),
-                requires_grad=False,
-            )
-            self.gate_up_proj_scales = nn.Parameter(
-                torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, dtype=torch.uint8),
-                requires_grad=False,
-            )
-            self.gate_up_proj_bias = nn.Parameter(
-                torch.zeros(self.num_experts, 2 * self.intermediate_size, dtype=torch.float32), requires_grad=False
-            )
-
-            self.down_proj_blocks = nn.Parameter(
-                torch.zeros((self.num_experts, self.hidden_size, self.intermediate_size // 32, 16), dtype=torch.uint8),
-                requires_grad=False,
-            )
-            self.down_proj_scales = nn.Parameter(
-                torch.zeros(self.num_experts, self.hidden_size, self.intermediate_size // 32, dtype=torch.uint8),
-                requires_grad=False,
-            )
-            self.down_proj_bias = nn.Parameter(
-                torch.zeros(self.num_experts, self.hidden_size, dtype=torch.float32), requires_grad=False
-            )
-            self.alpha = 1.702
-            self.limit = getattr(config, "swiglu_limit", 7.0)
-            self.gate_up_proj_precision_config = None
-            self.down_proj_precision_config = None
-
-        def forward(self, hidden_states: torch.Tensor, routing_data, gather_idx, scatter_idx) -> torch.Tensor:
-            with torch_cuda_device(hidden_states.device):
-                if not hasattr(self, "act"):
-                    self.act = FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (self.alpha, self.limit), 2)
-                if not hidden_states.requires_grad:
-                    intermediate_cache1 = matmul_ogs(
-                        hidden_states.to(torch.bfloat16), # tl.dot_scaled upcasts to BF16 for old hardware
-                        self.gate_up_proj,
-                        self.gate_up_proj_bias,
-                        routing_data,
-                        gather_indx=gather_idx,
-                        precision_config=self.gate_up_proj_precision_config,
-                        gammas=None,
-                        fused_activation=self.act,
-                    )
-                    intermediate_cache3 = matmul_ogs(
-                        intermediate_cache1,
-                        self.down_proj,
-                        self.down_proj_bias,
-                        routing_data,
-                        scatter_indx=scatter_idx,
-                        precision_config=self.down_proj_precision_config,
-                        gammas=routing_data.gate_scal if routing_data else None,
-                    )
-                else:
-                    intermediate_cache3 = Mxfp4GptOssExperts_Training.apply(
-                        hidden_states,
-                        self,
-                        routing_data,
-                        gather_idx,
-                        scatter_idx,
-                    )
-            return intermediate_cache3
-        pass
-    patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
 
     try:
         routing = triton_kernels.routing.routing
@@ -389,32 +317,272 @@ def patch_gpt_oss():
     except Exception as e:
         return raise_error("triton_kernels.routing.routing", e)
 
+    try:
+        from transformers.integrations.tensor_parallel import shard_and_distribute_module
+    except Exception as e:
+        return raise_error("transformers.integrations.tensor_parallel.shard_and_distribute_module", e)
+
+    torch_cuda_device = torch.cuda.device
+
+    required_keys = [
+        'version', 'matmul_fn', 'FnSpecs', 'FusedActivation',
+        'PrecisionConfig', 'FlexCtx', 'InFlexData', 'swiglu_fn'
+    ]
+
+    try:
+        assert all(key in api for key in required_keys), f"Missing keys: {set(required_keys) - set(api.keys())}"
+    except AssertionError as e:
+        return raise_error("detect_triton_api", str(e))
+
+    matmul_fn = api['matmul_fn']
+    FnSpecs = api['FnSpecs']
+    FusedActivation = api['FusedActivation']
+    PrecisionConfig = api['PrecisionConfig']
+    FlexCtx = api['FlexCtx']
+    InFlexData = api['InFlexData']
+    swiglu_fn = api['swiglu_fn']
+
+    if api['version'] == 'matmul':
+        if 'reduce_fn' not in api:
+            return raise_error("detect_triton_api", "reduce_fn not found in detect_triton_api")
+
+        reduce_fn = api['reduce_fn']
+
+        def create_precision_config(weight_scale):
+            return PrecisionConfig(b_mx_scale=weight_scale, flex_ctx=FlexCtx(rhs_data=InFlexData()))
+
+        def create_fused_activation(alpha, limit):
+            return FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (alpha, limit), 2)
+
+        def do_routing(logits: torch.Tensor, n_expts_act: int) -> RoutingInfo:
+            from triton_kernels.topk import topk
+            ragged_metadata, gather_indx, scatter_indx = triton_kernels.routing.routing(logits, n_expts_act)
+            sparse_logits = topk(logits, n_expts_act, apply_softmax=True)
+            combine_indx = sparse_logits.mask_metadata.col_sorted_indx
+            gate_scal = sparse_logits.vals.flatten()[combine_indx]
+            return RoutingInfo(gate_scal, n_expts_act, ragged_metadata, gather_indx, scatter_indx)
+
+        def weighted_reduce(out, routing_info):
+            n_expts_act = routing_info.n_expts_act
+            n_tokens = out.shape[0] // n_expts_act
+            dim = out.shape[-1]
+            y_mask = (routing_info.scatter_indx != -1).view(n_tokens, n_expts_act, 1)
+            out_reshaped = out.view(n_tokens, n_expts_act, dim)
+            gammas_reshaped = routing_info.gate_scal.view(n_tokens, n_expts_act, 1)
+            out_weighted = out_reshaped * gammas_reshaped
+            y_mask = y_mask.expand_as(out_weighted)
+            out_reduced, _ = reduce_fn(out_weighted, dim=1, mask=y_mask)
+            return out_reduced
+
+        class Mxfp4GptOssExperts_Training(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, hidden_states, self_class, routing_info):
+                pre_activation = matmul_fn(
+                    hidden_states.to(torch.bfloat16),
+                    self_class.gate_up_proj,
+                    self_class.gate_up_proj_bias,
+                    a_ragged_metadata=routing_info.raw_data,
+                    gather_indx=routing_info.gather_indx,
+                    precision_config=self_class.gate_up_proj_precision_config,
+                    fused_activation=None,
+                )
+                swiglu_output = swiglu_torch_forward(pre_activation, self_class.alpha, self_class.limit)
+                out = matmul_fn(
+                    swiglu_output,
+                    self_class.down_proj,
+                    self_class.down_proj_bias,
+                    a_ragged_metadata=routing_info.raw_data,
+                    scatter_indx=routing_info.scatter_indx,
+                    precision_config=self_class.down_proj_precision_config,
+                )
+                out = weighted_reduce(out, routing_info)
+                ctx.save_for_backward(
+                    pre_activation,
+                    routing_info.gate_scal,
+                    routing_info.gather_indx,
+                    routing_info.scatter_indx,
+                )
+                ctx.self_class = self_class
+                ctx.raw_data = routing_info.raw_data
+                ctx.n_expts_act = routing_info.n_expts_act
+                return out
+
+            @staticmethod
+            def backward(ctx, grad_token):
+                raise NotImplementedError(
+                    "Backwards pass using MXFP4 is still under construction!\n"
+                    "Use `unsloth/gpt-oss-20b-BF16` for bfloat16 training or `load_in_4bit = True`."
+                )
+
+        def forward_inference(self, hidden_states, routing_info):
+            if self._act is None:
+                self._act = create_fused_activation(self.alpha, self.limit)
+            intermediate = matmul_fn(
+                hidden_states.to(torch.bfloat16),
+                self.gate_up_proj,
+                self.gate_up_proj_bias,
+                a_ragged_metadata=routing_info.raw_data,
+                gather_indx=routing_info.gather_indx,
+                precision_config=self.gate_up_proj_precision_config,
+                fused_activation=self._act,
+            )
+            out = matmul_fn(
+                intermediate,
+                self.down_proj,
+                self.down_proj_bias,
+                a_ragged_metadata=routing_info.raw_data,
+                scatter_indx=routing_info.scatter_indx,
+                precision_config=self.down_proj_precision_config,
+            )
+            return weighted_reduce(out, routing_info)
+
+        def experts_forward(self, hidden_states, routing_info, gather_idx, scatter_idx):
+            with torch_cuda_device(hidden_states.device):
+                if hidden_states.requires_grad:
+                    return Mxfp4GptOssExperts_Training.apply(hidden_states, self, routing_info)
+                else:
+                    return forward_inference(self, hidden_states, routing_info)
+
+    else:  # old API
+        def create_precision_config(weight_scale):
+            return PrecisionConfig(weight_scale=weight_scale, flex_ctx=FlexCtx(rhs_data=InFlexData()))
+
+        def create_fused_activation(alpha, limit):
+            return FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (alpha, limit), 2)
+
+        def do_routing(logits: torch.Tensor, n_expts_act: int) -> RoutingInfo:
+            routing_data, gather_indx, scatter_indx = routing(logits, n_expts_act)
+            return RoutingInfo(routing_data.gate_scal, n_expts_act, routing_data, gather_indx, scatter_indx)
+
+        class Mxfp4GptOssExperts_Training(torch.autograd.Function):
+            @staticmethod
+            def forward(
+                ctx,
+                hidden_states,
+                self_class,
+                routing_data,
+                gather_idx,
+                scatter_idx,
+            ):
+                pre_activation = matmul_fn(
+                    hidden_states.to(torch.bfloat16),
+                    self_class.gate_up_proj,
+                    self_class.gate_up_proj_bias,
+                    routing_info.raw_data,
+                    gather_indx=routing_info.gather_indx,
+                    scatter_indx=None,
+                    precision_config=self_class.gate_up_proj_precision_config,
+                    gammas=None,
+                    fused_activation=None,
+                )
+                swiglu_output = swiglu_torch_forward(
+                    pre_activation,
+                    self_class.alpha,
+                    self_class.limit,
+                )
+                out = matmul_fn(
+                    swiglu_output,
+                    self_class.down_proj,
+                    self_class.down_proj_bias,
+                    routing_info.raw_data,
+                    gather_indx=None,
+                    scatter_indx=routing_info.scatter_indx,
+                    precision_config=self_class.down_proj_precision_config,
+                    gammas=routing_info.gate_scal,
+                    fused_activation=None,
+                )
+                ctx.save_for_backward(
+                    pre_activation,
+                    routing_info.gate_scal,
+                    routing_info.gather_idx.src_indx,
+                    routing_info.gather_idx.dst_indx,
+                    routing_info.scatter_idx.src_indx,
+                    routing_info.scatter_idx.dst_indx,
+                )
+                ctx.self_class   = self_class
+                ctx.gather_idx   = routing_info.gather_idx
+                ctx.scatter_idx  = routing_info.scatter_idx
+                ctx.routing_data = routing_info.raw_data
+                return out
+            pass
+
+            @staticmethod
+            def backward(ctx, grad_token):
+                raise NotImplementedError(
+                    "Backwards pass using MXFP4 is still under construction!\n"
+                    "Use `unsloth/gpt-oss-20b-BF16` for bfloat16 training or `load_in_4bit = True`."
+                )
+                (pre_act, gamma, gather_src, gather_dst, scatter_src, scatter_dst,) = ctx.saved_tensors
+                self_class = ctx.self_class
+                limit = self_class.limit
+                alpha = self_class.alpha
+
+                # 1) token ➜ expert (reverse of forward scatter)
+                grad_exp = grad_token.index_select(0, scatter_src)
+                grad_exp.mul_(gamma.unsqueeze(-1))
+                # 2) grad_exp · Wdᵀ (reuse forward GEMM kernel)
+                Wd_T = ctx.self_class.down_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, d_model, d_ff)
+                g1   = matmul_fn(grad_exp, Wd_T, None, ctx.routing_data, gather_indx=ctx.scatter_idx)
+                del Wd_T
+                # 3) activation derivative
+                g1 = swiglu_torch_backward(pre_act, alpha, limit, g1)
+                # 4) g1 · Wuᵀ
+                Wu_T = ctx.self_class.gate_up_proj.data.swapaxes(1, 2).transpose(1, 2).contiguous().transpose(1, 2) # (E, 2*d_ff, d_model)
+                dx_exp = matmul_fn(g1, Wu_T, None, ctx.routing_data, scatter_indx=ctx.gather_idx)
+                del Wu_T
+
+                # 5) expert ➜ token (reverse of forward gather)
+                dx_token = torch.zeros_like(grad_token)
+                dx_token.index_add_(0, gather_dst, dx_exp)
+                return (dx_token, None, None, None, None,)
+            pass
+        pass
+
+        def forward_inference(self, hidden_states, routing_info):
+            if self._act is None:
+                self._act = create_fused_activation(self.alpha, self.limit)
+            intermediate = matmul_fn(
+                hidden_states.to(torch.bfloat16),
+                self.gate_up_proj,
+                self.gate_up_proj_bias,
+                routing_info.raw_data,
+                gather_indx=routing_info.gather_indx,
+                precision_config=self.gate_up_proj_precision_config,
+                gammas=None,
+                fused_activation=self._act,
+            )
+            out = matmul_fn(
+                intermediate,
+                self.down_proj,
+                self.down_proj_bias,
+                routing_info.raw_data,
+                scatter_indx=routing_info.scatter_indx,
+                precision_config=self.down_proj_precision_config,
+                gammas=routing_info.gate_scal,
+            )
+            return out
+
+        def experts_forward(self, hidden_states, routing_info, gather_idx, scatter_idx):
+            with torch_cuda_device(hidden_states.device):
+                if hidden_states.requires_grad:
+                    return Mxfp4GptOssExperts_Training.apply(hidden_states, self, routing_info)
+                else:
+                    return forward_inference(self, hidden_states, routing_info)
+
+    class Mxfp4GptOssExperts(Mxfp4GptOssExpertsBase):
+        forward = experts_forward
+
     def mlp_forward(self, hidden_states):
         batch_size = hidden_states.shape[0]
         hidden_states = hidden_states.reshape(-1, self.router.hidden_dim)
         router_logits = nn.functional.linear(hidden_states, self.router.weight, self.router.bias)
 
         with torch_cuda_device(router_logits.device):
-            routing_data, gather_idx, scatter_idx = routing(router_logits, self.router.top_k)
+            routing_info = do_routing(router_logits, self.router.top_k)
 
-        routed_out = self.experts(hidden_states, routing_data, gather_idx, scatter_idx)
+        routed_out = self.experts(hidden_states, routing_info, routing_info.gather_indx, routing_info.scatter_indx)
         routed_out = routed_out.reshape(batch_size, -1, self.router.hidden_dim)
         return routed_out, router_logits
-    patch_function(transformers.integrations.mxfp4, "mlp_forward", mlp_forward)
-
-    try:
-        PrecisionConfig, FlexCtx, InFlexData = (
-            triton_kernels.matmul_ogs.PrecisionConfig,
-            triton_kernels.matmul_ogs.FlexCtx,
-            triton_kernels.matmul_ogs.InFlexData,
-        )
-    except Exception as e:
-        return raise_error("triton_kernels.matmul_ogs", e)
-
-    try:
-        from transformers.integrations.tensor_parallel import shard_and_distribute_module
-    except Exception as e:
-        return raise_error("transformers.integrations.tensor_parallel.shard_and_distribute_module", e)
 
     def load_and_swizzle_mxfp4(module, param_name, param_value, target_device, *args, **kwargs):
         model = kwargs.get("model", None)
@@ -467,11 +635,7 @@ def patch_gpt_oss():
 
                     # triton_weight_tensor is what needs to be passed in oai kernels. It stores the data, the shapes and any more objects. It is like a subtensor
                     setattr(module, proj, triton_weight_tensor)
-                    setattr(
-                        module,
-                        f"{proj}_precision_config",
-                        PrecisionConfig(weight_scale=weight_scale, flex_ctx=FlexCtx(rhs_data=InFlexData())),
-                    )
+                    setattr(module, f"{proj}_precision_config", create_precision_config(weight_scale))
 
                     # delete blocks and scales
                     delattr(module, scales_attr)
@@ -479,40 +643,12 @@ def patch_gpt_oss():
                     # setattr(module, blocks_attr, torch.nn.Parameter(triton_weight_tensor.storage.data, requires_grad=False))
                     del blocks
     pass
+
+    replace_with_mxfp4_linear = import_replace_with_mxfp4_linear()
+
+    patch_function(transformers.integrations.mxfp4, "Mxfp4GptOssExperts", Mxfp4GptOssExperts)
+    patch_function(transformers.integrations.mxfp4, "mlp_forward", mlp_forward)
     patch_function(transformers.integrations.mxfp4, "load_and_swizzle_mxfp4", load_and_swizzle_mxfp4, match_level = "relaxed")
-
-    try:
-        from transformers.integrations.mxfp4 import _replace_with_mxfp4_linear
-    except Exception as e:
-        return raise_error("transformers.integrations.mxfp4._replace_with_mxfp4_linear", e)
-
-    def replace_with_mxfp4_linear(
-        model,
-        modules_to_not_convert=None,
-        current_key_name=None,
-        quantization_config=None,
-        config=None,
-    ):
-        if quantization_config.dequantize: return model
-        modules_to_not_convert = ["lm_head"] if modules_to_not_convert is None else modules_to_not_convert
-        if quantization_config.modules_to_not_convert is not None:
-            modules_to_not_convert.extend(quantization_config.modules_to_not_convert)
-        modules_to_not_convert = list(set(modules_to_not_convert))
-        model, has_been_replaced = _replace_with_mxfp4_linear(
-            model,
-            modules_to_not_convert,
-            current_key_name,
-            quantization_config,
-            config=config,
-        )
-        if not has_been_replaced:
-            logger.warning_once(
-                "You are loading your model using mixed-precision FP4 quantization but no linear modules were found in your model."
-                " Please double check your model architecture, or submit an issue on github if you think this is"
-                " a bug."
-            )
-
-        return model
     patch_function(transformers.integrations.mxfp4, "replace_with_mxfp4_linear", replace_with_mxfp4_linear)
 pass
 TEMPORARY_PATCHES.append(patch_gpt_oss)
