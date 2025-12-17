@@ -101,7 +101,6 @@ def detect_triton_api() -> dict:
                 'FlexCtx': matmul.FlexCtx,
                 'InFlexData': matmul.InFlexData,
                 'swiglu_fn': swiglu.swiglu_fn,
-                'RoutingInfo': matmul.RoutingInfo,
             }
     except (ImportError, AttributeError):
         pass
@@ -313,7 +312,8 @@ def patch_gpt_oss():
         routing = triton_kernels.routing.routing
         routing = torch.compiler.disable(routing)
     except Exception as e:
-        return raise_error("triton_kernels.routing.routing", e)
+        # routing api has been removed
+        routing = None
 
     try:
         from transformers.integrations.tensor_parallel import shard_and_distribute_module
@@ -349,10 +349,20 @@ def patch_gpt_oss():
 
         def do_routing(logits: torch.Tensor, n_expts_act: int) -> RoutingInfo:
             from triton_kernels.topk import topk
-            ragged_metadata, gather_indx, scatter_indx = triton_kernels.routing.routing(logits, n_expts_act)
+            from triton_kernels.tensor import make_ragged_tensor_metadata
+
             sparse_logits = topk(logits, n_expts_act, apply_softmax=True)
+            dispatch_indx = sparse_logits.mask_metadata.row_sorted_indx
             combine_indx = sparse_logits.mask_metadata.col_sorted_indx
+            ragged_metadata = make_ragged_tensor_metadata(sparse_logits.mask_metadata.col_sum, dispatch_indx.shape[0])
+
+            # Gate scaling factors (softmaxed topk values, reordered to match scatter order)
             gate_scal = sparse_logits.vals.flatten()[combine_indx]
+
+            # Indices for new API
+            gather_indx = combine_indx // n_expts_act
+            scatter_indx = combine_indx
+
             return RoutingInfo(gate_scal, n_expts_act, ragged_metadata, gather_indx, scatter_indx)
 
         class Mxfp4GptOssExperts_Training(torch.autograd.Function):
