@@ -90,6 +90,7 @@ def detect_triton_api() -> dict:
     # Try new API first
     try:
         from triton_kernels import matmul, swiglu
+        from triton_kernels.reduce import reduce
 
         if hasattr(matmul, 'matmul'):
             return {
@@ -101,6 +102,7 @@ def detect_triton_api() -> dict:
                 'FlexCtx': matmul.FlexCtx,
                 'InFlexData': matmul.InFlexData,
                 'swiglu_fn': swiglu.swiglu_fn,
+                'reduce_fn': reduce,
             }
     except (ImportError, AttributeError):
         pass
@@ -341,6 +343,10 @@ def patch_gpt_oss():
     swiglu_fn = api['swiglu_fn']
 
     if api['version'] == 'matmul':
+        if 'reduce_fn' not in api:
+            return raise_error("detect_triton_api", "reduce_fn not found in detect_triton_api")
+
+        reduce_fn = api['reduce_fn']
         def create_precision_config(weight_scale):
             return PrecisionConfig(b_mx_scale=weight_scale, flex_ctx=FlexCtx(rhs_data=InFlexData()))
 
@@ -395,6 +401,7 @@ def patch_gpt_oss():
                     scatter_indx=routing_info.scatter_indx,
                     precision_config=self_class.down_proj_precision_config,
                 )
+                out = weighted_reduce(out, routing_info)
                 ctx.save_for_backward(
                     pre_activation,
                     routing_info.gate_scal,
@@ -412,6 +419,14 @@ def patch_gpt_oss():
                     "Backwards pass using MXFP4 is still under construction!\n"
                     "Use `unsloth/gpt-oss-20b-BF16` for bfloat16 training or `load_in_4bit = True`."
                 )
+
+        def weighted_reduce(out, routing_info):
+            n_expts_act = routing_info.n_expts_act
+            out = out.view(-1, n_expts_act, out.shape[-1])
+            gammas = routing_info.gate_scal.view(-1, n_expts_act, 1)
+            out_weighted = out * gammas
+            out_reduced, _ = reduce_fn(out_weighted, dim=1)
+            return out_reduced
 
         def forward_inference(self, hidden_states, routing_info):
             if self._act is None:
@@ -432,9 +447,9 @@ def patch_gpt_oss():
                 a_ragged_metadata=routing_info.raw_data,
                 scatter_indx=routing_info.scatter_indx,
                 precision_config=self.down_proj_precision_config,
-                gammas=routing_info.gate_scal,
+                # gammas=routing_info.gate_scal,
             )
-            return out
+            return weighted_reduce(out, routing_info)
 
         def experts_forward(self, hidden_states, routing_info, gather_idx, scatter_idx):
             with torch_cuda_device(hidden_states.device):
