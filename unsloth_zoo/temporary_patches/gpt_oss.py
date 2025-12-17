@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import inspect
+from functools import lru_cache
 from .common import (
     TEMPORARY_PATCHES,
     torch_compile,
@@ -83,12 +84,124 @@ def swiglu_torch_backward(pre_act, alpha, limit, g1):
     return g1 * grad.to(g1.dtype)
 pass
 
+@lru_cache(maxsize=1)
+def detect_triton_api() -> dict:
+    """Detect which triton_kernels API is available."""
+    # Try new API first
+    try:
+        from triton_kernels import matmul, swiglu
+        from triton_kernels.reduce import reduce
+        
+        if hasattr(matmul, 'matmul'):
+            return {
+                'version': 'new',
+                'matmul_fn': matmul.matmul,
+                'reduce_fn': reduce,
+                'FnSpecs': matmul.FnSpecs,
+                'FusedActivation': matmul.FusedActivation,
+                'PrecisionConfig': matmul.PrecisionConfig,
+                'FlexCtx': matmul.FlexCtx,
+                'InFlexData': matmul.InFlexData,
+                'swiglu_fn': swiglu.swiglu_fn,
+            }
+    except (ImportError, AttributeError):
+        pass
+    
+    # Fall back to old API
+    try:
+        from triton_kernels import matmul_ogs, swiglu
+        
+        if hasattr(matmul_ogs, 'matmul_ogs'):
+            return {
+                'version': 'old',
+                'matmul_fn': matmul_ogs.matmul_ogs,
+                'FnSpecs': matmul_ogs.FnSpecs,
+                'FusedActivation': matmul_ogs.FusedActivation,
+                'PrecisionConfig': matmul_ogs.PrecisionConfig,
+                'FlexCtx': matmul_ogs.FlexCtx,
+                'InFlexData': matmul_ogs.InFlexData,
+                'swiglu_fn': swiglu.swiglu_fn,
+            }
+    except (ImportError, AttributeError):
+        pass
+    
+    raise ImportError("Could not load triton_kernels")
+
+def swizzle_mxfp4(w, w_scale, *args, **kwargs):
+    from triton_kernels import tensor, tensor_details
+    FP4, convert_layout, wrap_torch_tensor = (
+        tensor.FP4,
+        tensor.convert_layout,
+        tensor.wrap_torch_tensor,
+    )
+    layout = tensor_details.layout
+    StridedLayout = tensor_details.layout.StridedLayout
+
+    value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(mx_axis=1)
+    w = convert_layout(wrap_torch_tensor(w, dtype=FP4), value_layout, **value_layout_opts)
+    # TODO : add that when we are actually sure that it works on B200
+    # if torch.cuda.get_device_capability()[0] == 10:
+    #     constraints = {
+    #         "is_persistent": True,
+    #         "epilogue_subtile": 1,
+    #     }
+    #     opt_flags.update_opt_flags_constraints(constraints)
+    # # transpose the tensor so that the quantization axis is on dim1
+
+    # TODO: there is still an issue with the scales on hopper
+    # scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(mx_axis=1, num_warps=8)
+    # w_scale = convert_layout(wrap_torch_tensor(w_scale), scale_layout, **scale_layout_opts)
+    w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout)
+    return w, w_scale
+
+class Mxfp4GptOssExpertsBase(nn.Module):
+    """Base class with shared __init__. Subclasses implement forward()."""
+    
+    def __init__(self, config):
+        super().__init__()
+        self.num_experts = config.num_local_experts
+        self.intermediate_size = config.intermediate_size
+        self.hidden_size = config.hidden_size
+        self.alpha = 1.702
+        self.limit = getattr(config, "swiglu_limit", 7.0)
+
+        self.gate_up_proj_blocks = nn.Parameter(
+            torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, 16, dtype=torch.uint8),
+            requires_grad=False,
+        )
+        self.gate_up_proj_scales = nn.Parameter(
+            torch.zeros(self.num_experts, 2 * self.intermediate_size, self.hidden_size // 32, dtype=torch.uint8),
+            requires_grad=False,
+        )
+        self.gate_up_proj_bias = nn.Parameter(
+            torch.zeros(self.num_experts, 2 * self.intermediate_size, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.down_proj_blocks = nn.Parameter(
+            torch.zeros(self.num_experts, self.hidden_size, self.intermediate_size // 32, 16, dtype=torch.uint8),
+            requires_grad=False,
+        )
+        self.down_proj_scales = nn.Parameter(
+            torch.zeros(self.num_experts, self.hidden_size, self.intermediate_size // 32, dtype=torch.uint8),
+            requires_grad=False,
+        )
+        self.down_proj_bias = nn.Parameter(
+            torch.zeros(self.num_experts, self.hidden_size, dtype=torch.float32),
+            requires_grad=False,
+        )
+        self.gate_up_proj_precision_config = None
+        self.down_proj_precision_config = None
+        self._act = None
 
 def patch_gpt_oss():
     try:
         import triton_kernels
     except Exception as e:
         return raise_error("Please install triton_kernels", e)
+    try:
+        api = detect_triton_api()
+    except ImportError as e:
+        return raise_error("triton_kernels", e)
 
     try:
         import transformers.quantizers.quantizer_mxfp4
@@ -107,47 +220,10 @@ def patch_gpt_oss():
         return raise_error("transformers.quantizers.quantizer_mxfp4.Mxfp4HfQuantizer", e)
 
     try:
-        from triton_kernels import matmul_ogs, swiglu
-        FnSpecs, FusedActivation, matmul_ogs = (
-            matmul_ogs.FnSpecs,
-            matmul_ogs.FusedActivation,
-            matmul_ogs.matmul_ogs,
-        )
-        swiglu_fn = swiglu.swiglu_fn
-    except Exception as e:
-        return raise_error("triton_kernels", e)
-
-    try:
         import transformers.integrations.mxfp4
     except Exception as e:
         return raise_error("transformers.integrations.mxfp4", e)
 
-    def swizzle_mxfp4(w, w_scale, *args, **kwargs):
-        from triton_kernels import tensor, tensor_details
-        FP4, convert_layout, wrap_torch_tensor = (
-            tensor.FP4,
-            tensor.convert_layout,
-            tensor.wrap_torch_tensor,
-        )
-        layout = tensor_details.layout
-        StridedLayout = tensor_details.layout.StridedLayout
-
-        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(mx_axis=1)
-        w = convert_layout(wrap_torch_tensor(w, dtype=FP4), value_layout, **value_layout_opts)
-        # TODO : add that when we are actually sure that it works on B200
-        # if torch.cuda.get_device_capability()[0] == 10:
-        #     constraints = {
-        #         "is_persistent": True,
-        #         "epilogue_subtile": 1,
-        #     }
-        #     opt_flags.update_opt_flags_constraints(constraints)
-        # # transpose the tensor so that the quantization axis is on dim1
-
-        # TODO: there is still an issue with the scales on hopper
-        # scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(mx_axis=1, num_warps=8)
-        # w_scale = convert_layout(wrap_torch_tensor(w_scale), scale_layout, **scale_layout_opts)
-        w_scale = convert_layout(wrap_torch_tensor(w_scale), StridedLayout)
-        return w, w_scale
     patch_function(transformers.integrations.mxfp4, "swizzle_mxfp4", swizzle_mxfp4, match_level = "relaxed")
 
     class Mxfp4GptOssExperts_Training(torch.autograd.Function):
