@@ -345,7 +345,16 @@ def patch_gpt_oss():
             return PrecisionConfig(b_mx_scale=weight_scale, flex_ctx=FlexCtx(rhs_data=InFlexData()))
 
         def create_fused_activation(alpha, limit):
-            return FusedActivation(FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (alpha, limit), 2)
+            return FusedActivation(
+                specs=FnSpecs(
+                    name="swiglu",
+                    fn=swiglu_fn,
+                    fn_arg_names=("alpha", "limit"),
+                    fn_arg_do_not_specialize=tuple(),
+                    reduction_n=2,
+                ),
+                fn_args=(alpha, limit),
+            )
 
         def do_routing(logits: torch.Tensor, n_expts_act: int) -> RoutingInfo:
             from triton_kernels.topk import topk
