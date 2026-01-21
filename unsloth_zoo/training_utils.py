@@ -208,7 +208,14 @@ def prepare_model_for_training(
     # Also set HF version manually to stop failures
     if hasattr(model, "_set_gradient_checkpointing"):
         if use_gradient_checkpointing in (True, "unsloth"):
-            model._set_gradient_checkpointing()
+            # Pass the current torch.utils.checkpoint.checkpoint to use the patched version
+            # The default argument in _set_gradient_checkpointing captures the original
+            # function at import time, so we must explicitly pass our patched version
+            from torch.utils.checkpoint import checkpoint as _current_checkpoint
+            model._set_gradient_checkpointing(
+                enable=True,
+                gradient_checkpointing_func=_current_checkpoint
+            )
         else:
             # Ensure checkpointing stays disabled if explicitly requested.
             for module in model.modules():
