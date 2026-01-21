@@ -92,7 +92,7 @@ pass
 def prepare_model_for_training(
     model                      : Any,
     use_gradient_checkpointing : Optional = "unsloth",
-    use_reentrant              : Optional[bool] = True,
+    use_reentrant              : Optional[bool] = False,
     full_finetuning            : Optional[bool] = False,
     train_layernorms           : Optional[bool] = False,
     train_embedding            : Optional[bool] = False,
@@ -215,14 +215,14 @@ def prepare_model_for_training(
                 if hasattr(module, "gradient_checkpointing"):
                     module.gradient_checkpointing = False
 
-    # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
-    if use_reentrant:
-        if hasattr(model, "enable_input_require_grads"):
-            model.enable_input_require_grads()
-        else:
-            def make_inputs_require_grad(module, input, output):
-                output.requires_grad_(True)
-            model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
+    # Always enable input gradients for proper gradient flow during training.
+    # This ensures gradients propagate correctly through the embedding layer.
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+    else:
+        def make_inputs_require_grad(module, input, output):
+            output.requires_grad_(True)
+        model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
     pass
 
     # Upcast modules_to_save
