@@ -1052,14 +1052,14 @@ def unsloth_checkpoint(
 
     debug_gc = os.environ.get("UNSLOTH_DEBUG_GC", "0") == "1"
 
-    # Always use our offloading implementation for consistency
-    # The should_offload logic determines IF we actually copy to CPU, but we always
-    # use the same code path
+    # Always use our non-reentrant checkpointing implementation
+    # cpu_buffer_index >= 0 means offload to CPU, -1 means no offload (but still checkpoint)
+    cpu_idx = current_cpu_index if should_offload else -1
     if debug_gc:
-        print(f"[DEBUG] Using _UnslothOffloadedCheckpointFunction, should_offload={should_offload}, cpu_buffer_index={current_cpu_index}")
+        print(f"[DEBUG] _UnslothOffloadedCheckpointFunction: args={len(args)}, offload={should_offload}, cpu_idx={cpu_idx}")
 
     return _UnslothOffloadedCheckpointFunction.apply(
-        function, preserve, current_cpu_index if should_offload else -1, *args
+        function, preserve, cpu_idx, *args
     )
 pass
 
@@ -1069,17 +1069,17 @@ def patch_unsloth_smart_gradient_checkpointing(dtype = None):
     All Unsloth Zoo code licensed under LGPLv3
 
     Patches torch.utils.checkpoint.checkpoint to use Unsloth's optimized
-    checkpointing with smart CPU offloading.
+    non-reentrant checkpointing with smart CPU offloading.
     """
     # Initialize buffers for CPU offloading
     initialize_unsloth_gradient_checkpointing(dtype)
 
-    # Patch CheckpointFunction for reentrant mode (used by default in transformers)
-    if torch.utils.checkpoint.CheckpointFunction.__name__ != "UnslothReentrantCheckpointFunction":
+    # Patch CheckpointFunction in case any code uses it directly
+    if torch.utils.checkpoint.CheckpointFunction.__name__ != "_UnslothOffloadedCheckpointFunction":
         torch.utils.checkpoint._old_CheckpointFunction = torch.utils.checkpoint.CheckpointFunction
-        torch.utils.checkpoint.CheckpointFunction = UnslothReentrantCheckpointFunction
+        torch.utils.checkpoint.CheckpointFunction = _UnslothOffloadedCheckpointFunction
 
-    # Patch torch.utils.checkpoint.checkpoint
+    # Patch torch.utils.checkpoint.checkpoint to use our non-reentrant implementation
     if torch.utils.checkpoint.checkpoint.__name__ != "unsloth_checkpoint":
         torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
         torch.utils.checkpoint.checkpoint = unsloth_checkpoint
