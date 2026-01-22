@@ -170,6 +170,7 @@ class TiledMLP(torch.autograd.Function):
                 if ctx.had_device_in_fwd:
                     set_device_states(ctx.fwd_devices, ctx.fwd_device_states, device_type=ctx.device_type)
 
+            # Pre-allocate gradient buffer ONCE (memory optimization preserved)
             x_gradients = torch.zeros_like(x, memory_format=torch.preserve_format)
             x = x.view(-1, H)
             # chunk on seq length, assume index before last
@@ -177,8 +178,11 @@ class TiledMLP(torch.autograd.Function):
             start_idx = 0
             extra_outputs = []
             for i, x_split in enumerate(x_splits):
-                x_split = x_split.unsqueeze(0)
+                # Detach and unsqueeze - we use grad() instead of .grad attribute
+                x_split = x_split.detach().unsqueeze(0)
                 split_size = x_split.numel()
+
+                # Get view into pre-allocated gradient buffer
                 x_grad_slice = x_gradients.view(-1).narrow(
                     dim=0,
                     start=start_idx,
@@ -191,12 +195,22 @@ class TiledMLP(torch.autograd.Function):
                     length=split_size,
                 ).view_as(x_split)
 
+                # Recompute forward with grad tracking
                 x_split.requires_grad_(True)
-                x_split.grad = x_grad_slice
                 with torch.enable_grad():
                     outputs = TiledMLP.handle_output(ctx.mlp_forward(x_split), extra_outputs)
 
-                torch.autograd.backward(outputs, grad_output_shard)
+                # NON-REENTRANT: Use grad() instead of backward()
+                # Returns gradients directly instead of accumulating into .grad
+                (x_split_grad,) = torch.autograd.grad(
+                    outputs,
+                    x_split,
+                    grad_outputs=grad_output_shard,
+                    retain_graph=False,
+                )
+
+                # Copy into pre-allocated buffer (preserves memory efficiency)
+                x_grad_slice.copy_(x_split_grad)
                 start_idx += split_size
 
         return None, None, x_gradients, None, None, None
