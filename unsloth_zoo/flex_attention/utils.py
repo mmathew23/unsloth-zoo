@@ -16,6 +16,7 @@
 
 __all__ = [
     "HAS_FLEX_ATTENTION",
+    "HAS_NJT_FLEX_ATTENTION",
     "FLEX_ATTENTION_BLOCK_SIZE",
     "_flex_attention",
     "flex_attention",
@@ -31,6 +32,10 @@ __all__ = [
     "generate_sliding_window_mask",
     "generate_sliding_window_mask_with_padding",
     "generate_decoding_sliding_window_mask_with_padding",
+
+    # NJT FlexAttention utilities
+    "create_njt_block_mask",
+    "njt_flex_attention",
 ]
 
 import torch
@@ -46,6 +51,14 @@ try:
     )
     HAS_FLEX_ATTENTION = True
     from torch.nn.attention.flex_attention import _score_mod_signature, _mask_mod_signature
+
+    # NJT (Nested Jagged Tensor) support for FlexAttention
+    try:
+        from torch.nn.attention.flex_attention import create_nested_block_mask as _create_nested_block_mask
+        HAS_NJT_FLEX_ATTENTION = True
+    except ImportError:
+        HAS_NJT_FLEX_ATTENTION = False
+        _create_nested_block_mask = None
 
     # Determine kernel_options since low memory GPUs will go out of memory
     # InductorError: RuntimeError: No valid triton configs. OutOfMemoryError: out of resource: triton_tem_fused_0 Required: 65536 Hardware limit:65536 Reducing block sizes or `num_stages` may help.
@@ -343,14 +356,85 @@ try:
             block_mask_slice.seq_lengths = (1, qlen_KV)
             self.block_mask_slice = block_mask_slice
             return block_mask_slice
+
+    # NJT FlexAttention utilities
+    def create_njt_block_mask(
+        mask_mod,
+        njt_q,
+        njt_kv = None,
+        device = "cuda",
+    ):
+        """Create a block mask for FlexAttention with Nested Jagged Tensors (NJTs).
+
+        This function uses create_nested_block_mask to create attention masks
+        that are compatible with variable-length sequences represented as NJTs.
+
+        Args:
+            mask_mod: A mask modification function (e.g., causal_mask).
+            njt_q: NJT query tensor with shape (B, num_heads, S*, head_dim).
+            njt_kv: Optional NJT key/value tensor for cross-attention.
+                    If None, uses njt_q for both query and key/value.
+            device: Target device.
+
+        Returns:
+            BlockMask for use with flex_attention.
+        """
+        if not HAS_NJT_FLEX_ATTENTION:
+            raise RuntimeError(
+                "NJT FlexAttention requires PyTorch 2.5+ with create_nested_block_mask support"
+            )
+        return _create_nested_block_mask(
+            mask_mod,
+            B = None,  # Batch size determined by NJT
+            H = None,  # Number of heads determined by NJT
+            q_nt = njt_q,
+            kv_nt = njt_kv,
+            _compile = True,  # Critical for memory efficiency
+        )
+
+    def njt_flex_attention(
+        njt_q,
+        njt_k,
+        njt_v,
+        mask_mod = None,
+        score_mod = None,
+        enable_gqa = True,
+    ):
+        """Run FlexAttention with Nested Jagged Tensor inputs.
+
+        Args:
+            njt_q: NJT query tensor with shape (B, num_heads, S*, head_dim).
+            njt_k: NJT key tensor.
+            njt_v: NJT value tensor.
+            mask_mod: Optional mask modification function (default: causal_mask).
+            score_mod: Optional score modification function.
+            enable_gqa: Whether to enable grouped query attention.
+
+        Returns:
+            NJT output tensor with shape (B, num_heads, S*, head_dim).
+        """
+        if mask_mod is None:
+            mask_mod = causal_mask
+
+        block_mask = create_njt_block_mask(mask_mod, njt_q, njt_k)
+
+        kwargs = {"block_mask": block_mask, "enable_gqa": enable_gqa}
+        if score_mod is not None:
+            kwargs["score_mod"] = score_mod
+
+        return flex_attention(njt_q, njt_k, njt_v, **kwargs)
+
     pass
 
 except:
     HAS_FLEX_ATTENTION = False
+    HAS_NJT_FLEX_ATTENTION = False
     FLEX_ATTENTION_BLOCK_SIZE = None
     flex_attention = None
     create_block_mask_cached = None
     causal_mask = None
     generate_sliding_window_mask = None
     FlexAttentionCache = None
+    create_njt_block_mask = None
+    njt_flex_attention = None
 pass

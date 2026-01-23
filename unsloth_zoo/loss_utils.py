@@ -334,11 +334,30 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
             token_counts = []
             for x in batch_samples:
                 labels = x["labels"]
+
+                # Handle NJT (Nested Jagged Tensor) labels
+                is_njt = hasattr(labels, "is_nested") and labels.is_nested
+                if is_njt:
+                    # For NJT, extract values and count tokens directly
+                    # NJT values are already concatenated, so slice on dim 0
+                    labels_flat = labels.values()
+                    token_count = (labels_flat[1:] != -100).sum()
+                    # Subtract number of sequences (boundary positions)
+                    num_seqs = labels_flat.shape[0] - labels.values().shape[0] + len(labels.offsets()) - 1
+                    njt_seq_lengths = x.get("njt_seq_lengths")
+                    if njt_seq_lengths is not None:
+                        # Each sequence's last token shouldn't be counted
+                        token_count = token_count - (len(njt_seq_lengths) - 1)
+                    token_counts.append(token_count)
+                    continue
+
                 token_count = (labels[..., 1:] != -100)
                 if "input_ids" in x:
                     input_ids = x["input_ids"]
-                    mark_static (input_ids, 0)
-                    mark_dynamic(input_ids, 1)
+                    # Skip mark_static/dynamic for NJT input_ids
+                    if not (hasattr(input_ids, "is_nested") and input_ids.is_nested):
+                        mark_static (input_ids, 0)
+                        mark_dynamic(input_ids, 1)
                 if "attention_mask" in x:
                     attention_mask = x["attention_mask"]
                     mark_static (attention_mask, 0)

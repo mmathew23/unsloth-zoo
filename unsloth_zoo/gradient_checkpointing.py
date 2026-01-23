@@ -431,17 +431,46 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                     CURRENT_GC_INDEX += 1
 
                     ctx._requires_gradient = True
-                    new_size = arg.numel()
 
+                    # Declare all globals upfront to avoid Python's global declaration order issues
                     global MINIMUM_SIZE
                     global CPU_INDEX
+                    global CPU_BUFFERS
+                    global GPU_BUFFERS
+                    global BACKWARD_PASS
+                    global EXTRA_STREAMS
+                    global MAIN_STREAMS
+                    global USE_UNSLOTH_GC
+
+                    # Handle NJT tensors - use direct copy instead of buffer approach
+                    # since NJT shapes contain symbolic dimensions
+                    is_njt = hasattr(arg, "is_nested") and arg.is_nested
+                    if is_njt:
+                        # For NJT, copy directly to CPU (no buffer, no view operations)
+                        device = arg.device
+                        device_index = device.index if device.index is not None else 0
+                        MAIN_STREAM = MAIN_STREAMS[device_index]
+                        EXTRA_STREAM = EXTRA_STREAMS[device_index]
+
+                        # Copy NJT to CPU
+                        EXTRA_STREAM.wait_stream(MAIN_STREAM)
+                        with torch_gpu_stream(EXTRA_STREAM):
+                            cpu_tensor = arg.to("cpu", non_blocking=True)
+
+                        ctx._saved_metadata = ("njt", cpu_tensor, device_index, MAIN_STREAM, EXTRA_STREAM, None,)
+                        tensor_inputs.append(None)
+                        ctx.tensor_indices.append(i)
+                        ctx.inputs.append(None)
+
+                        if USE_UNSLOTH_GC:
+                            print("Unsloth: Will smartly offload gradients to save VRAM!")
+                            USE_UNSLOTH_GC = False
+                        continue
+
+                    new_size = arg.numel()
+
                     if new_size > MINIMUM_SIZE and ((CURRENT_GC_INDEX != LAST_GC_INDEX) or FIRST_PASS):
                         use_gpu_buffer = True
-                        global CPU_BUFFERS
-                        global GPU_BUFFERS
-                        global BACKWARD_PASS
-                        global EXTRA_STREAMS
-                        global MAIN_STREAMS
                         device = arg.device
                         device_index = device.index
                         GPU_BUFFER   = GPU_BUFFERS  [device_index]
@@ -475,7 +504,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         CPU_INDEX += 1
                         tensor_inputs.append(None)
 
-                        global USE_UNSLOTH_GC
                         if USE_UNSLOTH_GC:
                             print("Unsloth: Will smartly offload gradients to save VRAM!")
                             USE_UNSLOTH_GC = False
@@ -520,20 +548,34 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         tensor_indices = ctx.tensor_indices
         tensors = ctx.saved_tensors
 
-        new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM = ctx._saved_metadata
-        if CPU_INDEX is not None:
-            global GPU_BUFFER
-            buffer = GPU_BUFFERS[device_index][:new_size].view(shape)
-            x = CPU_BUFFERS[CPU_INDEX][:new_size].view(shape)
+        saved_metadata = ctx._saved_metadata
 
-            # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
+        # Handle NJT case (marked with "njt" as first element)
+        is_njt_offload = len(saved_metadata) >= 1 and saved_metadata[0] == "njt"
+        if is_njt_offload:
+            _, cpu_tensor, device_index, MAIN_STREAM, EXTRA_STREAM, _ = saved_metadata
+            # Copy NJT back to GPU
             EXTRA_STREAM.wait_stream(MAIN_STREAM)
             with torch_gpu_stream(EXTRA_STREAM):
-                buffer.copy_(x, non_blocking = True)
+                buffer = cpu_tensor.to(f"cuda:{device_index}", non_blocking=True)
+            CPU_INDEX = "njt"  # Mark as NJT for later
         else:
-            # No GPU buffer seen
-            if len(tensor_indices) != 0:
-                inputs[tensor_indices[0]] = tensors[0]
+            # Handle both old 6-tuple format
+            new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM = saved_metadata[:6]
+            buffer = None
+            if CPU_INDEX is not None:
+                global GPU_BUFFER
+                buffer = GPU_BUFFERS[device_index][:new_size].view(shape)
+                x = CPU_BUFFERS[CPU_INDEX][:new_size].view(shape)
+
+                # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
+                EXTRA_STREAM.wait_stream(MAIN_STREAM)
+                with torch_gpu_stream(EXTRA_STREAM):
+                    buffer.copy_(x, non_blocking = True)
+            else:
+                # No GPU buffer seen
+                if len(tensor_indices) != 0:
+                    inputs[tensor_indices[0]] = tensors[0]
         pass
 
         # Fill in inputs with appropriate saved tensors.
@@ -584,6 +626,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 x.requires_grad_(True)
                 detached_inputs[0] = x
             pass
+            # Note: NJT case (CPU_INDEX == "njt") is handled above with buffer already set
 
             with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
                 outputs = ctx.run_function(*detached_inputs)

@@ -1707,14 +1707,31 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     target_dtype = result.dtype
     xA = dropout(x).to(target_dtype) @ lora_A.weight.to(target_dtype).t()
     # output = result + scaling * xA @ lora_B.weight.t()
-    shape = result.shape
-    output = torch_addmm(
-        result.view(-1, shape[-1]),
-        xA.view(-1, xA.shape[-1]),
-        lora_B.weight.to(target_dtype).t(),
-        alpha = scaling,
-        beta = 1,
-    ).view(shape)
+
+    # Handle NJT (Nested Jagged Tensor) inputs
+    is_njt = hasattr(result, "is_nested") and result.is_nested
+    if is_njt:
+        result_values = result.values()
+        xA_values = xA.values()
+        njt_offsets = result.offsets()
+        hd = result_values.shape[-1]
+        output_values = torch_addmm(
+            result_values.view(-1, hd),
+            xA_values.view(-1, xA_values.shape[-1]),
+            lora_B.weight.to(target_dtype).t(),
+            alpha = scaling,
+            beta = 1,
+        ).view(-1, hd)
+        output = torch.nested.nested_tensor_from_jagged(output_values, offsets=njt_offsets)
+    else:
+        shape = result.shape
+        output = torch_addmm(
+            result.view(-1, shape[-1]),
+            xA.view(-1, xA.shape[-1]),
+            lora_B.weight.to(target_dtype).t(),
+            alpha = scaling,
+            beta = 1,
+        ).view(shape)
 
     bias = lora_B.bias
     if bias is not None:
@@ -1736,14 +1753,31 @@ torch_float16 = torch.float16
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     xA = dropout(x.to(torch_float16)) @ lora_A.weight.to(torch_float16).t()
     # output = result + scaling * xA @ lora_B.weight.t()
-    shape = result.shape
-    output = torch_addmm(
-        result.view(-1, shape[-1]).to(torch_float16),
-        xA.view(-1, xA.shape[-1]),
-        lora_B.weight.to(torch_float16).t(),
-        alpha = scaling,
-        beta = 1,
-    ).view(shape)
+
+    # Handle NJT (Nested Jagged Tensor) inputs
+    is_njt = hasattr(result, "is_nested") and result.is_nested
+    if is_njt:
+        result_values = result.values()
+        xA_values = xA.values()
+        njt_offsets = result.offsets()
+        hd = result_values.shape[-1]
+        output_values = torch_addmm(
+            result_values.view(-1, hd).to(torch_float16),
+            xA_values.view(-1, xA_values.shape[-1]),
+            lora_B.weight.to(torch_float16).t(),
+            alpha = scaling,
+            beta = 1,
+        ).view(-1, hd)
+        output = torch.nested.nested_tensor_from_jagged(output_values, offsets=njt_offsets)
+    else:
+        shape = result.shape
+        output = torch_addmm(
+            result.view(-1, shape[-1]).to(torch_float16),
+            xA.view(-1, xA.shape[-1]),
+            lora_B.weight.to(torch_float16).t(),
+            alpha = scaling,
+            beta = 1,
+        ).view(shape)
 
     bias = lora_B.bias
     if bias is not None:

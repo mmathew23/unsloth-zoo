@@ -172,6 +172,19 @@ class UnslothFusedLoss(torch.autograd.Function):
         device = lm_head_weight.device
         if extra_kwargs is None: extra_kwargs = {}
 
+        # Handle NJT inputs by extracting values
+        is_njt_hidden = hasattr(hidden_states, "is_nested") and hidden_states.is_nested
+        is_njt_labels = hasattr(labels, "is_nested") and labels.is_nested
+        njt_offsets = None
+        if is_njt_hidden:
+            njt_offsets = hidden_states.offsets()
+            hidden_states = hidden_states.values()
+            # Reshape to 3D (1, total_tokens, hd) for compatibility
+            hidden_states = hidden_states.unsqueeze(0)
+        if is_njt_labels:
+            labels = labels.values()
+            labels = labels.unsqueeze(0)
+
         # Get shifted labels first
         if shift_labels:
             _labels = torch.empty_like(labels, device = device)
@@ -328,6 +341,7 @@ class UnslothFusedLoss(torch.autograd.Function):
         pass
         ctx.save_for_backward(grad_inputs, grad_lm_head, grad_lm_head_bias)
         ctx.scaling = scaling
+        ctx.njt_offsets = njt_offsets  # Save NJT info for backward
         return accumulated_loss
     pass
 
@@ -338,6 +352,11 @@ class UnslothFusedLoss(torch.autograd.Function):
             scaling = ctx.scaling if ctx.scaling is not None else 1.0
             torch._assert(torch.all(grad_output == scaling), f"Fused losses expect grad_output to be all {scaling}, but got {grad_output.ravel()[:10]}")
         (grad_inputs, grad_lm_head, grad_lm_head_bias, ) = ctx.saved_tensors
+        # Reconstruct NJT if original input was NJT
+        if ctx.njt_offsets is not None:
+            # grad_inputs is (1, total_tokens, hd), need to convert to NJT
+            grad_inputs_flat = grad_inputs.squeeze(0)  # (total_tokens, hd)
+            grad_inputs = torch.nested.nested_tensor_from_jagged(grad_inputs_flat, offsets=ctx.njt_offsets)
         return (None, grad_inputs, grad_lm_head, grad_lm_head_bias, None, None, None, None, None, None, None, None, None,)
     pass
 pass
