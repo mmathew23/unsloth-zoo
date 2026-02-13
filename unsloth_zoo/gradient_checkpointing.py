@@ -560,6 +560,7 @@ class UnslothGradientCheckpointer:
     Non-reentrant gradient checkpointing with smart CPU offloading.
     """
     _cpu_buffers: List[torch.Tensor] = []
+    _cpu_free_buffers: dict = {}
     _gpu_buffers: dict = {}
     _main_streams: dict = {}
     _extra_streams: dict = {}
@@ -615,6 +616,9 @@ class UnslothGradientCheckpointer:
             torch.empty(INITIAL_CPU_BUFFER_SIZE, dtype=dtype, device="cpu", pin_memory=True)
             for _ in range(INITIAL_CPU_BUFFER_COUNT)
         ]
+        cls._cpu_free_buffers = {
+            dtype: [(buf, None, None) for buf in cls._cpu_buffers]
+        }
 
         if num_devices is None:
             num_devices = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
@@ -647,6 +651,7 @@ class UnslothGradientCheckpointer:
             return
 
         cls._cpu_buffer_index = 0
+        cls._cpu_free_buffers = {}
         cls._current_gc_index = 0
         cls._last_gc_index = 0
         cls._first_pass = True
@@ -664,6 +669,11 @@ class UnslothGradientCheckpointer:
 
         if len(cls._cpu_buffers) > INITIAL_CPU_BUFFER_COUNT:
             del cls._cpu_buffers[INITIAL_CPU_BUFFER_COUNT:]
+        cls._cpu_free_buffers[cls._dtype] = [
+            (buf, None, None)
+            for buf in cls._cpu_buffers
+            if buf is not None
+        ]
 
         for device_idx in cls._gpu_buffers:
             if cls._gpu_buffers[device_idx] is not None and hasattr(cls._gpu_buffers[device_idx], "resize_"):
@@ -679,6 +689,7 @@ class UnslothGradientCheckpointer:
                 cls._cpu_buffers[i].resize_(0)
             cls._cpu_buffers[i] = None
         cls._cpu_buffers = []
+        cls._cpu_free_buffers = {}
 
         for device_idx in list(cls._gpu_buffers.keys()):
             if cls._gpu_buffers[device_idx] is not None and hasattr(cls._gpu_buffers[device_idx], "resize_"):
@@ -702,7 +713,11 @@ class UnslothGradientCheckpointer:
             event = stream.record_event()
             cls._events_supported = True
             return event
-        except Exception:
+        except Exception as e:
+            _gc_debug(
+                "NONREENTRANT_EVENT",
+                f"stream.record_event failed; falling back to wait_stream path. error={type(e).__name__}: {e}",
+            )
             cls._events_supported = False
             return None
 
@@ -713,7 +728,11 @@ class UnslothGradientCheckpointer:
         try:
             stream.wait_event(event)
             return True
-        except Exception:
+        except Exception as e:
+            _gc_debug(
+                "NONREENTRANT_EVENT",
+                f"stream.wait_event failed; falling back to wait_stream path. error={type(e).__name__}: {e}",
+            )
             cls._events_supported = False
             return False
 
@@ -740,6 +759,48 @@ class UnslothGradientCheckpointer:
             pass
         return True
 
+    @classmethod
+    def _acquire_cpu_buffer(cls, *, numel: int, dtype: torch.dtype, device_index: int) -> torch.Tensor:
+        pool = cls._cpu_free_buffers.setdefault(dtype, [])
+        chosen_idx = None
+        chosen_buf = None
+        for i in range(len(pool) - 1, -1, -1):
+            buf, fence_device_index, fence_event = pool[i]
+            ready = True
+            if fence_event is not None:
+                try:
+                    ready = bool(fence_event.query())
+                except Exception:
+                    ready = True
+            if not ready:
+                continue
+            if fence_device_index is not None and fence_device_index != device_index:
+                # Keep per-device stream-fenced buffers isolated.
+                continue
+            chosen_idx = i
+            chosen_buf = buf
+            break
+
+        if chosen_idx is not None:
+            pool.pop(chosen_idx)
+            if chosen_buf.numel() < numel:
+                chosen_buf = torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
+            return chosen_buf
+
+        return torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
+
+    @classmethod
+    def _release_cpu_buffer(
+        cls,
+        *,
+        cpu_buffer: torch.Tensor,
+        dtype: torch.dtype,
+        device_index: int,
+        restore_event,
+    ) -> None:
+        pool = cls._cpu_free_buffers.setdefault(dtype, [])
+        pool.append((cpu_buffer, device_index, restore_event))
+
     def pack_hook(self, tensor: torch.Tensor):
         cls = self.__class__
         if not self.should_offload(tensor):
@@ -757,23 +818,54 @@ class UnslothGradientCheckpointer:
             print("Unsloth: Will smartly offload gradients to save VRAM!")
             cls._use_unsloth_gc_message = False
 
-        cpu_buffer_index = cls._cpu_buffer_index
-        cls._cpu_buffer_index += 1
-        if cpu_buffer_index >= len(cls._cpu_buffers):
-            cls._cpu_buffers.append(
-                torch.empty(numel, dtype=cls._dtype, device="cpu", pin_memory=True)
+        # Debug-only correctness mode: bypass async pooled offload path.
+        # This isolates whether corruption comes from pooled async copy machinery.
+        if _is_truthy_env("UNSLOTH_GC_DEBUG_SAFE_DIRECT_CPU_COPY"):
+            pack_id = self.pack_counter
+            self.pack_counter += 1
+            self.offloaded_tensors[pack_id] = (
+                "direct",
+                tensor.detach().to("cpu"),
+                shape,
+                stride,
+                dtype,
+                requires_grad,
+                device_index,
+                numel,
             )
+            return ("cpu", pack_id)
 
-        cpu_buffer = cls._cpu_buffers[cpu_buffer_index]
-        if numel > cpu_buffer.numel():
-            cpu_buffer.resize_(numel)
+        cpu_buffer = cls._acquire_cpu_buffer(
+            numel=numel,
+            dtype=dtype,
+            device_index=device_index,
+        )
 
-        main_stream = cls._main_streams[device_index]
-        extra_stream = cls._extra_streams[device_index]
-        extra_stream.wait_stream(main_stream)
-        with torch_gpu_stream(extra_stream):
+        offload_event = None
+        if _is_truthy_env("UNSLOTH_GC_ASYNC_OFFLOAD"):
+            if DEVICE_TYPE in ("cuda", "hip"):
+                main_stream = torch.cuda.current_stream(device)
+            elif DEVICE_TYPE == "xpu":
+                main_stream = torch.xpu.current_stream(device)
+            else:
+                main_stream = cls._main_streams[device_index]
+            extra_stream = cls._extra_streams[device_index]
+            extra_stream.wait_stream(main_stream)
+            with torch_gpu_stream(extra_stream):
+                # Ensure allocator does not recycle `tensor` storage until this stream
+                # has finished consuming it for the async D2H copy.
+                try:
+                    tensor.record_stream(extra_stream)
+                except Exception:
+                    pass
+                cpu_buffer[:numel].view(shape).copy_(tensor, non_blocking=True)
+                offload_event = cls._record_stream_event(extra_stream)
+            # Debug switch: force copy completion before source tensor can be reclaimed.
+            # Useful to diagnose async lifetime hazards in non-reentrant saved tensor hooks.
+            if _is_truthy_env("UNSLOTH_GC_SYNC_PACK_COPY"):
+                main_stream.wait_stream(extra_stream)
+        else:
             cpu_buffer[:numel].view(shape).copy_(tensor, non_blocking=True)
-            offload_event = cls._record_stream_event(extra_stream)
 
         pack_id = self.pack_counter
         self.pack_counter += 1
@@ -784,7 +876,7 @@ class UnslothGradientCheckpointer:
             requires_grad,
             device_index,
             numel,
-            cpu_buffer_index,
+            cpu_buffer,
             offload_event,
         )
         return ("cpu", pack_id)
@@ -798,6 +890,30 @@ class UnslothGradientCheckpointer:
             return packed[1]
 
         _, pack_id = packed
+        entry = self.offloaded_tensors[pack_id]
+        if isinstance(entry, tuple) and len(entry) >= 1 and entry[0] == "direct":
+            (
+                _mode,
+                cpu_tensor,
+                shape,
+                original_stride,
+                original_dtype,
+                original_requires_grad,
+                device_index,
+                _numel,
+            ) = entry
+            result = cpu_tensor.to(
+                device = f"{DEVICE_TYPE_TORCH}:{device_index}",
+                non_blocking = False,
+            )
+            if tuple(result.stride()) != tuple(original_stride):
+                result = result.as_strided(shape, original_stride)
+            if result.dtype != original_dtype:
+                result = result.to(original_dtype)
+            if result.requires_grad != original_requires_grad:
+                result.requires_grad_(original_requires_grad)
+            return result
+
         (
             shape,
             original_stride,
@@ -805,26 +921,46 @@ class UnslothGradientCheckpointer:
             original_requires_grad,
             device_index,
             numel,
-            cpu_buf_idx,
+            cpu_buffer,
             offload_event,
         ) = self.offloaded_tensors[pack_id]
 
-        cpu_buffer = cls._cpu_buffers[cpu_buf_idx]
-
-        main_stream = cls._main_streams[device_index]
-        extra_stream = cls._extra_streams[device_index]
-        with torch_gpu_stream(extra_stream):
-            if not cls._wait_event(extra_stream, offload_event):
-                extra_stream.wait_stream(main_stream)
+        if _is_truthy_env("UNSLOTH_GC_ASYNC_OFFLOAD"):
+            device = torch.device(f"{DEVICE_TYPE_TORCH}:{device_index}")
+            if DEVICE_TYPE in ("cuda", "hip"):
+                main_stream = torch.cuda.current_stream(device)
+            elif DEVICE_TYPE == "xpu":
+                main_stream = torch.xpu.current_stream(device)
+            else:
+                main_stream = cls._main_streams[device_index]
+            extra_stream = cls._extra_streams[device_index]
+            with torch_gpu_stream(extra_stream):
+                if not cls._wait_event(extra_stream, offload_event):
+                    extra_stream.wait_stream(main_stream)
+                sync_unpack = _is_truthy_env("UNSLOTH_GC_SYNC_UNPACK_COPY")
+                result = cpu_buffer[:numel].view(shape).to(
+                    device = f"{DEVICE_TYPE_TORCH}:{device_index}",
+                    non_blocking = (not sync_unpack),
+                )
+                if tuple(result.stride()) != tuple(original_stride):
+                    result = result.as_strided(shape, original_stride)
+                restore_event = cls._record_stream_event(extra_stream)
+            if not cls._wait_event(main_stream, restore_event):
+                main_stream.wait_stream(extra_stream)
+        else:
             result = cpu_buffer[:numel].view(shape).to(
                 device = f"{DEVICE_TYPE_TORCH}:{device_index}",
                 non_blocking = True,
             )
             if tuple(result.stride()) != tuple(original_stride):
                 result = result.as_strided(shape, original_stride)
-            restore_event = cls._record_stream_event(extra_stream)
-        if not cls._wait_event(main_stream, restore_event):
-            main_stream.wait_stream(extra_stream)
+            restore_event = None
+        cls._release_cpu_buffer(
+            cpu_buffer=cpu_buffer,
+            dtype=original_dtype,
+            device_index=device_index,
+            restore_event=restore_event,
+        )
 
         if result.dtype != original_dtype:
             result = result.to(original_dtype)
