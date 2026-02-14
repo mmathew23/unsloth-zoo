@@ -320,10 +320,21 @@ UNSLOTH_GC_DEBUG_PRINTED = set()
 UNSLOTH_GC_SELECTIVE_STATS = {}
 ORIGINAL_NOOP_SETUP_CONTEXT = None
 UNSLOTH_NOOP_OFFLOAD_STATE = None
+UNSLOTH_NOOP_PROFILE = {
+    "setup_calls": 0,
+    "setup_time_s": 0.0,
+    "get_args_calls": 0,
+    "get_args_time_s": 0.0,
+}
 
 
 def _patch_noop_save_inputs():
     global ORIGINAL_NOOP_SETUP_CONTEXT
+    if _is_truthy_env("UNSLOTH_GC_PROFILE_NOOP"):
+        UNSLOTH_NOOP_PROFILE["setup_calls"] = 0
+        UNSLOTH_NOOP_PROFILE["setup_time_s"] = 0.0
+        UNSLOTH_NOOP_PROFILE["get_args_calls"] = 0
+        UNSLOTH_NOOP_PROFILE["get_args_time_s"] = 0.0
     cls = getattr(torch.utils.checkpoint, "_NoopSaveInputs", None)
     if cls is None:
         return
@@ -332,22 +343,36 @@ def _patch_noop_save_inputs():
     ORIGINAL_NOOP_SETUP_CONTEXT = cls.setup_context
 
     def unsloth_setup_context(ctx: Any, inputs: Tuple[Any, ...], output: Any) -> None:
+        profile_noop = _is_truthy_env("UNSLOTH_GC_PROFILE_NOOP")
+        t0 = time.perf_counter() if profile_noop else 0.0
         state = UNSLOTH_NOOP_OFFLOAD_STATE
         if state is None:
-            return ORIGINAL_NOOP_SETUP_CONTEXT(ctx, inputs, output)
+            result = ORIGINAL_NOOP_SETUP_CONTEXT(ctx, inputs, output)
+            if profile_noop:
+                UNSLOTH_NOOP_PROFILE["setup_calls"] += 1
+                UNSLOTH_NOOP_PROFILE["setup_time_s"] += (time.perf_counter() - t0)
+            return result
 
         offloader = state.get("offloader", None)
         target_input_index = int(state.get("target_input_index", 2))
         if offloader is None:
-            return ORIGINAL_NOOP_SETUP_CONTEXT(ctx, inputs, output)
+            result = ORIGINAL_NOOP_SETUP_CONTEXT(ctx, inputs, output)
+            if profile_noop:
+                UNSLOTH_NOOP_PROFILE["setup_calls"] += 1
+                UNSLOTH_NOOP_PROFILE["setup_time_s"] += (time.perf_counter() - t0)
+            return result
 
-        args = [None if isinstance(o, torch.Tensor) else o for o in inputs]
-        tensor_entries = {}
+        n_inputs = len(inputs)
+        # 0 = non-tensor, 1 = saved tensor, 2 = offloaded tensor
+        entry_kind = [0] * n_inputs
+        entry_index = [-1] * n_inputs
+        non_tensor_values = [None] * n_inputs
         saved_tensors = []
         offloaded = []
 
         for i, o in enumerate(inputs):
             if not isinstance(o, torch.Tensor):
+                non_tensor_values[i] = o
                 continue
 
             should_try_offload = (
@@ -357,32 +382,40 @@ def _patch_noop_save_inputs():
             )
             if should_try_offload:
                 packed = offloader.pack_hook(o)
-                if isinstance(packed, tuple) and len(packed) >= 1 and packed[0] == "cpu":
+                if isinstance(packed, tuple) and len(packed) >= 1 and packed[0] in ("cpu", "engine"):
                     off_idx = len(offloaded)
                     offloaded.append(packed)
-                    tensor_entries[i] = ("offloaded", off_idx)
+                    entry_kind[i] = 2
+                    entry_index[i] = off_idx
                     continue
 
             saved_idx = len(saved_tensors)
             saved_tensors.append(o)
-            tensor_entries[i] = ("saved", saved_idx)
+            entry_kind[i] = 1
+            entry_index[i] = saved_idx
 
         def get_args(saved_tensors_runtime):
-            ret = []
-            for i, o in enumerate(args):
-                entry = tensor_entries.get(i, None)
-                if entry is None:
-                    ret.append(o)
-                    continue
-                kind, idx = entry
-                if kind == "saved":
-                    ret.append(saved_tensors_runtime[idx])
+            profile_get_args = _is_truthy_env("UNSLOTH_GC_PROFILE_NOOP")
+            t1 = time.perf_counter() if profile_get_args else 0.0
+            ret = [None] * (n_inputs - 1)
+            for i in range(1, n_inputs):
+                kind = entry_kind[i]
+                if kind == 0:
+                    ret[i - 1] = non_tensor_values[i]
+                elif kind == 1:
+                    ret[i - 1] = saved_tensors_runtime[entry_index[i]]
                 else:
-                    ret.append(offloader.unpack_hook(offloaded[idx]))
-            return ret[1:]
+                    ret[i - 1] = offloader.unpack_hook(offloaded[entry_index[i]])
+            if profile_get_args:
+                UNSLOTH_NOOP_PROFILE["get_args_calls"] += 1
+                UNSLOTH_NOOP_PROFILE["get_args_time_s"] += (time.perf_counter() - t1)
+            return ret
 
         ctx.get_args = get_args
         ctx.save_for_backward(*saved_tensors)
+        if profile_noop:
+            UNSLOTH_NOOP_PROFILE["setup_calls"] += 1
+            UNSLOTH_NOOP_PROFILE["setup_time_s"] += (time.perf_counter() - t0)
 
     cls.setup_context = staticmethod(unsloth_setup_context)
 pass
@@ -399,6 +432,21 @@ def _unpatch_noop_save_inputs():
     cls.setup_context = ORIGINAL_NOOP_SETUP_CONTEXT
     ORIGINAL_NOOP_SETUP_CONTEXT = None
     UNSLOTH_NOOP_OFFLOAD_STATE = None
+    if _is_truthy_env("UNSLOTH_GC_PROFILE_NOOP"):
+        setup_calls = max(int(UNSLOTH_NOOP_PROFILE["setup_calls"]), 1)
+        get_args_calls = max(int(UNSLOTH_NOOP_PROFILE["get_args_calls"]), 1)
+        _gc_debug(
+            "NOOP_PROFILE",
+            (
+                f"setup_calls={UNSLOTH_NOOP_PROFILE['setup_calls']} "
+                f"setup_total_s={UNSLOTH_NOOP_PROFILE['setup_time_s']:.6f} "
+                f"setup_avg_us={(UNSLOTH_NOOP_PROFILE['setup_time_s']*1e6/setup_calls):.2f} "
+                f"get_args_calls={UNSLOTH_NOOP_PROFILE['get_args_calls']} "
+                f"get_args_total_s={UNSLOTH_NOOP_PROFILE['get_args_time_s']:.6f} "
+                f"get_args_avg_us={(UNSLOTH_NOOP_PROFILE['get_args_time_s']*1e6/get_args_calls):.2f}"
+            ),
+            once = False,
+        )
 pass
 
 
@@ -427,6 +475,26 @@ def _gc_disable_cpu_offload():
 pass
 
 
+def _gc_async_mode():
+    # Modes:
+    # - off   : single-stream safe transport.
+    # - pack  : async D2H pack only; restore remains on consumer stream.
+    # - full  : async D2H + async H2D on extra stream (opt-in only).
+    # - full_v2 : strict ticketed full async path with hard event requirements.
+    if _is_truthy_env("UNSLOTH_GC_ASYNC_OFFLOAD"):
+        return "full"
+    mode = os.environ.get("UNSLOTH_GC_ASYNC_MODE", "off")
+    mode = str(mode).strip().lower()
+    if mode in ("off", "none", "0", "false", "no"):
+        return "off"
+    if mode in ("full", "all", "2"):
+        return "full"
+    if mode in ("full_v2", "v2", "3"):
+        return "full_v2"
+    return "pack"
+pass
+
+
 def _gc_env_int(name, default):
     try:
         return int(os.environ.get(name, str(default)))
@@ -451,7 +519,11 @@ def _parse_nonreentrant_backend(backend):
         return "hooks"
     if backend in ("save_on_cpu", "nohooks", "no_hooks"):
         return "save_on_cpu"
-    raise ValueError("`nonreentrant_backend` must be one of ['hooks', 'save_on_cpu'].")
+    if backend in ("engine", "custom_engine", "nohooks_engine"):
+        return "engine"
+    if backend in ("engine_v2", "v2_engine", "custom_engine_v2"):
+        return "engine_v2"
+    raise ValueError("`nonreentrant_backend` must be one of ['hooks', 'save_on_cpu', 'engine', 'engine_v2'].")
 pass
 
 
@@ -576,6 +648,8 @@ class UnslothGradientCheckpointer:
     _dtype: torch.dtype = None
     _events_supported: Optional[bool] = None
     _meta_initialized: bool = False
+    _debug_buffer_meta: dict = {}
+    _ticket_counter: int = 0
 
     @classmethod
     def ensure_metadata(cls, dtype: torch.dtype = None):
@@ -619,6 +693,8 @@ class UnslothGradientCheckpointer:
         cls._cpu_free_buffers = {
             dtype: [(buf, None, None) for buf in cls._cpu_buffers]
         }
+        cls._debug_buffer_meta = {}
+        cls._ticket_counter = 0
 
         if num_devices is None:
             num_devices = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
@@ -652,6 +728,8 @@ class UnslothGradientCheckpointer:
 
         cls._cpu_buffer_index = 0
         cls._cpu_free_buffers = {}
+        cls._debug_buffer_meta = {}
+        cls._ticket_counter = 0
         cls._current_gc_index = 0
         cls._last_gc_index = 0
         cls._first_pass = True
@@ -690,6 +768,8 @@ class UnslothGradientCheckpointer:
             cls._cpu_buffers[i] = None
         cls._cpu_buffers = []
         cls._cpu_free_buffers = {}
+        cls._debug_buffer_meta = {}
+        cls._ticket_counter = 0
 
         for device_idx in list(cls._gpu_buffers.keys()):
             if cls._gpu_buffers[device_idx] is not None and hasattr(cls._gpu_buffers[device_idx], "resize_"):
@@ -761,6 +841,8 @@ class UnslothGradientCheckpointer:
 
     @classmethod
     def _acquire_cpu_buffer(cls, *, numel: int, dtype: torch.dtype, device_index: int) -> torch.Tensor:
+        if _is_truthy_env("UNSLOTH_GC_FULL_DEBUG_NO_REUSE"):
+            return torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
         pool = cls._cpu_free_buffers.setdefault(dtype, [])
         chosen_idx = None
         chosen_buf = None
@@ -801,6 +883,52 @@ class UnslothGradientCheckpointer:
         pool = cls._cpu_free_buffers.setdefault(dtype, [])
         pool.append((cpu_buffer, device_index, restore_event))
 
+    @classmethod
+    def _debug_buf_id(cls, cpu_buffer: torch.Tensor) -> int:
+        try:
+            return int(cpu_buffer.data_ptr())
+        except Exception:
+            return id(cpu_buffer)
+
+    @classmethod
+    def _debug_mark_state(cls, cpu_buffer: torch.Tensor, state: str, pack_id: int = -1, extra: str = ""):
+        if not _is_truthy_env("UNSLOTH_GC_FULL_DEBUG"):
+            return
+        buf_id = cls._debug_buf_id(cpu_buffer)
+        meta = cls._debug_buffer_meta.get(buf_id, {})
+        old_state = meta.get("state", "UNKNOWN")
+        cls._debug_buffer_meta[buf_id] = {
+            **meta,
+            "state": state,
+            "pack_id": pack_id,
+        }
+        _gc_debug(
+            "FULL_DEBUG_STATE",
+            f"buf={buf_id} {old_state} -> {state} pack_id={pack_id} {extra}",
+            once=False,
+        )
+
+    @classmethod
+    def _debug_assert_state(cls, cpu_buffer: torch.Tensor, allowed: tuple, where: str):
+        if not _is_truthy_env("UNSLOTH_GC_FULL_DEBUG"):
+            return
+        buf_id = cls._debug_buf_id(cpu_buffer)
+        state = cls._debug_buffer_meta.get(buf_id, {}).get("state", "UNKNOWN")
+        if state not in allowed:
+            raise RuntimeError(
+                f"[UNSLOTH_GC_FULL_DEBUG] Buffer state violation at {where}: "
+                f"buf={buf_id} state={state}, allowed={allowed}"
+            )
+
+    @classmethod
+    def _require_event(cls, event, where: str):
+        if event is None:
+            raise RuntimeError(
+                f"[UNSLOTH_GC_FULL_V2] missing required event at {where}; "
+                "event-based ordering is mandatory in full_v2."
+            )
+        return event
+
     def pack_hook(self, tensor: torch.Tensor):
         cls = self.__class__
         if not self.should_offload(tensor):
@@ -840,13 +968,43 @@ class UnslothGradientCheckpointer:
             dtype=dtype,
             device_index=device_index,
         )
+        cls._debug_assert_state(cpu_buffer, ("UNKNOWN", "FREE", "READY_CPU"), "pack_acquire")
 
         offload_event = None
-        if _is_truthy_env("UNSLOTH_GC_ASYNC_OFFLOAD"):
+        async_mode = _gc_async_mode()
+        if async_mode == "full_v2":
             if DEVICE_TYPE in ("cuda", "hip"):
                 main_stream = torch.cuda.current_stream(device)
+                if _is_truthy_env("UNSLOTH_GC_FULL_DEBUG_DEVICE_SYNC_PACK"):
+                    torch.cuda.synchronize(device)
             elif DEVICE_TYPE == "xpu":
                 main_stream = torch.xpu.current_stream(device)
+                if _is_truthy_env("UNSLOTH_GC_FULL_DEBUG_DEVICE_SYNC_PACK"):
+                    torch.xpu.synchronize(device)
+            else:
+                main_stream = cls._main_streams[device_index]
+            extra_stream = cls._extra_streams[device_index]
+            source_event = cls._record_stream_event(main_stream)
+            source_event = cls._require_event(source_event, "full_v2.pack.source_event")
+            with torch_gpu_stream(extra_stream):
+                extra_stream.wait_event(source_event)
+                try:
+                    tensor.record_stream(extra_stream)
+                except Exception:
+                    pass
+                cpu_buffer[:numel].view(shape).copy_(tensor, non_blocking=True)
+                offload_event = cls._record_stream_event(extra_stream)
+                offload_event = cls._require_event(offload_event, "full_v2.pack.offload_event")
+            cls._debug_mark_state(cpu_buffer, "PENDING_D2H", extra="mode=full_v2")
+        elif async_mode in ("pack", "full"):
+            if DEVICE_TYPE in ("cuda", "hip"):
+                main_stream = torch.cuda.current_stream(device)
+                if _is_truthy_env("UNSLOTH_GC_FULL_DEBUG_DEVICE_SYNC_PACK"):
+                    torch.cuda.synchronize(device)
+            elif DEVICE_TYPE == "xpu":
+                main_stream = torch.xpu.current_stream(device)
+                if _is_truthy_env("UNSLOTH_GC_FULL_DEBUG_DEVICE_SYNC_PACK"):
+                    torch.xpu.synchronize(device)
             else:
                 main_stream = cls._main_streams[device_index]
             extra_stream = cls._extra_streams[device_index]
@@ -860,15 +1018,24 @@ class UnslothGradientCheckpointer:
                     pass
                 cpu_buffer[:numel].view(shape).copy_(tensor, non_blocking=True)
                 offload_event = cls._record_stream_event(extra_stream)
+            cls._debug_mark_state(cpu_buffer, "PENDING_D2H", extra=f"mode={async_mode}")
             # Debug switch: force copy completion before source tensor can be reclaimed.
             # Useful to diagnose async lifetime hazards in non-reentrant saved tensor hooks.
             if _is_truthy_env("UNSLOTH_GC_SYNC_PACK_COPY"):
                 main_stream.wait_stream(extra_stream)
         else:
             cpu_buffer[:numel].view(shape).copy_(tensor, non_blocking=True)
+            cls._debug_mark_state(cpu_buffer, "READY_CPU", extra="mode=off")
 
         pack_id = self.pack_counter
         self.pack_counter += 1
+        ticket = None
+        if async_mode == "full_v2":
+            ticket = {
+                "ticket_id": cls._ticket_counter,
+                "state": "PACK_DONE",
+            }
+            cls._ticket_counter += 1
         self.offloaded_tensors[pack_id] = (
             shape,
             stride,
@@ -878,7 +1045,12 @@ class UnslothGradientCheckpointer:
             numel,
             cpu_buffer,
             offload_event,
+            ticket,
         )
+        if async_mode in ("pack", "full", "full_v2"):
+            cls._debug_mark_state(cpu_buffer, "PENDING_D2H", pack_id=pack_id, extra=f"mode={async_mode}")
+        else:
+            cls._debug_mark_state(cpu_buffer, "READY_CPU", pack_id=pack_id, extra="mode=off")
         return ("cpu", pack_id)
 
     def unpack_hook(self, packed):
@@ -923,9 +1095,44 @@ class UnslothGradientCheckpointer:
             numel,
             cpu_buffer,
             offload_event,
+            ticket,
         ) = self.offloaded_tensors[pack_id]
 
-        if _is_truthy_env("UNSLOTH_GC_ASYNC_OFFLOAD"):
+        async_mode = _gc_async_mode()
+        if async_mode == "full_v2":
+            if ticket is None:
+                raise RuntimeError("[UNSLOTH_GC_FULL_V2] missing ticket in unpack")
+            if ticket.get("state", None) != "PACK_DONE":
+                raise RuntimeError(
+                    f"[UNSLOTH_GC_FULL_V2] invalid ticket state before unpack: {ticket.get('state', None)}"
+                )
+            device = torch.device(f"{DEVICE_TYPE_TORCH}:{device_index}")
+            if DEVICE_TYPE in ("cuda", "hip"):
+                main_stream = torch.cuda.current_stream(device)
+            elif DEVICE_TYPE == "xpu":
+                main_stream = torch.xpu.current_stream(device)
+            else:
+                main_stream = cls._main_streams[device_index]
+            extra_stream = cls._extra_streams[device_index]
+            offload_event = cls._require_event(offload_event, "full_v2.unpack.offload_event")
+            with torch_gpu_stream(extra_stream):
+                extra_stream.wait_event(offload_event)
+                cls._debug_mark_state(cpu_buffer, "READY_CPU", pack_id=pack_id, extra="full_v2_waited_offload")
+                ticket["state"] = "UNPACK_QUEUED"
+                cls._debug_mark_state(cpu_buffer, "PENDING_H2D", pack_id=pack_id, extra="mode=full_v2")
+                result = cpu_buffer[:numel].view(shape).to(
+                    device = f"{DEVICE_TYPE_TORCH}:{device_index}",
+                    non_blocking = True,
+                )
+                if tuple(result.stride()) != tuple(original_stride):
+                    result = result.as_strided(shape, original_stride)
+                restore_event = cls._record_stream_event(extra_stream)
+                restore_event = cls._require_event(restore_event, "full_v2.unpack.restore_event")
+            main_stream.wait_event(restore_event)
+            # Strictly satisfy UNPACK_DONE before release in full_v2.
+            restore_event.synchronize()
+            ticket["state"] = "UNPACK_DONE"
+        elif async_mode == "full":
             device = torch.device(f"{DEVICE_TYPE_TORCH}:{device_index}")
             if DEVICE_TYPE in ("cuda", "hip"):
                 main_stream = torch.cuda.current_stream(device)
@@ -935,9 +1142,13 @@ class UnslothGradientCheckpointer:
                 main_stream = cls._main_streams[device_index]
             extra_stream = cls._extra_streams[device_index]
             with torch_gpu_stream(extra_stream):
+                if _is_truthy_env("UNSLOTH_GC_FULL_DEBUG") and offload_event is None:
+                    raise RuntimeError("[UNSLOTH_GC_FULL_DEBUG] full mode requires offload_event, got None")
                 if not cls._wait_event(extra_stream, offload_event):
                     extra_stream.wait_stream(main_stream)
+                cls._debug_mark_state(cpu_buffer, "READY_CPU", pack_id=pack_id, extra="full_waited_offload")
                 sync_unpack = _is_truthy_env("UNSLOTH_GC_SYNC_UNPACK_COPY")
+                cls._debug_mark_state(cpu_buffer, "PENDING_H2D", pack_id=pack_id, extra=f"sync_unpack={sync_unpack}")
                 result = cpu_buffer[:numel].view(shape).to(
                     device = f"{DEVICE_TYPE_TORCH}:{device_index}",
                     non_blocking = (not sync_unpack),
@@ -948,6 +1159,13 @@ class UnslothGradientCheckpointer:
             if not cls._wait_event(main_stream, restore_event):
                 main_stream.wait_stream(extra_stream)
         else:
+            # For "pack" mode, ensure D2H completion happened before using CPU buffer.
+            if offload_event is not None and DEVICE_TYPE in ("cuda", "hip"):
+                torch.cuda.current_stream(torch.device(f"{DEVICE_TYPE_TORCH}:{device_index}")).wait_event(offload_event)
+            elif offload_event is not None and DEVICE_TYPE == "xpu":
+                torch.xpu.current_stream(torch.device(f"{DEVICE_TYPE_TORCH}:{device_index}")).wait_event(offload_event)
+            cls._debug_mark_state(cpu_buffer, "READY_CPU", pack_id=pack_id, extra=f"mode={async_mode}")
+            cls._debug_mark_state(cpu_buffer, "PENDING_H2D", pack_id=pack_id, extra=f"mode={async_mode}")
             result = cpu_buffer[:numel].view(shape).to(
                 device = f"{DEVICE_TYPE_TORCH}:{device_index}",
                 non_blocking = True,
@@ -961,12 +1179,32 @@ class UnslothGradientCheckpointer:
             device_index=device_index,
             restore_event=restore_event,
         )
+        if async_mode == "full_v2" and ticket is not None:
+            ticket["state"] = "RELEASED"
+        cls._debug_mark_state(cpu_buffer, "FREE", pack_id=pack_id, extra=f"restore_event_none={restore_event is None}")
 
         if result.dtype != original_dtype:
             result = result.to(original_dtype)
         if result.requires_grad != original_requires_grad:
             result.requires_grad_(original_requires_grad)
         return result
+
+
+class UnslothNonReentrantEngineOffloader:
+    """
+    Hook-free non-reentrant offload controller using _NoopSaveInputs interception.
+    This keeps a centralized ticket table per checkpoint call.
+    """
+    def __init__(self, is_last_layer: bool = False):
+        self._base = UnslothGradientCheckpointer(is_last_layer=is_last_layer)
+
+    def pack_hook(self, tensor: torch.Tensor):
+        # _NoopSaveInputs already gives deterministic per-checkpoint ownership/order
+        # of packed entries, so extra Python ticket indirection is unnecessary.
+        return self._base.pack_hook(tensor)
+
+    def unpack_hook(self, packed):
+        return self._base.unpack_hook(packed)
 
 def initialize_unsloth_gradient_checkpointing(dtype = None):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -1405,6 +1643,7 @@ def unsloth_checkpoint(
     Returns:
         Output of running :attr:`function` on :attr:`*args`
     """
+    global UNSLOTH_NOOP_OFFLOAD_STATE
     if use_reentrant is None:
         global UNSLOTH_GC_PATCH_USE_REENTRANT
         use_reentrant = UNSLOTH_GC_PATCH_USE_REENTRANT
@@ -1450,7 +1689,7 @@ def unsloth_checkpoint(
     if torch.is_tensor(first_arg):
         dtype = first_arg.dtype
 
-    if backend == "hooks" and not cls._initialized:
+    if backend in ("hooks", "engine", "engine_v2") and not cls._initialized:
         cls.initialize(dtype)
     elif backend != "hooks" and not cls._meta_initialized:
         cls.ensure_metadata(dtype)
@@ -1473,20 +1712,91 @@ def unsloth_checkpoint(
         (not is_last_layer)
     )
 
-    offloader = UnslothGradientCheckpointer(is_last_layer=is_last_layer)
+    if backend == "engine":
+        offloader = UnslothNonReentrantEngineOffloader(is_last_layer=is_last_layer)
+    elif backend == "engine_v2":
+        offloader = None
+    else:
+        offloader = UnslothGradientCheckpointer(is_last_layer=is_last_layer)
     old_checkpoint = getattr(torch.utils.checkpoint, "_old_checkpoint", None)
     original_checkpoint = old_checkpoint if old_checkpoint is not None else torch.utils.checkpoint.checkpoint
 
-    if backend == "save_on_cpu":
+    if backend == "engine_v2":
+        _gc_debug(
+            "NONREENTRANT_ENGINE_V2_PATH",
+            "engine_v2 backend -> torch checkpoint(use_reentrant=False), optimized non-reentrant path",
+            once = False,
+        )
+        # Fast path: when offload is disabled, bypass all offload bookkeeping.
+        if _gc_disable_cpu_offload():
+            with _nonreentrant_perf_context():
+                return original_checkpoint(
+                    function, *args,
+                    use_reentrant=False,
+                    preserve_rng_state=preserve,
+                    context_fn=context_fn,
+                    determinism_check=determinism_check,
+                    debug=debug,
+                    **kwargs
+                )
+
+        allow_offload_v2, offload_reason_v2 = _nonreentrant_save_on_cpu_should_offload(
+            first_arg if torch.is_tensor(first_arg) else None
+        )
+        should_offload_v2 = should_offload and allow_offload_v2
+        if should_offload_v2:
+            _gc_debug(
+                "NONREENTRANT_ENGINE_V2",
+                f"engine_v2 offload enabled (optimized _NoopSaveInputs path), reason={offload_reason_v2}",
+                once=False,
+            )
+            offloader_v2 = UnslothNonReentrantEngineOffloader(is_last_layer=is_last_layer)
+            previous_state = UNSLOTH_NOOP_OFFLOAD_STATE
+            UNSLOTH_NOOP_OFFLOAD_STATE = {
+                "offloader": offloader_v2,
+                "target_input_index": 2,
+            }
+            try:
+                with _nonreentrant_perf_context():
+                    return original_checkpoint(
+                        function, *args,
+                        use_reentrant=False,
+                        preserve_rng_state=preserve,
+                        context_fn=context_fn,
+                        determinism_check=determinism_check,
+                        debug=debug,
+                        **kwargs
+                    )
+            finally:
+                UNSLOTH_NOOP_OFFLOAD_STATE = previous_state
+        else:
+            _gc_debug(
+                "NONREENTRANT_ENGINE_V2",
+                f"engine_v2 offload skipped, reason={offload_reason_v2}",
+                once=False,
+            )
+            with _nonreentrant_perf_context():
+                return original_checkpoint(
+                    function, *args,
+                    use_reentrant=False,
+                    preserve_rng_state=preserve,
+                    context_fn=context_fn,
+                    determinism_check=determinism_check,
+                    debug=debug,
+                    **kwargs
+                )
+
+    if backend in ("save_on_cpu", "engine"):
         allow_offload, offload_reason = _nonreentrant_save_on_cpu_should_offload(first_arg if torch.is_tensor(first_arg) else None)
         should_offload_save_on_cpu = should_offload and (not _gc_disable_cpu_offload()) and allow_offload
         if should_offload_save_on_cpu:
+            backend_tag = "NONREENTRANT_ENGINE" if backend == "engine" else "NONREENTRANT_SAVE_ON_CPU"
+            backend_msg = "engine backend enabled (ticketed _NoopSaveInputs offload)" if backend == "engine" else "save_on_cpu backend enabled (hook-free _NoopSaveInputs offload)"
             _gc_debug(
-                "NONREENTRANT_SAVE_ON_CPU",
-                f"save_on_cpu backend enabled (hook-free _NoopSaveInputs offload), reason={offload_reason}",
+                backend_tag,
+                f"{backend_msg}, reason={offload_reason}",
                 once = False,
             )
-            global UNSLOTH_NOOP_OFFLOAD_STATE
             previous_state = UNSLOTH_NOOP_OFFLOAD_STATE
             UNSLOTH_NOOP_OFFLOAD_STATE = {
                 "offloader": offloader,
@@ -1507,9 +1817,11 @@ def unsloth_checkpoint(
             finally:
                 UNSLOTH_NOOP_OFFLOAD_STATE = previous_state
         else:
+            backend_tag = "NONREENTRANT_ENGINE" if backend == "engine" else "NONREENTRANT_SAVE_ON_CPU"
+            backend_msg = "engine backend skipped offload (below threshold / CPU tensor / last layer / no grad / disabled / policy)" if backend == "engine" else "save_on_cpu backend skipped offload (below threshold / CPU tensor / last layer / no grad / disabled / policy)"
             _gc_debug(
-                "NONREENTRANT_SAVE_ON_CPU",
-                f"save_on_cpu backend skipped offload (below threshold / CPU tensor / last layer / no grad / disabled / policy) reason={offload_reason}",
+                backend_tag,
+                f"{backend_msg} reason={offload_reason}",
                 once = False,
             )
             with _nonreentrant_perf_context():
