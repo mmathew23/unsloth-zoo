@@ -1522,8 +1522,7 @@ from torch.utils.checkpoint import (
     _DEFAULT_DETERMINISM_MODE,
     noop_context_fn,
 )
-@torch._disable_dynamo
-def unsloth_checkpoint(
+def _unsloth_checkpoint_impl(
     function,
     *args,
     use_reentrant: Optional[bool] = None,
@@ -1870,6 +1869,75 @@ def unsloth_checkpoint(
             debug=debug,
             **kwargs
         )
+pass
+
+
+@torch._disable_dynamo
+def _unsloth_checkpoint_nodynamo(
+    function,
+    *args,
+    use_reentrant: Optional[bool] = None,
+    context_fn: Callable[[], Tuple[ContextManager, ContextManager]] = noop_context_fn,
+    determinism_check: str = _DEFAULT_DETERMINISM_MODE,
+    debug: bool = False,
+    **kwargs
+):
+    return _unsloth_checkpoint_impl(
+        function,
+        *args,
+        use_reentrant=use_reentrant,
+        context_fn=context_fn,
+        determinism_check=determinism_check,
+        debug=debug,
+        **kwargs,
+    )
+pass
+
+
+def _should_allow_dynamo_nonreentrant(use_reentrant: Optional[bool]) -> bool:
+    if not _is_truthy_env("UNSLOTH_GC_ALLOW_DYNAMO_NONREENTRANT"):
+        return False
+    if use_reentrant is None:
+        effective_use_reentrant = UNSLOTH_GC_PATCH_USE_REENTRANT
+    else:
+        effective_use_reentrant = bool(use_reentrant)
+    return effective_use_reentrant is False
+pass
+
+
+def unsloth_checkpoint(
+    function,
+    *args,
+    use_reentrant: Optional[bool] = None,
+    context_fn: Callable[[], Tuple[ContextManager, ContextManager]] = noop_context_fn,
+    determinism_check: str = _DEFAULT_DETERMINISM_MODE,
+    debug: bool = False,
+    **kwargs
+):
+    if _should_allow_dynamo_nonreentrant(use_reentrant):
+        _gc_debug(
+            "NONREENTRANT_COMPILE_EXPERIMENT",
+            "Running non-reentrant checkpoint without torch._disable_dynamo",
+            once=False,
+        )
+        return _unsloth_checkpoint_impl(
+            function,
+            *args,
+            use_reentrant=use_reentrant,
+            context_fn=context_fn,
+            determinism_check=determinism_check,
+            debug=debug,
+            **kwargs,
+        )
+    return _unsloth_checkpoint_nodynamo(
+        function,
+        *args,
+        use_reentrant=use_reentrant,
+        context_fn=context_fn,
+        determinism_check=determinism_check,
+        debug=debug,
+        **kwargs,
+    )
 pass
 
 
