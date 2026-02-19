@@ -569,14 +569,23 @@ def _nonreentrant_adaptive_offload_should_offload(tensor, prefix):
     min_bytes = int(os.environ.get(f"{prefix}_MIN_BYTES", str(2 * 1024 * 1024)))
     if tensor is None:
         return False, "auto:no_tensor"
-    if getattr(tensor, "nbytes", 0) < min_bytes:
+    if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
+        if torch.compiler.is_compiling():
+            return False, "auto:torch_compile_disable_offload_gate"
+    try:
+        tensor_nbytes = int(getattr(tensor, "nbytes", 0))
+    except Exception:
+        # Symbolic shapes under torch.compile can make nbytes/numel unavailable.
+        # In that case, skip offload for safety rather than raising.
+        return False, "auto:symbolic_nbytes_unavailable"
+    if tensor_nbytes < min_bytes:
         return False, f"auto:tensor_nbytes<{min_bytes}"
     if DEVICE_TYPE not in ("cuda", "hip"):
         return True, "auto:non_cuda_device"
 
     # Memory-pressure gating is intentionally disabled for now.
     # In auto mode, once tensor size passes the threshold, offload it.
-    return True, f"auto:size_gate_only nbytes={getattr(tensor, 'nbytes', 0)}"
+    return True, f"auto:size_gate_only nbytes={tensor_nbytes}"
 pass
 
 

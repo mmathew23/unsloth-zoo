@@ -200,18 +200,34 @@ def prepare_model_for_training(
     if use_gradient_checkpointing != "unsloth":
         unpatch_unsloth_gradient_checkpointing()
         unpatch_unsloth_smart_gradient_checkpointing()
+    pass_use_reentrant_to_hf_gc = str(os.environ.get("UNSLOTH_GC_PASS_USE_REENTRANT_TO_HF", "0")).strip().lower() not in ("0", "false", "no", "off", "")
+
+    def _enable_gc(_module):
+        if not hasattr(_module, "gradient_checkpointing_enable"):
+            return
+        if pass_use_reentrant_to_hf_gc:
+            try:
+                _module.gradient_checkpointing_enable(
+                    gradient_checkpointing_kwargs={"use_reentrant": use_reentrant},
+                )
+                return
+            except TypeError:
+                # Older HF signatures might not accept kwargs; fall back.
+                pass
+        _module.gradient_checkpointing_enable()
+
     m = model
     while hasattr(m, "model"):
         if use_gradient_checkpointing == "unsloth":
             m._offloaded_gradient_checkpointing = True
         if use_gradient_checkpointing == True and hasattr(m, "gradient_checkpointing_enable"):
-            m.gradient_checkpointing_enable()
+            _enable_gc(m)
         m = m.model
     pass
     if use_gradient_checkpointing == "unsloth":
         m._offloaded_gradient_checkpointing = True
     if use_gradient_checkpointing == True and hasattr(m, "gradient_checkpointing_enable"):
-        m.gradient_checkpointing_enable()
+        _enable_gc(m)
 
     # Also set HF version manually to stop failures
     if hasattr(model, "_set_gradient_checkpointing"):
