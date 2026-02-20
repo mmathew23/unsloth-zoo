@@ -16,6 +16,7 @@
 
 import torch
 import math
+import functools
 import datasets
 from transformers import set_seed as transformers_set_seed
 from transformers import get_scheduler as transformers_get_scheduler
@@ -200,20 +201,18 @@ def prepare_model_for_training(
     if use_gradient_checkpointing != "unsloth":
         unpatch_unsloth_gradient_checkpointing()
         unpatch_unsloth_smart_gradient_checkpointing()
-    pass_use_reentrant_to_hf_gc = str(os.environ.get("UNSLOTH_GC_PASS_USE_REENTRANT_TO_HF", "0")).strip().lower() not in ("0", "false", "no", "off", "")
 
     def _enable_gc(_module):
         if not hasattr(_module, "gradient_checkpointing_enable"):
             return
-        if pass_use_reentrant_to_hf_gc:
-            try:
-                _module.gradient_checkpointing_enable(
-                    gradient_checkpointing_kwargs={"use_reentrant": use_reentrant},
-                )
-                return
-            except TypeError:
-                # Older HF signatures might not accept kwargs; fall back.
-                pass
+        try:
+            _module.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": use_reentrant},
+            )
+            return
+        except TypeError:
+            # Older HF signatures might not accept kwargs; fall back.
+            pass
         _module.gradient_checkpointing_enable()
 
     m = model
@@ -238,6 +237,20 @@ def prepare_model_for_training(
             for module in model.modules():
                 if hasattr(module, "gradient_checkpointing"):
                     module.gradient_checkpointing = False
+
+    # HF caches checkpoint callables on modules; rebind to the active one so
+    # mode switches and monkey patches apply consistently.
+    if use_gradient_checkpointing in (True, "unsloth"):
+        checkpoint_fn = torch.utils.checkpoint.checkpoint
+        for module in model.modules():
+            if hasattr(module, "_gradient_checkpointing_func"):
+                if use_gradient_checkpointing is True:
+                    module._gradient_checkpointing_func = functools.partial(
+                        checkpoint_fn,
+                        use_reentrant = use_reentrant,
+                    )
+                else:
+                    module._gradient_checkpointing_func = checkpoint_fn
 
     # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
     if use_reentrant:
