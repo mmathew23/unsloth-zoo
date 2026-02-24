@@ -305,6 +305,7 @@ global USE_UNSLOTH_GC
 global LAST_GC_INDEX
 global FIRST_PASS
 global CURRENT_GC_INDEX
+global REENTRANT_CHECKPOINT_DEPTH
 
 if DEVICE_TYPE in ("cuda", "hip"):
     torch_gpu_stream = torch.cuda.stream
@@ -318,6 +319,14 @@ UNSLOTH_GC_NONREENTRANT_BACKEND = "hooks"
 UNSLOTH_GC_DEBUG_PRINTED = set()
 ORIGINAL_NOOP_SETUP_CONTEXT = None
 UNSLOTH_NOOP_OFFLOAD_STATE = None
+_UNSLOTH_GC_USE_REENTRANT_ENV_WARNED = False
+REENTRANT_CHECKPOINT_DEPTH = 0
+
+
+def is_reentrant_checkpoint_active() -> bool:
+    # True while UnslothCheckpointFunction is executing run_function
+    # (both original forward and backward-time recompute).
+    return REENTRANT_CHECKPOINT_DEPTH > 0
 
 
 def _patch_noop_save_inputs():
@@ -1116,8 +1125,13 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         pass
         if ctx._requires_gradient: ctx.save_for_backward(*tensor_inputs)
 
-        with torch.no_grad():
-            outputs = run_function(*args)
+        global REENTRANT_CHECKPOINT_DEPTH
+        REENTRANT_CHECKPOINT_DEPTH += 1
+        try:
+            with torch.no_grad():
+                outputs = run_function(*args)
+        finally:
+            REENTRANT_CHECKPOINT_DEPTH = max(0, REENTRANT_CHECKPOINT_DEPTH - 1)
 
         if use_gpu_buffer: MAIN_STREAM.wait_stream(EXTRA_STREAM)
         return outputs
@@ -1207,9 +1221,14 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 detached_inputs[0] = x
             pass
 
-            with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
-                outputs = ctx.run_function(*detached_inputs)
-            pass
+            global REENTRANT_CHECKPOINT_DEPTH
+            REENTRANT_CHECKPOINT_DEPTH += 1
+            try:
+                with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
+                    outputs = ctx.run_function(*detached_inputs)
+                pass
+            finally:
+                REENTRANT_CHECKPOINT_DEPTH = max(0, REENTRANT_CHECKPOINT_DEPTH - 1)
         pass
 
         if isinstance(outputs, torch.Tensor):
@@ -1679,11 +1698,18 @@ def _parse_reentrant_mode(use_reentrant):
             raise TypeError("`use_reentrant` must be a boolean or None.")
         return use_reentrant
 
+    global _UNSLOTH_GC_USE_REENTRANT_ENV_WARNED
     env_value = os.environ.get("UNSLOTH_GC_USE_REENTRANT", None)
-    if env_value is None:
-        return True
-    env_value = str(env_value).strip().lower()
-    return env_value not in ("0", "false", "no", "off")
+    if (env_value is not None) and (not _UNSLOTH_GC_USE_REENTRANT_ENV_WARNED):
+        warnings.warn(
+            "Unsloth: `UNSLOTH_GC_USE_REENTRANT` is deprecated and no longer "
+            "controls checkpoint mode when `use_reentrant` is omitted. "
+            "Pass `use_reentrant=` explicitly.",
+            FutureWarning,
+            stacklevel = 2,
+        )
+        _UNSLOTH_GC_USE_REENTRANT_ENV_WARNED = True
+    return True
 pass
 
 
