@@ -305,7 +305,6 @@ global USE_UNSLOTH_GC
 global LAST_GC_INDEX
 global FIRST_PASS
 global CURRENT_GC_INDEX
-global REENTRANT_CHECKPOINT_DEPTH
 
 if DEVICE_TYPE in ("cuda", "hip"):
     torch_gpu_stream = torch.cuda.stream
@@ -320,13 +319,6 @@ UNSLOTH_GC_DEBUG_PRINTED = set()
 ORIGINAL_NOOP_SETUP_CONTEXT = None
 UNSLOTH_NOOP_OFFLOAD_STATE = None
 _UNSLOTH_GC_USE_REENTRANT_ENV_WARNED = False
-REENTRANT_CHECKPOINT_DEPTH = 0
-
-
-def is_reentrant_checkpoint_active() -> bool:
-    # True while UnslothCheckpointFunction is executing run_function
-    # (both original forward and backward-time recompute).
-    return REENTRANT_CHECKPOINT_DEPTH > 0
 
 
 def _patch_noop_save_inputs():
@@ -368,7 +360,7 @@ def _patch_noop_save_inputs():
             )
             if should_try_offload:
                 packed = offloader.pack_hook(o)
-                if isinstance(packed, tuple) and len(packed) >= 1 and packed[0] in ("cpu", "engine"):
+                if isinstance(packed, tuple) and len(packed) >= 1 and packed[0] == "cpu":
                     off_idx = len(offloaded)
                     offloaded.append(packed)
                     entry_kind[i] = 2
@@ -461,11 +453,7 @@ def _parse_nonreentrant_backend(backend):
         return "hooks"
     if backend in ("save_on_cpu", "nohooks", "no_hooks"):
         return "save_on_cpu"
-    if backend in ("engine", "custom_engine", "nohooks_engine"):
-        return "engine"
-    if backend in ("engine_v2", "v2_engine", "custom_engine_v2"):
-        return "engine_v2"
-    raise ValueError("`nonreentrant_backend` must be one of ['hooks', 'save_on_cpu', 'engine', 'engine_v2'].")
+    raise ValueError("`nonreentrant_backend` must be one of ['hooks', 'save_on_cpu'].")
 pass
 
 
@@ -477,69 +465,6 @@ def _resolve_nonreentrant_determinism_mode(determinism_check):
     if mode in ("default", "none"):
         return mode
     raise ValueError("`UNSLOTH_GC_NONREENTRANT_DETERMINISM_CHECK` must be one of ['default', 'none'].")
-pass
-
-
-def _parse_nonreentrant_offload_policy(prefix):
-    policy = os.environ.get(f"{prefix}_POLICY", "auto")
-    policy = str(policy).strip().lower()
-    if policy in ("auto", "always", "never"):
-        return policy
-    raise ValueError(f"`{prefix}_POLICY` must be one of ['auto', 'always', 'never'].")
-pass
-
-
-def _nonreentrant_adaptive_offload_should_offload(tensor, prefix):
-    policy = _parse_nonreentrant_offload_policy(prefix)
-    if policy == "always":
-        return True, "policy=always"
-    if policy == "never":
-        return False, "policy=never"
-
-    # Match reentrant offload behavior: 2MB activation threshold by default.
-    min_bytes = int(os.environ.get(f"{prefix}_MIN_BYTES", str(2 * 1024 * 1024)))
-    if tensor is None:
-        return False, "auto:no_tensor"
-    if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
-        if torch.compiler.is_compiling():
-            return False, "auto:torch_compile_disable_offload_gate"
-    try:
-        tensor_nbytes = int(getattr(tensor, "nbytes", 0))
-    except Exception:
-        # Symbolic shapes under torch.compile can make nbytes/numel unavailable.
-        # In that case, skip offload for safety rather than raising.
-        return False, "auto:symbolic_nbytes_unavailable"
-    if tensor_nbytes < min_bytes:
-        return False, f"auto:tensor_nbytes<{min_bytes}"
-    if DEVICE_TYPE not in ("cuda", "hip"):
-        return True, "auto:non_cuda_device"
-
-    # Memory-pressure gating is intentionally disabled for now.
-    # In auto mode, once tensor size passes the threshold, offload it.
-    return True, f"auto:size_gate_only nbytes={tensor_nbytes}"
-pass
-
-
-def _nonreentrant_save_on_cpu_should_offload(tensor):
-    return _nonreentrant_adaptive_offload_should_offload(
-        tensor,
-        "UNSLOTH_GC_NONREENTRANT_SAVE_ON_CPU",
-    )
-pass
-
-
-def _nonreentrant_hooks_should_offload(tensor):
-    return _nonreentrant_adaptive_offload_should_offload(
-        tensor,
-        "UNSLOTH_GC_NONREENTRANT_HOOKS_OFFLOAD",
-    )
-pass
-
-
-def _maybe_compose_selective_ac_context_fn(context_fn):
-    # Keep SAC plumbing by forwarding the context function through
-    # non-reentrant checkpoint calls unchanged.
-    return context_fn
 pass
 
 
@@ -707,6 +632,21 @@ class UnslothGradientCheckpointer:
         self.is_last_layer = is_last_layer
 
     @classmethod
+    def begin_checkpoint(cls, dtype=None):
+        """Per-call bookkeeping: initialize if needed, track layer index, return offloader."""
+        if not cls._initialized:
+            cls.initialize(dtype)
+        if cls._backward_pass:
+            cls._backward_pass = False
+            cls._cpu_buffer_index = 0
+            cls._current_gc_index = 0
+        if cls._first_pass:
+            cls._last_gc_index += 1
+        cls._current_gc_index += 1
+        is_last_layer = (cls._current_gc_index == cls._last_gc_index) and not cls._first_pass
+        return cls(is_last_layer=is_last_layer)
+
+    @classmethod
     def _record_stream_event(cls, stream):
         if cls._events_supported is False:
             return None
@@ -741,6 +681,9 @@ class UnslothGradientCheckpointer:
         cls = self.__class__
         if _gc_disable_cpu_offload():
             return False
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
+            if torch.compiler.is_compiling():
+                return False
         if tensor.numel() < cls._minimum_size:
             return False
         if tensor.device.type == "cpu":
@@ -931,22 +874,6 @@ class UnslothGradientCheckpointer:
         return result
 
 
-class UnslothNonReentrantEngineOffloader:
-    """
-    Hook-free non-reentrant offload controller using _NoopSaveInputs interception.
-    This keeps per-checkpoint ownership centralized in torch checkpoint internals.
-    """
-    def __init__(self, is_last_layer: bool = False):
-        self._base = UnslothGradientCheckpointer(is_last_layer=is_last_layer)
-
-    def pack_hook(self, tensor: torch.Tensor):
-        # _NoopSaveInputs gives deterministic per-checkpoint ownership/order
-        # of packed entries.
-        return self._base.pack_hook(tensor)
-
-    def unpack_hook(self, packed):
-        return self._base.unpack_hook(packed)
-
 def initialize_unsloth_gradient_checkpointing(dtype = None):
     # All Unsloth Zoo code licensed under LGPLv3
     global CPU_BUFFERS
@@ -1125,13 +1052,8 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         pass
         if ctx._requires_gradient: ctx.save_for_backward(*tensor_inputs)
 
-        global REENTRANT_CHECKPOINT_DEPTH
-        REENTRANT_CHECKPOINT_DEPTH += 1
-        try:
-            with torch.no_grad():
-                outputs = run_function(*args)
-        finally:
-            REENTRANT_CHECKPOINT_DEPTH = max(0, REENTRANT_CHECKPOINT_DEPTH - 1)
+        with torch.no_grad():
+            outputs = run_function(*args)
 
         if use_gpu_buffer: MAIN_STREAM.wait_stream(EXTRA_STREAM)
         return outputs
@@ -1221,14 +1143,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 detached_inputs[0] = x
             pass
 
-            global REENTRANT_CHECKPOINT_DEPTH
-            REENTRANT_CHECKPOINT_DEPTH += 1
-            try:
-                with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
-                    outputs = ctx.run_function(*detached_inputs)
-                pass
-            finally:
-                REENTRANT_CHECKPOINT_DEPTH = max(0, REENTRANT_CHECKPOINT_DEPTH - 1)
+            with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
+                outputs = ctx.run_function(*detached_inputs)
+            pass
         pass
 
         if isinstance(outputs, torch.Tensor):
@@ -1282,116 +1199,10 @@ def _unsloth_checkpoint_impl(
     debug: bool = False,
     **kwargs
 ):
-    r"""Checkpoint a model or part of the model.
+    """Unsloth gradient checkpoint: reentrant or non-reentrant with CPU offloading.
 
-    Activation checkpointing is a technique that trades compute for memory.
-    Instead of keeping tensors needed for backward alive until they are used in
-    gradient computation during backward, forward computation in checkpointed
-    regions omits saving tensors for backward and recomputes them during the
-    backward pass. Activation checkpointing can be applied to any part of a
-    model.
-
-    There are currently two checkpointing implementations available, determined
-    by the :attr:`use_reentrant` parameter. It is recommended that you use
-    ``use_reentrant=False``. Please refer the note below for a discussion of
-    their differences.
-
-    .. warning::
-
-        If the :attr:`function` invocation during the backward pass differs
-        from the forward pass, e.g., due to a global variable, the checkpointed
-        version may not be equivalent, potentially causing an
-        error being raised or leading to silently incorrect gradients.
-
-    .. warning::
-
-        The ``use_reentrant`` parameter should be passed explicitly. In version
-        2.4 we will raise an exception if ``use_reentrant`` is not passed.
-        If you are using the ``use_reentrant=True`` variant, please refer to the
-        note below for important considerations and potential limitations.
-
-    .. note::
-
-        The reentrant variant of checkpoint (``use_reentrant=True``) and
-        the non-reentrant variant of checkpoint (``use_reentrant=False``)
-        differ in the following ways:
-
-        * Non-reentrant checkpoint stops recomputation as soon as all needed
-          intermediate activations have been recomputed. This feature is enabled
-          by default, but can be disabled with :func:`set_checkpoint_early_stop`.
-          Reentrant checkpoint always recomputes :attr:`function` in its
-          entirety during the backward pass.
-
-        * The reentrant variant does not record the autograd graph during the
-          forward pass, as it runs with the forward pass under
-          :func:`torch.no_grad`. The non-reentrant version does record the
-          autograd graph, allowing one to perform backward on the graph within
-          checkpointed regions.
-
-        * The reentrant checkpoint only supports the
-          :func:`torch.autograd.backward` API for the backward pass without its
-          `inputs` argument, while the non-reentrant version supports all ways
-          of performing the backward pass.
-
-        * At least one input and output must have ``requires_grad=True`` for the
-          reentrant variant. If this condition is unmet, the checkpointed part
-          of the model will not have gradients. The non-reentrant version does
-          not have this requirement.
-
-        * The reentrant version does not consider tensors in nested structures
-          (e.g., custom objects, lists, dicts, etc) as participating in
-          autograd, while the non-reentrant version does.
-
-        * The reentrant checkpoint does not support checkpointed regions with
-          detached tensors from the computational graph, whereas the
-          non-reentrant version does. For the reentrant variant, if the
-          checkpointed segment contains tensors detached using ``detach()`` or
-          with :func:`torch.no_grad`, the backward pass will raise an error.
-          This is because ``checkpoint`` makes all the outputs require gradients
-          and this causes issues when a tensor is defined to have no gradient in
-          the model. To avoid this, detach the tensors outside of the
-          ``checkpoint`` function.
-
-    Args:
-        function: describes what to run in the forward pass of the model or
-            part of the model. It should also know how to handle the inputs
-            passed as the tuple. For example, in LSTM, if user passes
-            ``(activation, hidden)``, :attr:`function` should correctly use the
-            first input as ``activation`` and the second input as ``hidden``
-        preserve_rng_state(bool, optional):  Omit stashing and restoring
-            the RNG state during each checkpoint. Note that under torch.compile,
-            this flag doesn't take effect and we always preserve RNG state.
-            Default: ``True``
-        use_reentrant(bool):
-            specify whether to use the activation checkpoint variant that
-            requires reentrant autograd. This parameter should be passed
-            explicitly. In version 2.5 we will raise an exception if
-            ``use_reentrant`` is not passed. If ``use_reentrant=False``,
-            ``checkpoint`` will use an implementation that does not require
-            reentrant autograd. This allows ``checkpoint`` to support additional
-            functionality, such as working as expected with
-            ``torch.autograd.grad`` and support for keyword arguments input into
-            the checkpointed function.
-        context_fn(Callable, optional): A callable returning a tuple of two
-            context managers. The function and its recomputation will be run
-            under the first and second context managers respectively.
-            This argument is only supported if ``use_reentrant=False``.
-        determinism_check(str, optional): A string specifying the determinism
-            check to perform. By default it is set to ``"default"`` which
-            compares the shapes, dtypes, and devices of the recomputed tensors
-            against those the saved tensors. To turn off this check, specify
-            ``"none"``. Currently these are the only two supported values.
-            Please open an issue if you would like to see more determinism
-            checks. This argument is only supported if ``use_reentrant=False``,
-            if ``use_reentrant=True``, the determinism check is always disabled.
-        debug(bool, optional): If ``True``, error messages will also include
-            a trace of the operators ran during the original forward computation
-            as well as the recomputation. This argument is only supported if
-            ``use_reentrant=False``.
-        args: tuple containing inputs to the :attr:`function`
-
-    Returns:
-        Output of running :attr:`function` on :attr:`*args`
+    Dispatches to reentrant (UnslothCheckpointFunction) or non-reentrant
+    (hooks / save_on_cpu backends) based on use_reentrant flag.
     """
     global UNSLOTH_NOOP_OFFLOAD_STATE
     if use_reentrant is None:
@@ -1426,7 +1237,6 @@ def _unsloth_checkpoint_impl(
 
     cls = UnslothGradientCheckpointer
     determinism_check = _resolve_nonreentrant_determinism_mode(determinism_check)
-    context_fn = _maybe_compose_selective_ac_context_fn(context_fn)
     global UNSLOTH_GC_NONREENTRANT_BACKEND
     backend = UNSLOTH_GC_NONREENTRANT_BACKEND
     _gc_debug(
@@ -1439,46 +1249,37 @@ def _unsloth_checkpoint_impl(
     if torch.is_tensor(first_arg):
         dtype = first_arg.dtype
 
-    if backend in ("hooks", "engine", "engine_v2") and not cls._initialized:
-        cls.initialize(dtype)
-    elif backend != "hooks" and not cls._meta_initialized:
-        cls.ensure_metadata(dtype)
+    offloader = cls.begin_checkpoint(dtype)
 
-    if cls._backward_pass:
-        cls._backward_pass = False
-        cls._cpu_buffer_index = 0
-        cls._current_gc_index = 0
-
-    if cls._first_pass:
-        cls._last_gc_index += 1
-    cls._current_gc_index += 1
-
-    is_last_layer = (cls._current_gc_index == cls._last_gc_index) and not cls._first_pass
-    should_offload = (
-        (not _gc_disable_cpu_offload()) and
-        torch.is_tensor(first_arg) and
-        first_arg.requires_grad and
-        first_arg.numel() > cls._minimum_size and
-        (not is_last_layer)
-    )
-
-    if backend == "engine":
-        offloader = UnslothNonReentrantEngineOffloader(is_last_layer=is_last_layer)
-    elif backend == "engine_v2":
-        offloader = None
-    else:
-        offloader = UnslothGradientCheckpointer(is_last_layer=is_last_layer)
     old_checkpoint = getattr(torch.utils.checkpoint, "_old_checkpoint", None)
     original_checkpoint = old_checkpoint if old_checkpoint is not None else torch.utils.checkpoint.checkpoint
 
-    if backend == "engine_v2":
+    # Global kill switch: skip offload entirely
+    if _gc_disable_cpu_offload():
+        with _nonreentrant_perf_context():
+            return original_checkpoint(
+                function, *args,
+                use_reentrant=False,
+                preserve_rng_state=preserve,
+                context_fn=context_fn,
+                determinism_check=determinism_check,
+                debug=debug,
+                **kwargs
+            )
+
+    if backend == "save_on_cpu":
         _gc_debug(
-            "NONREENTRANT_ENGINE_V2_PATH",
-            "engine_v2 backend -> torch checkpoint(use_reentrant=False), optimized non-reentrant path",
+            "NONREENTRANT_SAVE_ON_CPU",
+            "save_on_cpu backend (_NoopSaveInputs offload path)",
             once = False,
         )
-        # Fast path: when offload is disabled, bypass all offload bookkeeping.
-        if _gc_disable_cpu_offload():
+        previous_state = UNSLOTH_NOOP_OFFLOAD_STATE
+        UNSLOTH_NOOP_OFFLOAD_STATE = {
+            "offloader": offloader,
+            # _NoopSaveInputs gets: (dummy, kwargs, *args), so first model arg is index 2.
+            "target_input_index": 2,
+        }
+        try:
             with _nonreentrant_perf_context():
                 return original_checkpoint(
                     function, *args,
@@ -1489,108 +1290,13 @@ def _unsloth_checkpoint_impl(
                     debug=debug,
                     **kwargs
                 )
-
-        allow_offload_v2, offload_reason_v2 = _nonreentrant_save_on_cpu_should_offload(
-            first_arg if torch.is_tensor(first_arg) else None
-        )
-        should_offload_v2 = should_offload and allow_offload_v2
-        if should_offload_v2:
-            _gc_debug(
-                "NONREENTRANT_ENGINE_V2",
-                f"engine_v2 offload enabled (optimized _NoopSaveInputs path), reason={offload_reason_v2}",
-                once=False,
-            )
-            offloader_v2 = UnslothNonReentrantEngineOffloader(is_last_layer=is_last_layer)
-            previous_state = UNSLOTH_NOOP_OFFLOAD_STATE
-            UNSLOTH_NOOP_OFFLOAD_STATE = {
-                "offloader": offloader_v2,
-                "target_input_index": 2,
-            }
-            try:
-                with _nonreentrant_perf_context():
-                    return original_checkpoint(
-                        function, *args,
-                        use_reentrant=False,
-                        preserve_rng_state=preserve,
-                        context_fn=context_fn,
-                        determinism_check=determinism_check,
-                        debug=debug,
-                        **kwargs
-                    )
-            finally:
-                UNSLOTH_NOOP_OFFLOAD_STATE = previous_state
-        else:
-            _gc_debug(
-                "NONREENTRANT_ENGINE_V2",
-                f"engine_v2 offload skipped, reason={offload_reason_v2}",
-                once=False,
-            )
-            with _nonreentrant_perf_context():
-                return original_checkpoint(
-                    function, *args,
-                    use_reentrant=False,
-                    preserve_rng_state=preserve,
-                    context_fn=context_fn,
-                    determinism_check=determinism_check,
-                    debug=debug,
-                    **kwargs
-                )
-
-    if backend in ("save_on_cpu", "engine"):
-        allow_offload, offload_reason = _nonreentrant_save_on_cpu_should_offload(first_arg if torch.is_tensor(first_arg) else None)
-        should_offload_save_on_cpu = should_offload and (not _gc_disable_cpu_offload()) and allow_offload
-        if should_offload_save_on_cpu:
-            backend_tag = "NONREENTRANT_ENGINE" if backend == "engine" else "NONREENTRANT_SAVE_ON_CPU"
-            backend_msg = "engine backend enabled (ticketed _NoopSaveInputs offload)" if backend == "engine" else "save_on_cpu backend enabled (hook-free _NoopSaveInputs offload)"
-            _gc_debug(
-                backend_tag,
-                f"{backend_msg}, reason={offload_reason}",
-                once = False,
-            )
-            previous_state = UNSLOTH_NOOP_OFFLOAD_STATE
-            UNSLOTH_NOOP_OFFLOAD_STATE = {
-                "offloader": offloader,
-                # _NoopSaveInputs gets: (dummy, kwargs, *args), so first model arg is index 2.
-                "target_input_index": 2,
-            }
-            try:
-                with _nonreentrant_perf_context():
-                    return original_checkpoint(
-                        function, *args,
-                        use_reentrant=False,
-                        preserve_rng_state=preserve,
-                        context_fn=context_fn,
-                        determinism_check=determinism_check,
-                        debug=debug,
-                        **kwargs
-                    )
-            finally:
-                UNSLOTH_NOOP_OFFLOAD_STATE = previous_state
-        else:
-            backend_tag = "NONREENTRANT_ENGINE" if backend == "engine" else "NONREENTRANT_SAVE_ON_CPU"
-            backend_msg = "engine backend skipped offload (below threshold / CPU tensor / last layer / no grad / disabled / policy)" if backend == "engine" else "save_on_cpu backend skipped offload (below threshold / CPU tensor / last layer / no grad / disabled / policy)"
-            _gc_debug(
-                backend_tag,
-                f"{backend_msg} reason={offload_reason}",
-                once = False,
-            )
-            with _nonreentrant_perf_context():
-                return original_checkpoint(
-                    function, *args,
-                    use_reentrant=False,
-                    preserve_rng_state=preserve,
-                    context_fn=context_fn,
-                    determinism_check=determinism_check,
-                    debug=debug,
-                    **kwargs
-                )
-
-    allow_hooks_offload, hooks_offload_reason = _nonreentrant_hooks_should_offload(first_arg if torch.is_tensor(first_arg) else None)
-    should_offload_hooks = should_offload and allow_hooks_offload
-    if should_offload_hooks:
+        finally:
+            UNSLOTH_NOOP_OFFLOAD_STATE = previous_state
+    else:
+        # hooks (default)
         _gc_debug(
-            "NONREENTRANT_OFFLOAD",
-            f"non-reentrant checkpoint OFFLOAD enabled for this activation (hooks backend), reason={hooks_offload_reason}",
+            "NONREENTRANT_HOOKS",
+            "hooks backend (saved_tensors_hooks offload path)",
             once = False,
         )
         with torch.autograd.graph.saved_tensors_hooks(offloader.pack_hook, offloader.unpack_hook):
@@ -1604,22 +1310,6 @@ def _unsloth_checkpoint_impl(
                     debug=debug,
                     **kwargs
                 )
-
-    _gc_debug(
-        "NONREENTRANT_OFFLOAD",
-        f"non-reentrant checkpoint OFFLOAD skipped (below threshold / CPU tensor / last layer / no grad / policy), reason={hooks_offload_reason}",
-        once = False,
-    )
-    with _nonreentrant_perf_context():
-        return original_checkpoint(
-            function, *args,
-            use_reentrant=False,
-            preserve_rng_state=preserve,
-            context_fn=context_fn,
-            determinism_check=determinism_check,
-            debug=debug,
-            **kwargs
-        )
 pass
 
 
