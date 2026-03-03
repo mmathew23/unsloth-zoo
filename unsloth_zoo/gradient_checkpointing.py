@@ -314,10 +314,8 @@ elif DEVICE_TYPE == "xpu":
 CPU_BUFFERS = []
 CPU_INDEX = None
 UNSLOTH_GC_PATCH_USE_REENTRANT = True
-UNSLOTH_GC_DEBUG_PRINTED = set()
 ORIGINAL_NOOP_SETUP_CONTEXT = None
 UNSLOTH_NOOP_OFFLOAD_STATE = None
-_UNSLOTH_GC_USE_REENTRANT_ENV_WARNED = False
 
 
 def _patch_noop_save_inputs():
@@ -404,43 +402,12 @@ def _unpatch_noop_save_inputs():
 pass
 
 
-def _is_truthy_env(name):
-    value = os.environ.get(name, None)
+def _gc_disable_cpu_offload():
+    value = os.environ.get("UNSLOTH_GC_DISABLE_CPU_OFFLOAD", None)
     if value is None:
         return False
     return str(value).strip().lower() not in ("0", "false", "no", "off", "")
 pass
-
-
-def _gc_debug(tag, message, once = True):
-    if not _is_truthy_env("UNSLOTH_ENABLE_LOGGING"):
-        return
-    key = (tag, message)
-    if once and key in UNSLOTH_GC_DEBUG_PRINTED:
-        return
-    if once:
-        UNSLOTH_GC_DEBUG_PRINTED.add(key)
-    print(f"[UNSLOTH_GC][{tag}] {message}")
-pass
-
-
-def _gc_disable_cpu_offload():
-    return _is_truthy_env("UNSLOTH_GC_DISABLE_CPU_OFFLOAD")
-pass
-
-
-def _resolve_nonreentrant_determinism_mode(determinism_check):
-    if determinism_check != _DEFAULT_DETERMINISM_MODE:
-        return determinism_check
-    mode = os.environ.get("UNSLOTH_GC_NONREENTRANT_DETERMINISM_CHECK", "none")
-    mode = str(mode).strip().lower()
-    if mode in ("default", "none"):
-        return mode
-    raise ValueError("`UNSLOTH_GC_NONREENTRANT_DETERMINISM_CHECK` must be one of ['default', 'none'].")
-pass
-
-
-_CACHED_DETERMINISM_MODE = None
 
 
 class UnslothGradientCheckpointer:
@@ -618,11 +585,7 @@ class UnslothGradientCheckpointer:
             event = stream.record_event()
             cls._events_supported = True
             return event
-        except Exception as e:
-            _gc_debug(
-                "NONREENTRANT_EVENT",
-                f"stream.record_event failed; falling back to wait_stream path. error={type(e).__name__}: {e}",
-            )
+        except Exception:
             cls._events_supported = False
             return None
 
@@ -633,11 +596,7 @@ class UnslothGradientCheckpointer:
         try:
             stream.wait_event(event)
             return True
-        except Exception as e:
-            _gc_debug(
-                "NONREENTRANT_EVENT",
-                f"stream.wait_event failed; falling back to wait_stream path. error={type(e).__name__}: {e}",
-            )
+        except Exception:
             cls._events_supported = False
             return False
 
@@ -1133,7 +1092,8 @@ from torch.utils.checkpoint import (
     _DEFAULT_DETERMINISM_MODE,
     noop_context_fn,
 )
-def _unsloth_checkpoint_impl(
+@torch._disable_dynamo
+def unsloth_checkpoint(
     function,
     *args,
     use_reentrant: Optional[bool] = None,
@@ -1167,10 +1127,6 @@ def _unsloth_checkpoint_impl(
         raise ValueError("Unexpected keyword arguments: " + ",".join(arg for arg in kwargs))
 
     if use_reentrant:
-        _gc_debug(
-            "REENTRANT_PATH",
-            "unsloth_checkpoint -> UnslothCheckpointFunction.apply (reentrant autograd path)",
-        )
         if context_fn is not noop_context_fn or debug is not False:
             raise ValueError(
                 "Passing `context_fn` or `debug` is only supported when "
@@ -1179,12 +1135,8 @@ def _unsloth_checkpoint_impl(
         return UnslothCheckpointFunction.apply(function, preserve, *args)
 
     cls = UnslothGradientCheckpointer
-    determinism_check = _CACHED_DETERMINISM_MODE if _CACHED_DETERMINISM_MODE is not None else _resolve_nonreentrant_determinism_mode(determinism_check)
-    _gc_debug(
-        "NONREENTRANT_PATH",
-        "unsloth_checkpoint -> torch checkpoint(use_reentrant=False)",
-        once = False,
-    )
+    # Skip determinism checks for performance (avoids shape/dtype/device validation overhead).
+    determinism_check = "none"
     dtype = None
     first_arg = args[0] if args else None
     if torch.is_tensor(first_arg):
@@ -1207,11 +1159,6 @@ def _unsloth_checkpoint_impl(
             **kwargs
         )
 
-    _gc_debug(
-        "NONREENTRANT_SAVE_ON_CPU",
-        "save_on_cpu backend (_NoopSaveInputs offload path)",
-        once = False,
-    )
     previous_state = UNSLOTH_NOOP_OFFLOAD_STATE
     UNSLOTH_NOOP_OFFLOAD_STATE = {
         "offloader": offloader,
@@ -1233,114 +1180,10 @@ def _unsloth_checkpoint_impl(
 pass
 
 
-@torch._disable_dynamo
-def _unsloth_checkpoint_nodynamo(
-    function,
-    *args,
-    use_reentrant: Optional[bool] = None,
-    context_fn: Callable[[], Tuple[ContextManager, ContextManager]] = noop_context_fn,
-    determinism_check: str = _DEFAULT_DETERMINISM_MODE,
-    debug: bool = False,
-    **kwargs
-):
-    return _unsloth_checkpoint_impl(
-        function,
-        *args,
-        use_reentrant=use_reentrant,
-        context_fn=context_fn,
-        determinism_check=determinism_check,
-        debug=debug,
-        **kwargs,
-    )
-pass
-
-
-def _should_allow_dynamo_nonreentrant(use_reentrant: Optional[bool]) -> bool:
-    if not _is_truthy_env("UNSLOTH_GC_ALLOW_DYNAMO_NONREENTRANT"):
-        return False
-    if use_reentrant is None:
-        effective_use_reentrant = UNSLOTH_GC_PATCH_USE_REENTRANT
-    else:
-        effective_use_reentrant = bool(use_reentrant)
-    return effective_use_reentrant is False
-pass
-
-
-def unsloth_checkpoint(
-    function,
-    *args,
-    use_reentrant: Optional[bool] = None,
-    context_fn: Callable[[], Tuple[ContextManager, ContextManager]] = noop_context_fn,
-    determinism_check: str = _DEFAULT_DETERMINISM_MODE,
-    debug: bool = False,
-    **kwargs
-):
-    if _should_allow_dynamo_nonreentrant(use_reentrant):
-        _gc_debug(
-            "NONREENTRANT_COMPILE_EXPERIMENT",
-            "Running non-reentrant checkpoint without torch._disable_dynamo",
-            once=False,
-        )
-        return _unsloth_checkpoint_impl(
-            function,
-            *args,
-            use_reentrant=use_reentrant,
-            context_fn=context_fn,
-            determinism_check=determinism_check,
-            debug=debug,
-            **kwargs,
-        )
-    return _unsloth_checkpoint_nodynamo(
-        function,
-        *args,
-        use_reentrant=use_reentrant,
-        context_fn=context_fn,
-        determinism_check=determinism_check,
-        debug=debug,
-        **kwargs,
-    )
-pass
-
-
-def _parse_reentrant_mode(use_reentrant):
-    if use_reentrant is not None:
-        if type(use_reentrant) is not bool:
-            raise TypeError("`use_reentrant` must be a boolean or None.")
-        return use_reentrant
-
-    global _UNSLOTH_GC_USE_REENTRANT_ENV_WARNED
-    env_value = os.environ.get("UNSLOTH_GC_USE_REENTRANT", None)
-    if (env_value is not None) and (not _UNSLOTH_GC_USE_REENTRANT_ENV_WARNED):
-        warnings.warn(
-            "Unsloth: `UNSLOTH_GC_USE_REENTRANT` is deprecated and no longer "
-            "controls checkpoint mode when `use_reentrant` is omitted. "
-            "Pass `use_reentrant=` explicitly.",
-            FutureWarning,
-            stacklevel = 2,
-        )
-        _UNSLOTH_GC_USE_REENTRANT_ENV_WARNED = True
-    return True
-pass
-
-
-def patch_unsloth_smart_gradient_checkpointing(dtype = None, use_reentrant = None, nonreentrant_backend = None):
+def patch_unsloth_smart_gradient_checkpointing(dtype = None, use_reentrant = None):
     # All Unsloth Zoo code licensed under LGPLv3
     global UNSLOTH_GC_PATCH_USE_REENTRANT
-    global _CACHED_DETERMINISM_MODE
-    UNSLOTH_GC_PATCH_USE_REENTRANT = _parse_reentrant_mode(use_reentrant)
-    if nonreentrant_backend is not None:
-        warnings.warn(
-            "Unsloth: `nonreentrant_backend` is deprecated and ignored. "
-            "The save_on_cpu backend is now always used.",
-            FutureWarning,
-            stacklevel=2,
-        )
-    _CACHED_DETERMINISM_MODE = _resolve_nonreentrant_determinism_mode(_DEFAULT_DETERMINISM_MODE)
-    _gc_debug(
-        "PATCH_MODE",
-        f"patch_unsloth_smart_gradient_checkpointing selected use_reentrant={UNSLOTH_GC_PATCH_USE_REENTRANT}",
-        once = False,
-    )
+    UNSLOTH_GC_PATCH_USE_REENTRANT = bool(use_reentrant) if use_reentrant is not None else True
 
     if UNSLOTH_GC_PATCH_USE_REENTRANT:
         UnslothGradientCheckpointer.cleanup()
@@ -1375,9 +1218,7 @@ pass
 def unpatch_unsloth_smart_gradient_checkpointing():
     # All Unsloth Zoo code licensed under LGPLv3
     global UNSLOTH_GC_PATCH_USE_REENTRANT
-    global _CACHED_DETERMINISM_MODE
     UNSLOTH_GC_PATCH_USE_REENTRANT = True
-    _CACHED_DETERMINISM_MODE = None
     UnslothGradientCheckpointer.cleanup()
 
     if (torch.utils.checkpoint.CheckpointFunction.__name__ == "UnslothCheckpointFunction") and \
