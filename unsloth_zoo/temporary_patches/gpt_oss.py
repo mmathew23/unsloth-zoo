@@ -2296,21 +2296,12 @@ def patch_GptOssModel():
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        # `torch._dynamo.mark_dynamic` can be forbidden when tracing some full-model
-        # compile regions; skip these hints while the graph is actively compiling.
-        is_compiling = False
         try:
-            if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
-                is_compiling = bool(torch.compiler.is_compiling())
-        except Exception:
-            is_compiling = False
-        if not is_compiling:
-            try:
-                torch._dynamo.mark_static (hidden_states, 0)
-                torch._dynamo.mark_dynamic(hidden_states, 1)
-                torch._dynamo.mark_static (hidden_states, 2)
-            except Exception:
-                pass
+            torch._dynamo.mark_static (hidden_states, 0)
+            torch._dynamo.mark_dynamic(hidden_states, 1)
+            torch._dynamo.mark_static (hidden_states, 2)
+        except:
+            pass
 
         # It may already have been prepared by e.g. `generate`
         if not self.training and not isinstance(attention_mask, dict):
