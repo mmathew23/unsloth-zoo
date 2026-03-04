@@ -313,7 +313,6 @@ elif DEVICE_TYPE == "xpu":
 
 CPU_BUFFERS = []
 CPU_INDEX = None
-UNSLOTH_GC_PATCH_USE_REENTRANT = True
 ORIGINAL_NOOP_SETUP_CONTEXT = None
 UNSLOTH_NOOP_OFFLOAD_STATE = None
 
@@ -1109,18 +1108,7 @@ def unsloth_checkpoint(
     """
     global UNSLOTH_NOOP_OFFLOAD_STATE
     if use_reentrant is None:
-        global UNSLOTH_GC_PATCH_USE_REENTRANT
-        use_reentrant = UNSLOTH_GC_PATCH_USE_REENTRANT
-        if use_reentrant:
-            warnings.warn(
-                "torch.utils.checkpoint: the use_reentrant parameter should be "
-                "passed explicitly. In version 2.5 we will raise an exception "
-                "if use_reentrant is not passed. use_reentrant=False is "
-                "recommended, but if you need to preserve the current default "
-                "behavior, you can pass use_reentrant=True. Refer to docs for more "
-                "details on the differences between the two variants.",
-                stacklevel=2
-            )
+        use_reentrant = True
 
     preserve = kwargs.pop("preserve_rng_state", True)
     if kwargs and use_reentrant:
@@ -1182,10 +1170,9 @@ pass
 
 def patch_unsloth_smart_gradient_checkpointing(dtype = None, use_reentrant = None):
     # All Unsloth Zoo code licensed under LGPLv3
-    global UNSLOTH_GC_PATCH_USE_REENTRANT
-    UNSLOTH_GC_PATCH_USE_REENTRANT = bool(use_reentrant) if use_reentrant is not None else True
+    effective_use_reentrant = bool(use_reentrant) if use_reentrant is not None else True
 
-    if UNSLOTH_GC_PATCH_USE_REENTRANT:
+    if effective_use_reentrant:
         UnslothGradientCheckpointer.cleanup()
         if torch.utils.checkpoint.CheckpointFunction.__name__ != "UnslothCheckpointFunction":
             initialize_unsloth_gradient_checkpointing(dtype)
@@ -1217,8 +1204,6 @@ pass
 
 def unpatch_unsloth_smart_gradient_checkpointing():
     # All Unsloth Zoo code licensed under LGPLv3
-    global UNSLOTH_GC_PATCH_USE_REENTRANT
-    UNSLOTH_GC_PATCH_USE_REENTRANT = True
     UnslothGradientCheckpointer.cleanup()
 
     if (torch.utils.checkpoint.CheckpointFunction.__name__ == "UnslothCheckpointFunction") and \
