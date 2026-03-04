@@ -947,6 +947,9 @@ def create_new_function(
                 if versioning[: versioning.find("__UNSLOTH_VERSIONING__")] != versions:
                     overwrite = True
     pass
+    # Internal note: template edits only take effect after cache regeneration.
+    # If UNSLOTH_COMPILE_OVERWRITE=0, stale compiled modules are reused unless
+    # version-mismatch logic below explicitly forces regeneration.
     if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
         # Even with OVERWRITE disabled, force recompile on transformers version mismatch
         if file_source is not None and "__UNSLOTH_VERSIONING__" in file_source:
@@ -1493,6 +1496,36 @@ if n_items is None:
             break
 pass
 
+has_pre_shift_labels = False
+effective_labels = labels
+if "shift_labels" in all_locals:
+    __shift_labels = all_locals["shift_labels"]
+    if __shift_labels is not None:
+        has_pre_shift_labels = True
+        effective_labels = __shift_labels
+if (not has_pre_shift_labels) and "loss_kwargs" in all_locals:
+    __kwargs = all_locals["loss_kwargs"]
+    if type(__kwargs) is dict:
+        __shift_labels = __kwargs.get("shift_labels", None)
+        if __shift_labels is not None:
+            has_pre_shift_labels = True
+            effective_labels = __shift_labels
+if (not has_pre_shift_labels) and "kwargs" in all_locals:
+    __kwargs = all_locals["kwargs"]
+    if type(__kwargs) is dict:
+        __shift_labels = __kwargs.get("shift_labels", None)
+        if __shift_labels is not None:
+            has_pre_shift_labels = True
+            effective_labels = __shift_labels
+if not has_pre_shift_labels:
+    for __kwargs in all_locals.values():
+        if type(__kwargs) is dict:
+            __shift_labels = __kwargs.get("shift_labels", None)
+            if __shift_labels is not None:
+                has_pre_shift_labels = True
+                effective_labels = __shift_labels
+                break
+
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
@@ -1516,13 +1549,14 @@ else:
     # ========= NEW fused =========
     _hidden_states = hidden_states\\1
     torch._dynamo.mark_dynamic(_hidden_states, 1)
-    torch._dynamo.mark_dynamic(labels, 1)
+    torch._dynamo.mark_dynamic(effective_labels, 1)
     loss = unsloth_fused_ce_loss(
         trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
-        labels               = labels,
+        labels               = effective_labels,
+        shift_labels         = not has_pre_shift_labels,
         mask                 = None,
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
@@ -1548,11 +1582,11 @@ NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
 RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
 
 n_items = None
+all_locals = locals()
 if (\\9) != () and type(\\9) is dict:
     n_items = (\\9).get("num_items_in_batch", None)
     if n_items is None: n_items = (\\9).get("n_items", None)
 if n_items is None:
-    all_locals = locals()
     if 'loss_kwargs' in all_locals:
         __kwargs = all_locals['loss_kwargs']
         if type(__kwargs) is dict:
@@ -1571,6 +1605,36 @@ if n_items is None:
                 if n_items is None: n_items = __kwargs.get("n_items", None)
                 break
 pass
+
+has_pre_shift_labels = False
+effective_labels = labels
+if "shift_labels" in all_locals:
+    __shift_labels = all_locals["shift_labels"]
+    if __shift_labels is not None:
+        has_pre_shift_labels = True
+        effective_labels = __shift_labels
+if (not has_pre_shift_labels) and "loss_kwargs" in all_locals:
+    __kwargs = all_locals["loss_kwargs"]
+    if type(__kwargs) is dict:
+        __shift_labels = __kwargs.get("shift_labels", None)
+        if __shift_labels is not None:
+            has_pre_shift_labels = True
+            effective_labels = __shift_labels
+if (not has_pre_shift_labels) and "kwargs" in all_locals:
+    __kwargs = all_locals["kwargs"]
+    if type(__kwargs) is dict:
+        __shift_labels = __kwargs.get("shift_labels", None)
+        if __shift_labels is not None:
+            has_pre_shift_labels = True
+            effective_labels = __shift_labels
+if not has_pre_shift_labels:
+    for __kwargs in all_locals.values():
+        if type(__kwargs) is dict:
+            __shift_labels = __kwargs.get("shift_labels", None)
+            if __shift_labels is not None:
+                has_pre_shift_labels = True
+                effective_labels = __shift_labels
+                break
 
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
@@ -1595,13 +1659,14 @@ elif self.loss_function.__name__.endswith("ForCausalLMLoss") and labels is not N
     # ========= NEW fused =========
     _hidden_states = hidden_states\\1
     torch._dynamo.mark_dynamic(_hidden_states, 1)
-    torch._dynamo.mark_dynamic(labels, 1)
+    torch._dynamo.mark_dynamic(effective_labels, 1)
     loss = unsloth_fused_ce_loss(
         trainer              = None,
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
-        labels               = labels,
+        labels               = effective_labels,
+        shift_labels         = not has_pre_shift_labels,
         mask                 = None,
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
@@ -1668,6 +1733,36 @@ if n_items is None:
             break
 pass
 
+has_pre_shift_labels = False
+effective_labels = labels
+if "shift_labels" in all_locals:
+    __shift_labels = all_locals["shift_labels"]
+    if __shift_labels is not None:
+        has_pre_shift_labels = True
+        effective_labels = __shift_labels
+if (not has_pre_shift_labels) and "loss_kwargs" in all_locals:
+    __kwargs = all_locals["loss_kwargs"]
+    if type(__kwargs) is dict:
+        __shift_labels = __kwargs.get("shift_labels", None)
+        if __shift_labels is not None:
+            has_pre_shift_labels = True
+            effective_labels = __shift_labels
+if (not has_pre_shift_labels) and "kwargs" in all_locals:
+    __kwargs = all_locals["kwargs"]
+    if type(__kwargs) is dict:
+        __shift_labels = __kwargs.get("shift_labels", None)
+        if __shift_labels is not None:
+            has_pre_shift_labels = True
+            effective_labels = __shift_labels
+if not has_pre_shift_labels:
+    for __kwargs in all_locals.values():
+        if type(__kwargs) is dict:
+            __shift_labels = __kwargs.get("shift_labels", None)
+            if __shift_labels is not None:
+                has_pre_shift_labels = True
+                effective_labels = __shift_labels
+                break
+
 requires_grad_ = self.lm_head.weight.requires_grad
 requires_grad_ = requires_grad_ or self.lm_head.weight.dtype == torch.float32
 
@@ -1683,7 +1778,7 @@ else:
     # ========= NEW fused =========
     _hidden_states = hidden_states\\1
     torch._dynamo.mark_dynamic(_hidden_states, 1)
-    torch._dynamo.mark_dynamic(labels, 1)
+    torch._dynamo.mark_dynamic(effective_labels, 1)
     if attention_mask is not None:
         torch._dynamo.mark_dynamic(attention_mask, 1)
     loss = unsloth_fused_ce_loss(
@@ -1691,8 +1786,9 @@ else:
         hidden_states        = _hidden_states,
         lm_head_weight       = lm_head_weight,
         lm_head_bias         = lm_head_bias,
-        labels               = labels,
-        mask                 = \\6,
+        labels               = effective_labels,
+        shift_labels         = not has_pre_shift_labels,
+        mask                 = None if has_pre_shift_labels else \\6,
         n_items              = n_items,
         scaling              = getattr(self, "accelerator_scaler", None),
         target_gb            = None,
