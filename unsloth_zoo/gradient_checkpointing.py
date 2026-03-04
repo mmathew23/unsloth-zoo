@@ -48,6 +48,7 @@ __all__ = [
     "unpatch_unsloth_smart_gradient_checkpointing",
     "reset_unsloth_gradient_checkpointing_buffers",
     "UnslothGradientCheckpointer",
+    "UnslothOffloadActivations",
 ]
 
 # Initial buffer sizes for gradient checkpointing
@@ -773,6 +774,88 @@ class UnslothGradientCheckpointer:
         return result
 
 
+class UnslothOffloadActivations(torch.autograd.graph.saved_tensors_hooks):
+    """
+    All Unsloth Zoo code licensed under LGPLv3
+
+    Compile-compatible CPU activation offloading via saved_tensors_hooks.
+
+    This operates at the autograd runtime level, AFTER compiled graphs
+    produce tensors. saved_tensors_hooks are invisible to torch.compile,
+    so this avoids graph breaks entirely.
+
+    Reuses all existing UnslothGradientCheckpointer infrastructure:
+    buffer pooling, event-fenced reuse, async stream coordination.
+    """
+
+    def __init__(self, *, dtype=None, enabled=True):
+        self._enabled = enabled and not _gc_disable_cpu_offload()
+        self._dtype = dtype
+        self._offloader = None
+        self._first_pass = True
+        super().__init__(self._pack_hook, self._unpack_hook)
+
+    def __enter__(self):
+        if not self._enabled:
+            return self
+        cls = UnslothGradientCheckpointer
+        if not cls._initialized:
+            cls.initialize(self._dtype)
+        # Reset forward/backward state tracking for this forward pass
+        cls._backward_pass = False
+        cls._cpu_buffer_index = 0
+        cls._current_gc_index = 0
+        if self._first_pass:
+            cls._last_gc_index = 0
+        # Create a fresh offloader instance for this forward pass
+        self._offloader = cls(is_last_layer=False)
+        return super().__enter__()
+
+    def __exit__(self, *args):
+        if not self._enabled:
+            return
+        super().__exit__(*args)
+        self._first_pass = False
+
+    @staticmethod
+    def _should_offload(tensor):
+        """Mirrors UnslothGradientCheckpointer.should_offload() checks,
+        minus the is_last_layer check (not applicable for hooks-based offloading)."""
+        cls = UnslothGradientCheckpointer
+        if not cls._meta_initialized:
+            cls.ensure_metadata()
+        if tensor.numel() < cls._minimum_size:
+            return False
+        if tensor.device.type == "cpu":
+            return False
+        if tensor.layout != torch.strided:
+            return False
+        if (not tensor.is_contiguous()) or (tensor.storage_offset() != 0):
+            return False
+        try:
+            if tensor._is_view():
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _pack_hook(self, tensor):
+        if not self._enabled or self._offloader is None:
+            return tensor
+        if not self._should_offload(tensor):
+            return ("gpu", tensor)
+        return self._offloader.pack_hook(tensor)
+
+    def _unpack_hook(self, packed):
+        if not self._enabled or self._offloader is None:
+            return packed
+        if not isinstance(packed, tuple):
+            return packed
+        if packed[0] == "gpu":
+            return packed[1]
+        return self._offloader.unpack_hook(packed)
+
+
 def initialize_unsloth_gradient_checkpointing(dtype = None):
     # All Unsloth Zoo code licensed under LGPLv3
     global CPU_BUFFERS
@@ -1089,78 +1172,50 @@ from torch.utils.checkpoint import (
     _DEFAULT_DETERMINISM_MODE,
     noop_context_fn,
 )
+
+
 @torch._disable_dynamo
+def _unsloth_checkpoint_reentrant(function, *args, preserve_rng_state=True):
+    return UnslothCheckpointFunction.apply(function, preserve_rng_state, *args)
+
+
+def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
+    """Non-reentrant checkpoint that delegates DIRECTLY to native PyTorch checkpoint.
+
+    No _NoopSaveInputs patch, no ContextVar, no offloader.
+    Offloading is handled externally by UnslothOffloadActivations.
+    """
+    old_checkpoint = getattr(torch.utils.checkpoint, "_old_checkpoint", None)
+    original_checkpoint = old_checkpoint or torch.utils.checkpoint.checkpoint
+    return original_checkpoint(
+        function, *args,
+        use_reentrant=False,
+        determinism_check="none",
+        **kwargs
+    )
+
+
 def unsloth_checkpoint(
     function,
     *args,
     use_reentrant: Optional[bool] = None,
-    context_fn: Callable[[], Tuple[ContextManager, ContextManager]] = noop_context_fn,
-    determinism_check: str = _DEFAULT_DETERMINISM_MODE,
-    debug: bool = False,
     **kwargs
 ):
-    """Unsloth gradient checkpoint: reentrant or non-reentrant with CPU offloading.
+    """Unsloth gradient checkpoint: dispatches to reentrant or non-reentrant.
 
-    Dispatches to reentrant (UnslothCheckpointFunction) or non-reentrant
-    (save_on_cpu backend) based on use_reentrant flag.
+    No @torch._disable_dynamo -- this is a pure dispatcher so it does not
+    create graph breaks for the non-reentrant path.
     """
     if use_reentrant is None:
         use_reentrant = True
 
-    preserve = kwargs.pop("preserve_rng_state", True)
-    if kwargs and use_reentrant:
-        raise ValueError("Unexpected keyword arguments: " + ",".join(arg for arg in kwargs))
-
     if use_reentrant:
-        if context_fn is not noop_context_fn or debug is not False:
-            raise ValueError(
-                "Passing `context_fn` or `debug` is only supported when "
-                "use_reentrant=False."
-            )
-        return UnslothCheckpointFunction.apply(function, preserve, *args)
+        preserve = kwargs.pop("preserve_rng_state", True)
+        if kwargs:
+            raise ValueError("Unexpected keyword arguments: " + ",".join(arg for arg in kwargs))
+        return _unsloth_checkpoint_reentrant(function, *args, preserve_rng_state=preserve)
 
-    cls = UnslothGradientCheckpointer
-    # Skip determinism checks for performance (avoids shape/dtype/device validation overhead).
-    determinism_check = "none"
-    dtype = None
-    first_arg = args[0] if args else None
-    if torch.is_tensor(first_arg):
-        dtype = first_arg.dtype
-
-    offloader = cls.begin_checkpoint(dtype)
-
-    old_checkpoint = getattr(torch.utils.checkpoint, "_old_checkpoint", None)
-    original_checkpoint = old_checkpoint if old_checkpoint is not None else torch.utils.checkpoint.checkpoint
-
-    # Global kill switch: skip offload entirely
-    if _gc_disable_cpu_offload():
-        return original_checkpoint(
-            function, *args,
-            use_reentrant=False,
-            preserve_rng_state=preserve,
-            context_fn=context_fn,
-            determinism_check=determinism_check,
-            debug=debug,
-            **kwargs
-        )
-
-    token = _noop_offload_state.set({
-        "offloader": offloader,
-        # _NoopSaveInputs gets: (dummy, kwargs, *args), so first model arg is index 2.
-        "target_input_index": 2,
-    })
-    try:
-        return original_checkpoint(
-            function, *args,
-            use_reentrant=False,
-            preserve_rng_state=preserve,
-            context_fn=context_fn,
-            determinism_check=determinism_check,
-            debug=debug,
-            **kwargs
-        )
-    finally:
-        _noop_offload_state.reset(token)
+    return _unsloth_checkpoint_nonreentrant(function, *args, **kwargs)
 pass
 
 
@@ -1193,8 +1248,6 @@ def patch_unsloth_smart_gradient_checkpointing(dtype = None, use_reentrant = Non
             transformers.modeling_utils.checkpoint = unsloth_checkpoint
     except Exception:
         pass
-
-    _patch_noop_save_inputs()
 pass
 
 
@@ -1312,7 +1365,6 @@ def reset_unsloth_gradient_checkpointing_buffers():
 pass
 
 
-@torch._disable_dynamo
 def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
     return unsloth_checkpoint(function, *args, use_reentrant = False, **kwargs)
 pass
