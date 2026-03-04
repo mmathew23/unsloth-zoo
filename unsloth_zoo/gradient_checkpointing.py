@@ -20,6 +20,7 @@ from typing import Union, Optional, List, Any, Callable, Tuple
 import os
 import warnings
 import gc
+from contextvars import ContextVar
 from .utils import _get_dtype, Version
 from .device_type import (
     is_hip,
@@ -313,28 +314,26 @@ elif DEVICE_TYPE == "xpu":
 
 CPU_BUFFERS = []
 CPU_INDEX = None
-ORIGINAL_NOOP_SETUP_CONTEXT = None
-UNSLOTH_NOOP_OFFLOAD_STATE = None
+_noop_offload_state: ContextVar[Optional[dict]] = ContextVar("_noop_offload_state", default=None)
 
 
 def _patch_noop_save_inputs():
-    global ORIGINAL_NOOP_SETUP_CONTEXT
     cls = getattr(torch.utils.checkpoint, "_NoopSaveInputs", None)
     if cls is None:
         return
-    if ORIGINAL_NOOP_SETUP_CONTEXT is not None:
+    if UnslothGradientCheckpointer._original_noop_setup_context is not None:
         return
-    ORIGINAL_NOOP_SETUP_CONTEXT = cls.setup_context
+    UnslothGradientCheckpointer._original_noop_setup_context = cls.setup_context
 
     def unsloth_setup_context(ctx: Any, inputs: Tuple[Any, ...], output: Any) -> None:
-        state = UNSLOTH_NOOP_OFFLOAD_STATE
+        state = _noop_offload_state.get()
         if state is None:
-            return ORIGINAL_NOOP_SETUP_CONTEXT(ctx, inputs, output)
+            return UnslothGradientCheckpointer._original_noop_setup_context(ctx, inputs, output)
 
         offloader = state.get("offloader", None)
         target_input_index = int(state.get("target_input_index", 2))
         if offloader is None:
-            return ORIGINAL_NOOP_SETUP_CONTEXT(ctx, inputs, output)
+            return UnslothGradientCheckpointer._original_noop_setup_context(ctx, inputs, output)
 
         n_inputs = len(inputs)
         # 0 = non-tensor, 1 = saved tensor, 2 = offloaded tensor
@@ -388,16 +387,14 @@ pass
 
 
 def _unpatch_noop_save_inputs():
-    global ORIGINAL_NOOP_SETUP_CONTEXT
-    global UNSLOTH_NOOP_OFFLOAD_STATE
     cls = getattr(torch.utils.checkpoint, "_NoopSaveInputs", None)
     if cls is None:
         return
-    if ORIGINAL_NOOP_SETUP_CONTEXT is None:
+    if UnslothGradientCheckpointer._original_noop_setup_context is None:
         return
-    cls.setup_context = ORIGINAL_NOOP_SETUP_CONTEXT
-    ORIGINAL_NOOP_SETUP_CONTEXT = None
-    UNSLOTH_NOOP_OFFLOAD_STATE = None
+    cls.setup_context = UnslothGradientCheckpointer._original_noop_setup_context
+    UnslothGradientCheckpointer._original_noop_setup_context = None
+    _noop_offload_state.set(None)
 pass
 
 
@@ -432,6 +429,7 @@ class UnslothGradientCheckpointer:
     _dtype: torch.dtype = None
     _events_supported: Optional[bool] = None
     _meta_initialized: bool = False
+    _original_noop_setup_context: Optional[Any] = None
 
     @classmethod
     def ensure_metadata(cls, dtype: torch.dtype = None):
@@ -1106,7 +1104,6 @@ def unsloth_checkpoint(
     Dispatches to reentrant (UnslothCheckpointFunction) or non-reentrant
     (save_on_cpu backend) based on use_reentrant flag.
     """
-    global UNSLOTH_NOOP_OFFLOAD_STATE
     if use_reentrant is None:
         use_reentrant = True
 
@@ -1147,12 +1144,11 @@ def unsloth_checkpoint(
             **kwargs
         )
 
-    previous_state = UNSLOTH_NOOP_OFFLOAD_STATE
-    UNSLOTH_NOOP_OFFLOAD_STATE = {
+    token = _noop_offload_state.set({
         "offloader": offloader,
         # _NoopSaveInputs gets: (dummy, kwargs, *args), so first model arg is index 2.
         "target_input_index": 2,
-    }
+    })
     try:
         return original_checkpoint(
             function, *args,
@@ -1164,7 +1160,7 @@ def unsloth_checkpoint(
             **kwargs
         )
     finally:
-        UNSLOTH_NOOP_OFFLOAD_STATE = previous_state
+        _noop_offload_state.reset(token)
 pass
 
 
