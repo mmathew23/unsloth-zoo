@@ -225,7 +225,6 @@ class UnslothFusedLoss(torch.autograd.Function):
             labels_j,
             divisor = None,
             scaling = None,
-            shift_labels = False,
             **kwargs,
         ):
             if lm_head_requires_grad and lm_head_bias_requires_grad:
@@ -242,7 +241,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     labels_j,
                     divisor,
                     scaling,
-                    not shift_labels, # Already label shifted
+                    False, # Already label shifted
                     **kwargs,
                 )
                 grad_lm_head.add_(chunk_grad_lm_head)
@@ -260,7 +259,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     labels_j,
                     divisor,
                     scaling,
-                    not shift_labels, # Already label shifted
+                    False, # Already label shifted
                     **kwargs,
                 )
                 grad_lm_head.add_(chunk_grad_lm_head)
@@ -277,7 +276,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     labels_j,
                     divisor,
                     scaling,
-                    not shift_labels, # Already label shifted
+                    False, # Already label shifted
                     **kwargs,
                 )
                 grad_lm_head_bias.add_(chunk_grad_lm_head_bias)
@@ -294,7 +293,7 @@ class UnslothFusedLoss(torch.autograd.Function):
                     labels_j,
                     divisor,
                     scaling,
-                    not shift_labels, # Already label shifted
+                    False, # Already label shifted
                     **kwargs,
                 )
             pass
@@ -322,7 +321,6 @@ class UnslothFusedLoss(torch.autograd.Function):
                 labels_j = labels_j,
                 divisor = divisor,
                 scaling = scaling,
-                shift_labels = shift_labels,
                 **extra_kwargs,
             )
         pass
