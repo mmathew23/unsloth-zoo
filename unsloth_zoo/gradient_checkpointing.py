@@ -305,15 +305,6 @@ elif DEVICE_TYPE == "xpu":
 
 CPU_BUFFERS = []
 CPU_INDEX = None
-def _unpatch_noop_save_inputs():
-    cls = getattr(torch.utils.checkpoint, "_NoopSaveInputs", None)
-    if cls is None:
-        return
-    if UnslothGradientCheckpointer._original_noop_setup_context is None:
-        return
-    cls.setup_context = UnslothGradientCheckpointer._original_noop_setup_context
-    UnslothGradientCheckpointer._original_noop_setup_context = None
-    _noop_offload_state.set(None)
 pass
 
 
@@ -338,7 +329,6 @@ class UnslothGradientCheckpointer:
     _extra_streams: dict = {}
     _initialized: bool = False
 
-    _cpu_buffer_index: int = 0
     _current_gc_index: int = 0
     _last_gc_index: int = 0
     _first_pass: bool = True
@@ -348,7 +338,6 @@ class UnslothGradientCheckpointer:
     _dtype: torch.dtype = None
     _events_supported: Optional[bool] = None
     _meta_initialized: bool = False
-    _original_noop_setup_context: Optional[Any] = None
 
     @classmethod
     def ensure_metadata(cls, dtype: torch.dtype = None):
@@ -423,7 +412,6 @@ class UnslothGradientCheckpointer:
         if not cls._initialized:
             return
 
-        cls._cpu_buffer_index = 0
         cls._cpu_free_buffers = {}
         cls._current_gc_index = 0
         cls._last_gc_index = 0
@@ -668,6 +656,8 @@ class UnslothGradientCheckpointer:
         extra_stream = cls._extra_streams[device_index]
         with torch_gpu_stream(extra_stream):
             if not cls._wait_event(extra_stream, offload_event):
+                # Fallback: stream ordering guarantees prior D2H on extra_stream
+                # is already complete, so this wait_stream is a conservative no-op.
                 extra_stream.wait_stream(main_stream)
             result = cpu_buffer[:numel].view(shape).to(
                 device = f"{DEVICE_TYPE_TORCH}:{device_index}",
@@ -678,6 +668,12 @@ class UnslothGradientCheckpointer:
             restore_event = cls._record_stream_event(extra_stream)
         if not cls._wait_event(main_stream, restore_event):
             main_stream.wait_stream(extra_stream)
+        # Tell the allocator this tensor (allocated on extra_stream) is used
+        # by main_stream, so it must not be recycled until main_stream is done.
+        try:
+            result.record_stream(main_stream)
+        except Exception:
+            pass
         cls._release_cpu_buffer(
             cpu_buffer=cpu_buffer,
             dtype=original_dtype,
@@ -721,7 +717,6 @@ class UnslothOffloadActivations(torch.autograd.graph.saved_tensors_hooks):
             cls.initialize(self._dtype)
         # Reset forward/backward state tracking for this forward pass
         cls._backward_pass = False
-        cls._cpu_buffer_index = 0
         cls._current_gc_index = 0
         if self._first_pass:
             cls._last_gc_index = 0
@@ -1192,7 +1187,6 @@ def unpatch_unsloth_smart_gradient_checkpointing():
     except Exception:
         pass
 
-    _unpatch_noop_save_inputs()
 pass
 
 
