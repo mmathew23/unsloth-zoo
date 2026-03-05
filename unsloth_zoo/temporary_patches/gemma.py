@@ -352,7 +352,7 @@ def patch_Gemma3Attention():
     except Exception as e:
         return raise_error("Gemma3Attention.forward", e)
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
-    scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = False)
+    scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
     torch_jit_is_tracing = torch.jit.is_tracing
 
     def prepare(
@@ -605,7 +605,7 @@ def patch_Gemma3Attention_generic():
     except Exception as e:
         return raise_error("Gemma3Attention.forward", e)
     scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
-    scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = False)
+    scaled_dot_product_attention = torch.compiler.disable(scaled_dot_product_attention, recursive = True)
     torch_jit_is_tracing = torch.jit.is_tracing
 
     def prepare(
