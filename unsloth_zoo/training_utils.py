@@ -30,6 +30,7 @@ from .hf_utils import dtype_from_config
 from .gradient_checkpointing import (
     unpatch_unsloth_gradient_checkpointing,
     unpatch_unsloth_smart_gradient_checkpointing,
+    _bind_gradient_checkpointing_func,
 )
 import os
 import re
@@ -242,15 +243,11 @@ def prepare_model_for_training(
     # mode switches and monkey patches apply consistently.
     if use_gradient_checkpointing in (True, "unsloth"):
         checkpoint_fn = torch.utils.checkpoint.checkpoint
-        for module in model.modules():
-            if hasattr(module, "_gradient_checkpointing_func"):
-                if use_gradient_checkpointing is True:
-                    module._gradient_checkpointing_func = functools.partial(
-                        checkpoint_fn,
-                        use_reentrant = use_reentrant,
-                    )
-                else:
-                    module._gradient_checkpointing_func = checkpoint_fn
+        context_fn = getattr(model, "_unsloth_sac_context_fn", None)
+        effective_reentrant = use_reentrant if use_gradient_checkpointing is True else None
+        _bind_gradient_checkpointing_func(
+            model, checkpoint_fn, effective_reentrant, context_fn,
+        )
 
     # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
     if use_reentrant:

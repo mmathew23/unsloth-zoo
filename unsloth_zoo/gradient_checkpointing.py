@@ -16,6 +16,7 @@
 
 import torch
 import numpy as np
+import functools
 from typing import Union, Optional, List, Any, Callable, Tuple
 import os
 import warnings
@@ -48,7 +49,179 @@ __all__ = [
     "reset_unsloth_gradient_checkpointing_buffers",
     "UnslothGradientCheckpointer",
     "UnslothOffloadActivations",
+    "resolve_sac_context_fn",
+    "set_sac_policy",
+    "_bind_gradient_checkpointing_func",
 ]
+
+# ── Selective Activation Checkpointing (SAC) ──────────────────────────
+#
+# SAC lets you selectively save expensive ops' outputs (e.g. attention, matmul)
+# instead of recomputing everything during backward.  It composes with CPU
+# offloading: SAC decides *what* to save, saved_tensors_hooks decides *where*.
+# However under torch compile saved_tensors_hooks may not be compatible with 
+# SAC CPU_OFFLOAD policies.
+#
+# Only available with use_reentrant=False (PyTorch checkpoint context_fn kwarg).
+
+try:
+    from torch.utils.checkpoint import (
+        CheckpointPolicy,
+        create_selective_checkpoint_contexts,
+    )
+    _SAC_AVAILABLE = True
+except ImportError:
+    _SAC_AVAILABLE = False
+
+# Resolve op handles at import time; skip any that don't exist on this build.
+_SAC_ATTENTION_OPS = set()
+_SAC_MATMUL_OPS = set()
+
+def _try_resolve_op(name):
+    try:
+        parts = name.split(".")
+        obj = torch.ops
+        for p in parts:
+            obj = getattr(obj, p)
+        return obj
+    except AttributeError:
+        return None
+
+for _op_name in (
+    "aten._scaled_dot_product_flash_attention.default",
+    "aten._scaled_dot_product_efficient_attention.default",
+    "aten._scaled_dot_product_math.default",
+    "aten._scaled_dot_product_cudnn_attention.default",
+    "aten._flash_attention_forward.default",
+    "aten._efficient_attention_forward.default",
+):
+    _op = _try_resolve_op(_op_name)
+    if _op is not None:
+        _SAC_ATTENTION_OPS.add(_op)
+
+for _op_name in (
+    "aten.mm.default",
+    "aten.bmm.default",
+    "aten.addmm.default",
+):
+    _op = _try_resolve_op(_op_name)
+    if _op is not None:
+        _SAC_MATMUL_OPS.add(_op)
+
+
+def _sac_policy_attn_only(ctx, op, *args, **kwargs):
+    if op in _SAC_ATTENTION_OPS:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def _sac_policy_attn_and_matmul(ctx, op, *args, **kwargs):
+    if op in _SAC_ATTENTION_OPS or op in _SAC_MATMUL_OPS:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+_SAC_PRESETS = {
+    "attn_only": _sac_policy_attn_only,
+    "attn_and_matmul": _sac_policy_attn_and_matmul,
+}
+
+
+def resolve_sac_context_fn(policy):
+    """Resolve a user-provided SAC policy to a context_fn callable (or None).
+
+    Args:
+        policy: One of:
+            - None → no SAC (returns None)
+            - str  → preset name ("attn_only", "attn_and_matmul")
+            - list of OpOverloads → ops whose outputs to save
+            - callable(ctx, op, *args, **kwargs) → CheckpointPolicy
+
+    Returns:
+        A callable suitable for the ``context_fn`` kwarg of
+        ``torch.utils.checkpoint.checkpoint``, or None.
+    """
+    if policy is None:
+        return None
+
+    if not _SAC_AVAILABLE:
+        raise RuntimeError(
+            "Unsloth: SAC requires PyTorch >= 2.4 with "
+            "torch.utils.checkpoint.CheckpointPolicy support."
+        )
+
+    if isinstance(policy, str):
+        if policy not in _SAC_PRESETS:
+            raise ValueError(
+                f"Unsloth: Unknown SAC preset {policy!r}. "
+                f"Available: {list(_SAC_PRESETS.keys())}"
+            )
+        policy_fn = _SAC_PRESETS[policy]
+    elif isinstance(policy, (list, tuple, set)):
+        save_ops = set(policy)
+        def policy_fn(ctx, op, *args, **kwargs):
+            if op in save_ops:
+                return CheckpointPolicy.MUST_SAVE
+            return CheckpointPolicy.PREFER_RECOMPUTE
+    elif callable(policy):
+        policy_fn = policy
+    else:
+        raise TypeError(
+            f"Unsloth: sac_policy must be None, a string, a list of ops, "
+            f"or a callable, got {type(policy).__name__}"
+        )
+
+    return functools.partial(create_selective_checkpoint_contexts, policy_fn)
+
+
+# Useful for more than just SAC
+def _bind_gradient_checkpointing_func(model, checkpoint_fn, use_reentrant, context_fn=None):
+    """Bind _gradient_checkpointing_func on all modules with the given settings.
+
+    Builds a functools.partial from non-None kwargs and assigns it to every
+    module that already has _gradient_checkpointing_func.
+    """
+    partial_kwargs = {}
+    if use_reentrant is not None:
+        partial_kwargs["use_reentrant"] = use_reentrant
+    if context_fn is not None:
+        partial_kwargs["context_fn"] = context_fn
+
+    if partial_kwargs:
+        bound = functools.partial(checkpoint_fn, **partial_kwargs)
+    else:
+        bound = checkpoint_fn
+
+    for module in model.modules():
+        if hasattr(module, "_gradient_checkpointing_func"):
+            module._gradient_checkpointing_func = bound
+
+
+def set_sac_policy(model, policy):
+    """Set or clear SAC policy at runtime (no model reload needed).
+
+    Args:
+        model: The model (must have been loaded with use_reentrant=False).
+        policy: Same as ``sac_policy`` in ``from_pretrained``, or None to disable.
+
+    Raises:
+        ValueError: If the model uses reentrant checkpointing.
+    """
+    use_reentrant = getattr(model, "_unsloth_use_reentrant", True)
+    if use_reentrant and policy is not None:
+        raise ValueError(
+            "Unsloth: SAC requires use_reentrant=False. "
+            "Re-load the model with use_reentrant=False to use SAC."
+        )
+
+    context_fn = resolve_sac_context_fn(policy)
+    model._unsloth_sac_context_fn = context_fn
+
+    checkpoint_fn = torch.utils.checkpoint.checkpoint
+    _bind_gradient_checkpointing_func(
+        model, checkpoint_fn, use_reentrant, context_fn,
+    )
+
 
 # Initial buffer sizes for gradient checkpointing
 INITIAL_CPU_BUFFER_SIZE = 128 * 1024       # Initial size per CPU buffer
