@@ -73,9 +73,10 @@ try:
 except ImportError:
     _SAC_AVAILABLE = False
 
-# Resolve op handles at import time; skip any that don't exist on this build.
-_SAC_ATTENTION_OPS = set()
-_SAC_MATMUL_OPS = set()
+# Op sets are resolved lazily on first SAC use, not at import time.
+_SAC_ATTENTION_OPS = None
+_SAC_MATMUL_OPS = None
+
 
 def _try_resolve_op(name):
     try:
@@ -87,26 +88,35 @@ def _try_resolve_op(name):
     except AttributeError:
         return None
 
-for _op_name in (
-    "aten._scaled_dot_product_flash_attention.default",
-    "aten._scaled_dot_product_efficient_attention.default",
-    "aten._scaled_dot_product_math.default",
-    "aten._scaled_dot_product_cudnn_attention.default",
-    "aten._flash_attention_forward.default",
-    "aten._efficient_attention_forward.default",
-):
-    _op = _try_resolve_op(_op_name)
-    if _op is not None:
-        _SAC_ATTENTION_OPS.add(_op)
 
-for _op_name in (
-    "aten.mm.default",
-    "aten.bmm.default",
-    "aten.addmm.default",
-):
-    _op = _try_resolve_op(_op_name)
-    if _op is not None:
-        _SAC_MATMUL_OPS.add(_op)
+def _ensure_sac_ops():
+    """Lazily resolve op handles on first use."""
+    global _SAC_ATTENTION_OPS, _SAC_MATMUL_OPS
+    if _SAC_ATTENTION_OPS is not None:
+        return
+
+    _SAC_ATTENTION_OPS = set()
+    for op_name in (
+        "aten._scaled_dot_product_flash_attention.default",
+        "aten._scaled_dot_product_efficient_attention.default",
+        "aten._scaled_dot_product_math.default",
+        "aten._scaled_dot_product_cudnn_attention.default",
+        "aten._flash_attention_forward.default",
+        "aten._efficient_attention_forward.default",
+    ):
+        op = _try_resolve_op(op_name)
+        if op is not None:
+            _SAC_ATTENTION_OPS.add(op)
+
+    _SAC_MATMUL_OPS = set()
+    for op_name in (
+        "aten.mm.default",
+        "aten.bmm.default",
+        "aten.addmm.default",
+    ):
+        op = _try_resolve_op(op_name)
+        if op is not None:
+            _SAC_MATMUL_OPS.add(op)
 
 
 def _sac_policy_attn_only(ctx, op, *args, **kwargs):
@@ -149,6 +159,8 @@ def resolve_sac_context_fn(policy):
             "Unsloth: SAC requires PyTorch >= 2.4 with "
             "torch.utils.checkpoint.CheckpointPolicy support."
         )
+
+    _ensure_sac_ops()
 
     if isinstance(policy, str):
         if policy not in _SAC_PRESETS:
