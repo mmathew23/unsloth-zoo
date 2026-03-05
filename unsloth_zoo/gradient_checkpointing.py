@@ -658,7 +658,6 @@ class UnslothGradientCheckpointer:
             cls.initialize(dtype)
         if cls._backward_pass:
             cls._backward_pass = False
-            cls._cpu_buffer_index = 0
             cls._current_gc_index = 0
         if cls._first_pass:
             cls._last_gc_index += 1
@@ -794,7 +793,8 @@ class UnslothGradientCheckpointer:
             except Exception:
                 pass
             cpu_buffer[:numel].view(shape).copy_(tensor, non_blocking=True)
-            offload_event = cls._record_stream_event(extra_stream)
+            # no need to record even since d2h -> h2d is FIFO on same steram
+            # offload_event = cls._record_stream_event(extra_stream)
 
         pack_id = self.pack_counter
         self.pack_counter += 1
@@ -806,7 +806,7 @@ class UnslothGradientCheckpointer:
             device_index,
             numel,
             cpu_buffer,
-            offload_event,
+            # offload_event,
         ))
         return ("cpu", pack_id)
 
@@ -827,7 +827,7 @@ class UnslothGradientCheckpointer:
             device_index,
             numel,
             cpu_buffer,
-            offload_event,
+            # offload_event,
         ) = self.offloaded_tensors[pack_id]
         self.offloaded_tensors[pack_id] = None
 
@@ -840,10 +840,13 @@ class UnslothGradientCheckpointer:
             main_stream = cls._main_streams[device_index]
         extra_stream = cls._extra_streams[device_index]
         with torch_gpu_stream(extra_stream):
-            if not cls._wait_event(extra_stream, offload_event):
-                # Fallback: stream ordering guarantees prior D2H on extra_stream
-                # is already complete, so this wait_stream is a conservative no-op.
-                extra_stream.wait_stream(main_stream)
+            # Not recording offload even because using the same stream
+            # if we in the future need multi streams wait events will be needed
+            # to make sure ordering is correct
+            # if not cls._wait_event(extra_stream, offload_event):
+            #     # Fallback: stream ordering guarantees prior D2H on extra_stream
+            #     # is already complete
+            #     extra_stream.wait_stream(main_stream)
             result = cpu_buffer[:numel].view(shape).to(
                 device = f"{DEVICE_TYPE_TORCH}:{device_index}",
                 non_blocking = True,
