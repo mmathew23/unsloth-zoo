@@ -331,11 +331,38 @@ class UnslothFusedLoss(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output,):
-        # grad_output is assumed to be always = 1
-        if UNSLOTH_ENABLE_LOGGING:
-            scaling = ctx.scaling if ctx.scaling is not None else 1.0
-            torch._assert(torch.all(grad_output == scaling), f"Fused losses expect grad_output to be all {scaling}, but got {grad_output.ravel()[:10]}")
+        # Saved gradients correspond to `expected_scale` from forward-time fused grad
+        # construction. If the outer graph scales the loss (e.g., DDP token averaging),
+        # propagate that extra factor via grad_output.
+        expected_scale = ctx.scaling if ctx.scaling is not None else 1.0
         (grad_inputs, grad_lm_head, grad_lm_head_bias, ) = ctx.saved_tensors
+
+        if torch.is_tensor(grad_output):
+            grad_multiplier = grad_output.to(
+                device = grad_inputs.device,
+                dtype = grad_inputs.dtype,
+                non_blocking = True,
+            ) / expected_scale
+        else:
+            grad_multiplier = float(grad_output) / expected_scale
+
+        if UNSLOTH_ENABLE_LOGGING:
+            logger.info(f"Fused CE backward grad multiplier = {grad_multiplier}")
+
+        if torch.is_tensor(grad_multiplier):
+            grad_inputs = grad_inputs * grad_multiplier
+            if grad_lm_head is not None:
+                grad_lm_head = grad_lm_head * grad_multiplier
+            if grad_lm_head_bias is not None:
+                grad_lm_head_bias = grad_lm_head_bias * grad_multiplier
+        else:
+            if grad_multiplier != 1.0:
+                grad_inputs = grad_inputs * grad_multiplier
+                if grad_lm_head is not None:
+                    grad_lm_head = grad_lm_head * grad_multiplier
+                if grad_lm_head_bias is not None:
+                    grad_lm_head_bias = grad_lm_head_bias * grad_multiplier
+
         return (None, grad_inputs, grad_lm_head, grad_lm_head_bias, None, None, None, None, None, None, None, None, None,)
     pass
 pass
