@@ -1163,7 +1163,6 @@ def create_standalone_class(
 
             skipping = False
             paren_depth = 0
-            skip_base_name = None
 
             for line in lines:
                 if skipping:
@@ -1172,7 +1171,6 @@ def create_standalone_class(
                     if paren_depth <= 0:
                         skipping = False
                         paren_depth = 0
-                        skip_base_name = None
                     continue
 
                 stripped = line.strip()
@@ -1197,7 +1195,6 @@ def create_standalone_class(
                         paren_depth = line.count("(") - line.count(")")
                         if paren_depth > 0:
                             skipping = True
-                            skip_base_name = decorator_base
                         continue  # Strip this decorator line
 
                     # Unknown decorator -> keep it but warn

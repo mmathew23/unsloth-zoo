@@ -20,7 +20,6 @@ from typing import Union, Optional, List, Any, Callable, Tuple
 import os
 import warnings
 import gc
-from contextvars import ContextVar
 from .utils import _get_dtype, Version
 from .device_type import (
     is_hip,
@@ -210,12 +209,6 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
 pass
 
 
-# @torch._disable_dynamo
-# def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
-#     return Unsloth_Offloaded_Gradient_Checkpointer.apply(function, *args)
-# pass
-
-
 @torch._disable_dynamo
 def unsloth_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
     return Unsloth_Gradient_Checkpointer.apply(function, *args)
@@ -265,13 +258,10 @@ pass
 
 
 from torch.utils.checkpoint import (
-    check_backward_validity,
     _infer_device_type,
     _get_autocast_kwargs,
     _get_device_module,
     get_device_states,
-    # set_device_states,
-    detach_variable,
     contextlib,
     DefaultDeviceType,
 )
@@ -315,78 +305,6 @@ elif DEVICE_TYPE == "xpu":
 
 CPU_BUFFERS = []
 CPU_INDEX = None
-_noop_offload_state: ContextVar[Optional[dict]] = ContextVar("_noop_offload_state", default=None)
-
-
-def _patch_noop_save_inputs():
-    cls = getattr(torch.utils.checkpoint, "_NoopSaveInputs", None)
-    if cls is None:
-        return
-    if UnslothGradientCheckpointer._original_noop_setup_context is not None:
-        return
-    UnslothGradientCheckpointer._original_noop_setup_context = cls.setup_context
-
-    def unsloth_setup_context(ctx: Any, inputs: Tuple[Any, ...], output: Any) -> None:
-        state = _noop_offload_state.get()
-        if state is None:
-            return UnslothGradientCheckpointer._original_noop_setup_context(ctx, inputs, output)
-
-        offloader = state.get("offloader", None)
-        target_input_index = int(state.get("target_input_index", 2))
-        if offloader is None:
-            return UnslothGradientCheckpointer._original_noop_setup_context(ctx, inputs, output)
-
-        n_inputs = len(inputs)
-        # 0 = non-tensor, 1 = saved tensor, 2 = offloaded tensor
-        entry_kind = [0] * n_inputs
-        entry_index = [-1] * n_inputs
-        non_tensor_values = [None] * n_inputs
-        saved_tensors = []
-        offloaded = []
-
-        for i, o in enumerate(inputs):
-            if not isinstance(o, torch.Tensor):
-                non_tensor_values[i] = o
-                continue
-
-            should_try_offload = (
-                i == target_input_index and
-                o.requires_grad and
-                o.device.type != "cpu"
-            )
-            if should_try_offload:
-                packed = offloader.pack_hook(o)
-                if isinstance(packed, tuple) and len(packed) >= 1 and packed[0] == "cpu":
-                    off_idx = len(offloaded)
-                    offloaded.append(packed)
-                    entry_kind[i] = 2
-                    entry_index[i] = off_idx
-                    continue
-
-            saved_idx = len(saved_tensors)
-            saved_tensors.append(o)
-            entry_kind[i] = 1
-            entry_index[i] = saved_idx
-
-        def get_args(saved_tensors_runtime):
-            ret = [None] * (n_inputs - 1)
-            for i in range(1, n_inputs):
-                kind = entry_kind[i]
-                if kind == 0:
-                    ret[i - 1] = non_tensor_values[i]
-                elif kind == 1:
-                    ret[i - 1] = saved_tensors_runtime[entry_index[i]]
-                else:
-                    ret[i - 1] = offloader.unpack_hook(offloaded[entry_index[i]])
-            return ret
-
-        ctx.get_args = get_args
-        ctx.save_for_backward(*saved_tensors)
-
-    cls.setup_context = staticmethod(unsloth_setup_context)
-pass
-
-
 def _unpatch_noop_save_inputs():
     cls = getattr(torch.utils.checkpoint, "_NoopSaveInputs", None)
     if cls is None:
@@ -925,8 +843,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, run_function, preserve_rng_state, *args):
         # All Unsloth Zoo code licensed under LGPLv3
-        # check_backward_validity(args)
-        # Check if no requires_grad in inputs
         ctx.run_function = run_function
         ctx.preserve_rng_state = preserve_rng_state
         # Accommodates the (remote) possibility that autocast is enabled for cpu AND gpu.
@@ -1062,7 +978,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
         new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM = ctx._saved_metadata
         if CPU_INDEX is not None:
-            global GPU_BUFFER
             buffer = GPU_BUFFERS[device_index][:new_size].view(shape)
             x = CPU_BUFFERS[CPU_INDEX][:new_size].view(shape)
 
@@ -1106,7 +1021,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 device_type=ctx.device_type, **ctx.device_autocast_kwargs
             ) if torch.amp.is_autocast_available(ctx.device_type) else contextlib.nullcontext()
 
-            # detached_inputs = detach_variable(tuple(inputs))
             detached_inputs = []
             for inp in inputs:
                 if not isinstance(inp, torch.Tensor):
@@ -1144,10 +1058,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
         if len(outputs_with_grad) == 0:
             pass
-            # raise RuntimeError(
-            #     "none of output has requires_grad=True,"
-            #     " this checkpoint() is not necessary"
-            # )
         else:
             torch.autograd.backward(outputs_with_grad, args_with_grad)
         pass
@@ -1165,13 +1075,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         return (None, None) + grads
     pass
 pass
-
-
-from torch.utils.checkpoint import (
-    ContextManager,
-    _DEFAULT_DETERMINISM_MODE,
-    noop_context_fn,
-)
 
 
 @torch._disable_dynamo

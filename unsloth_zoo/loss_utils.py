@@ -17,9 +17,6 @@
 import torch
 from .utils import Version
 import os
-import math
-import functools
-from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
 from . import DEVICE_TYPE
@@ -186,9 +183,6 @@ def fused_linear_cross_entropy(
     accuracy_threshold : str = "auto",
 ):
     # All Unsloth Zoo code licensed under LGPLv3
-    if os.environ.get("UNSLOTH_DEBUG_LOSS", "0") == "1":
-        n_nonignored = (labels != -100).sum().item()
-        print(f"[DEBUG] fused_linear_cross_entropy: num_items_in_batch={num_items_in_batch} labels.shape={labels.shape} n_nonignored={n_nonignored} softcapping={logit_softcapping}", flush=True)
     if num_items_in_batch is not None and torch.is_tensor(num_items_in_batch):
         num_items_in_batch = num_items_in_batch.to(hidden_states.device, non_blocking = True)
 
@@ -292,8 +286,6 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
         # Removes PeftModelForCausalLM and gets internal model
         m = m.get_base_model()
     model_name = m.__class__.__name__
-    if os.environ.get("UNSLOTH_DEBUG_LOSS", "0") == "1":
-        print(f"[DEBUG] _unsloth_get_batch_samples: model_name={model_name} model_type={type(self.model).__name__}", flush=True)
     global ALLOWED_NUM_ITEMS_IN_BATCH
     if model_name not in ALLOWED_NUM_ITEMS_IN_BATCH:
 
@@ -385,8 +377,6 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     pass
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: num_items_in_batch = {num_items_in_batch}")
-    if os.environ.get("UNSLOTH_DEBUG_LOSS", "0") == "1":
-        print(f"[DEBUG] _unsloth_get_batch_samples: has_kwargs={has_kwargs} num_items_in_batch={num_items_in_batch} model_accepts_loss_kwargs={getattr(self, 'model_accepts_loss_kwargs', 'N/A')} compute_loss_func={getattr(self, 'compute_loss_func', 'N/A')}", flush=True)
 
     # [TODO] Unfortunately skip_guard_eval_unsafe = True fails
     # Increment counter and set compiler stance
