@@ -21,6 +21,7 @@ from typing import Union, Optional, List, Any, Callable, Tuple
 import os
 import warnings
 import gc
+import weakref
 from .utils import _get_dtype, Version
 from .device_type import (
     is_hip,
@@ -647,8 +648,6 @@ class UnslothGradientCheckpointer:
         cls._initialized = False
 
     def __init__(self, is_last_layer: bool = False):
-        self.offloaded_tensors = []
-        self.pack_counter = 0
         self.is_last_layer = is_last_layer
 
     @classmethod
@@ -807,12 +806,7 @@ class UnslothGradientCheckpointer:
             except Exception:
                 pass
             cpu_buffer[:numel].view(shape).copy_(tensor, non_blocking=True)
-            # no need to record even since d2h -> h2d is FIFO on same steram
-            # offload_event = cls._record_stream_event(extra_stream)
-
-        pack_id = self.pack_counter
-        self.pack_counter += 1
-        self.offloaded_tensors.append((
+        return PackedCPUBuffer(
             shape,
             stride,
             dtype,
@@ -820,30 +814,21 @@ class UnslothGradientCheckpointer:
             device_index,
             numel,
             cpu_buffer,
-            # offload_event,
-        ))
-        return ("cpu", pack_id)
+            cls,
+        )
 
-    def unpack_hook(self, packed):
-        cls = self.__class__
+    @classmethod
+    def unpack_packed(cls, packed):
         cls._backward_pass = True
         cls._first_pass = False
 
-        if packed[0] == "gpu":
-            return packed[1]
-
-        _, pack_id = packed
-        (
-            shape,
-            original_stride,
-            original_dtype,
-            original_requires_grad,
-            device_index,
-            numel,
-            cpu_buffer,
-            # offload_event,
-        ) = self.offloaded_tensors[pack_id]
-        self.offloaded_tensors[pack_id] = None
+        shape = packed.shape
+        original_stride = packed.stride
+        original_dtype = packed.dtype
+        original_requires_grad = packed.requires_grad
+        device_index = packed.device_index
+        numel = packed.numel
+        cpu_buffer = packed.cpu_buffer
 
         device = torch.device(f"{DEVICE_TYPE_TORCH}:{device_index}")
         if DEVICE_TYPE in ("cuda", "hip"):
@@ -854,13 +839,6 @@ class UnslothGradientCheckpointer:
             main_stream = cls._main_streams[device_index]
         extra_stream = cls._extra_streams[device_index]
         with torch_gpu_stream(extra_stream):
-            # Not recording offload even because using the same stream
-            # if we in the future need multi streams wait events will be needed
-            # to make sure ordering is correct
-            # if not cls._wait_event(extra_stream, offload_event):
-            #     # Fallback: stream ordering guarantees prior D2H on extra_stream
-            #     # is already complete
-            #     extra_stream.wait_stream(main_stream)
             result = cpu_buffer[:numel].view(shape).to(
                 device = f"{DEVICE_TYPE_TORCH}:{device_index}",
                 non_blocking = True,
@@ -868,6 +846,7 @@ class UnslothGradientCheckpointer:
             if tuple(result.stride()) != tuple(original_stride):
                 result = result.as_strided(shape, original_stride)
             restore_event = cls._record_stream_event(extra_stream)
+            packed.set_restore_event(restore_event)
         if not cls._wait_event(main_stream, restore_event):
             main_stream.wait_stream(extra_stream)
         # Tell the allocator this tensor (allocated on extra_stream) is used
@@ -876,18 +855,80 @@ class UnslothGradientCheckpointer:
             result.record_stream(main_stream)
         except Exception:
             pass
-        cls._release_cpu_buffer(
-            cpu_buffer=cpu_buffer,
-            dtype=original_dtype,
-            device_index=device_index,
-            restore_event=restore_event,
-        )
 
         if result.dtype != original_dtype:
             result = result.to(original_dtype)
         if result.requires_grad != original_requires_grad:
             result.requires_grad_(original_requires_grad)
         return result
+
+
+class PackedCPUBuffer:
+    """Packed representation for offloaded activations.
+
+    The backing pinned CPU buffer stays alive for as long as this object stays
+    alive, which matches saved_tensors_hooks lifetime requirements. Cleanup is
+    tied to object destruction instead of the start of a future forward pass.
+    """
+
+    __slots__ = (
+        "shape",
+        "stride",
+        "dtype",
+        "requires_grad",
+        "device_index",
+        "numel",
+        "_state",
+        "_finalizer",
+        "__weakref__",
+    )
+
+    def __init__(
+        self,
+        shape,
+        stride,
+        dtype,
+        requires_grad,
+        device_index,
+        numel,
+        cpu_buffer,
+        owner_cls,
+    ):
+        self.shape = shape
+        self.stride = stride
+        self.dtype = dtype
+        self.requires_grad = requires_grad
+        self.device_index = device_index
+        self.numel = numel
+        self._state = {
+            "cpu_buffer": cpu_buffer,
+            "dtype": dtype,
+            "device_index": device_index,
+            "restore_event": None,
+            "released": False,
+            "owner_cls": owner_cls,
+        }
+        self._finalizer = weakref.finalize(self, PackedCPUBuffer._finalize, self._state)
+
+    @staticmethod
+    def _finalize(state):
+        if state["released"]:
+            return
+        state["released"] = True
+        state["owner_cls"]._release_cpu_buffer(
+            cpu_buffer=state["cpu_buffer"],
+            dtype=state["dtype"],
+            device_index=state["device_index"],
+            restore_event=state["restore_event"],
+        )
+
+    @property
+    def cpu_buffer(self):
+        return self._state["cpu_buffer"]
+
+    def set_restore_event(self, restore_event):
+        if not self._state["released"]:
+            self._state["restore_event"] = restore_event
 
 
 class UnslothOffloadActivations(torch.autograd.graph.saved_tensors_hooks):
@@ -962,13 +1003,13 @@ class UnslothOffloadActivations(torch.autograd.graph.saved_tensors_hooks):
         return self._offloader.pack_hook(tensor)
 
     def _unpack_hook(self, packed):
-        if not self._enabled or self._offloader is None:
+        if not self._enabled:
             return packed
-        if not isinstance(packed, tuple):
-            return packed
-        if packed[0] == "gpu":
+        if isinstance(packed, PackedCPUBuffer):
+            return UnslothGradientCheckpointer.unpack_packed(packed)
+        if isinstance(packed, tuple) and packed[0] == "gpu":
             return packed[1]
-        return self._offloader.unpack_hook(packed)
+        return packed
 
 
 def initialize_unsloth_gradient_checkpointing(dtype = None):

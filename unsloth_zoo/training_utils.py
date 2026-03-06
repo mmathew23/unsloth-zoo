@@ -244,7 +244,9 @@ def prepare_model_for_training(
     if use_gradient_checkpointing in (True, "unsloth"):
         checkpoint_fn = torch.utils.checkpoint.checkpoint
         context_fn = getattr(model, "_unsloth_sac_context_fn", None)
-        effective_reentrant = use_reentrant if use_gradient_checkpointing is True else None
+        effective_reentrant = getattr(model, "_unsloth_use_reentrant", None)
+        if type(effective_reentrant) is not bool:
+            effective_reentrant = bool(use_reentrant)
         _bind_gradient_checkpointing_func(
             model, checkpoint_fn, effective_reentrant, context_fn,
         )
