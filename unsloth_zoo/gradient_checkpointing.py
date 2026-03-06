@@ -719,14 +719,28 @@ class UnslothGradientCheckpointer:
         pool = cls._cpu_free_buffers.setdefault(dtype, [])
         chosen_idx = None
         chosen_buf = None
+        # this whole bit may not be needed but in the future if we move to multi stream
+        # this will be helpful infra
+        # could be made more efficient so we don't over query events
         for i in range(len(pool) - 1, -1, -1):
             buf, fence_device_index, fence_event = pool[i]
+            # Skip other devices FIRST (avoid device switch + query)
+            if fence_device_index is not None and fence_device_index != device_index:
+                continue
+
             ready = True
             if fence_event is not None:
                 try:
-                    ready = bool(fence_event.query())
+                    if DEVICE_TYPE in ("cuda", "hip") and fence_device_index is not None:
+                        with torch.cuda.device(fence_device_index):
+                            ready = bool(fence_event.query())
+                    elif DEVICE_TYPE == "xpu" and fence_device_index is not None:
+                        with torch.xpu.device(fence_device_index):
+                            ready = bool(fence_event.query())
+                    else:
+                        ready = bool(fence_event.query())
                 except Exception:
-                    ready = True
+                    ready = False
             if not ready:
                 continue
             if fence_device_index is not None and fence_device_index != device_index:
