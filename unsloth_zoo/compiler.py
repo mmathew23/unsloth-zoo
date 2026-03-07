@@ -152,6 +152,40 @@ def _get_nonreentrant_qwen3vl_compile_policy(model_type: str) -> dict[str, bool]
         "disable_vision_merger_compile": _env_flag("UNSLOTH_NR_DISABLE_QWEN3VL_VISION_MERGER_COMPILE"),
     }
 
+
+def _force_disable_compile_for_function(source: str, function_name: str) -> str:
+    pattern = re.compile(
+        r"@torch\.compile\([^\n]*\)\n(def " + re.escape(function_name) + r"\()",
+        flags = re.MULTILINE,
+    )
+    new_source, replaced = pattern.subn(
+        "@torch.compiler.disable(recursive = False)\n\\1",
+        source,
+        count = 1,
+    )
+    if replaced != 0:
+        return new_source
+
+    fallback = re.compile(r"(^def " + re.escape(function_name) + r"\()", flags = re.MULTILINE)
+    new_source, replaced = fallback.subn(
+        "@torch.compiler.disable(recursive = False)\n\\1",
+        source,
+        count = 1,
+    )
+    return new_source
+
+
+def _apply_nonreentrant_qwen3vl_source_policy(source: str, policy: dict[str, bool]) -> str:
+    if not policy["active"]:
+        return source
+    if policy["disable_text_mlp_compile"]:
+        source = _force_disable_compile_for_function(source, "Qwen3VLTextMLP_forward")
+    if policy["disable_vision_mlp_compile"]:
+        source = _force_disable_compile_for_function(source, "Qwen3VLVisionMLP_forward")
+    if policy["disable_vision_merger_compile"]:
+        source = _force_disable_compile_for_function(source, "Qwen3VLVisionPatchMerger_forward")
+    return source
+
 DISABLED_KEYWORDS = [
     "select_best_resolution",  # Llava NeXT errors out
     "original_aspect_ratio > current_aspect_ratio",  # Llava NeXT errors out
@@ -4082,6 +4116,10 @@ def unsloth_compile_transformers(
     pass
 
     all_code = "\n\n".join(final_all_standalone_classes)
+    all_code = _apply_nonreentrant_qwen3vl_source_policy(
+        all_code,
+        nonreentrant_qwen3vl_policy,
+    )
 
     try:
         combined_module = create_new_function(
