@@ -22,6 +22,9 @@ import os
 import warnings
 import gc
 import weakref
+import time
+import atexit
+from collections import defaultdict
 from contextvars import ContextVar
 from .utils import _get_dtype, Version
 from .device_type import (
@@ -81,6 +84,216 @@ except ImportError:
 _SAC_ATTENTION_OPS = None
 _SAC_MATMUL_OPS = None
 _GC_OFFLOAD_BACKENDS = {"noop", "hooks"}
+_gc_profile_module: ContextVar[Optional[str]] = ContextVar("_gc_profile_module", default=None)
+_gc_profile_enabled_cache: Optional[bool] = None
+_gc_profile_registered = False
+_gc_profile_state = {
+    "mode": None,
+    "totals": defaultdict(float),
+    "module_stats": defaultdict(lambda: defaultdict(float)),
+    "shape_stats": defaultdict(lambda: defaultdict(float)),
+    "skip_reasons": defaultdict(int),
+}
+
+
+def _gc_profile_enabled() -> bool:
+    global _gc_profile_enabled_cache
+    if _gc_profile_enabled_cache is None:
+        value = os.environ.get("UNSLOTH_GC_PROFILE", "0")
+        _gc_profile_enabled_cache = str(value).strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(_gc_profile_enabled_cache)
+
+
+def _gc_profile_module_name() -> str:
+    name = _gc_profile_module.get()
+    if name:
+        return name
+    return "<unknown>"
+
+
+def _gc_profile_resolve_function_module_name(function) -> Optional[str]:
+    module = getattr(function, "__self__", None)
+    if isinstance(module, torch.nn.Module):
+        return getattr(module, "_unsloth_gc_profile_module_name", None) or module.__class__.__name__
+
+    closure = getattr(function, "__closure__", None)
+    if closure:
+        for cell in closure:
+            try:
+                value = cell.cell_contents
+            except ValueError:
+                continue
+            if isinstance(value, torch.nn.Module):
+                return getattr(value, "_unsloth_gc_profile_module_name", None) or value.__class__.__name__
+            maybe_module = getattr(value, "__self__", None)
+            if isinstance(maybe_module, torch.nn.Module):
+                return getattr(maybe_module, "_unsloth_gc_profile_module_name", None) or maybe_module.__class__.__name__
+    return None
+
+
+def _gc_profile_shape_key(shape, dtype) -> str:
+    dims = "x".join(str(int(x)) for x in shape)
+    return f"{dims}:{dtype}"
+
+
+def _gc_profile_ensure(mode: str) -> bool:
+    global _gc_profile_registered
+    if not _gc_profile_enabled():
+        return False
+    if _gc_profile_state["mode"] is None:
+        _gc_profile_state["mode"] = mode
+    if not _gc_profile_registered:
+        atexit.register(_gc_profile_dump_summary)
+        _gc_profile_registered = True
+    return True
+
+
+def _gc_profile_record_skip(reason: str) -> None:
+    if not _gc_profile_enabled():
+        return
+    _gc_profile_state["skip_reasons"][reason] += 1
+
+
+def _gc_profile_record(
+    *,
+    mode: str,
+    module_name: str,
+    shape,
+    dtype,
+    numel: int,
+    kind: str,
+    duration_s: float = 0.0,
+    wait_s: float = 0.0,
+    count: int = 1,
+    extra_allocated: bool = False,
+    pool_hit: bool = False,
+    wait_event_fallback: bool = False,
+) -> None:
+    if not _gc_profile_ensure(mode):
+        return
+
+    n_bytes = int(numel) * torch.tensor([], dtype=dtype).element_size()
+    totals = _gc_profile_state["totals"]
+    totals[f"{kind}_count"] += count
+    totals[f"{kind}_bytes"] += n_bytes
+    totals[f"{kind}_cpu_s"] += duration_s
+    totals[f"{kind}_wait_s"] += wait_s
+    if extra_allocated:
+        totals["cpu_buffer_allocs"] += 1
+    if pool_hit:
+        totals["cpu_buffer_pool_hits"] += 1
+    if wait_event_fallback:
+        totals["wait_stream_fallbacks"] += 1
+
+    module_stats = _gc_profile_state["module_stats"][module_name]
+    module_stats[f"{kind}_count"] += count
+    module_stats[f"{kind}_bytes"] += n_bytes
+    module_stats[f"{kind}_cpu_s"] += duration_s
+    module_stats[f"{kind}_wait_s"] += wait_s
+
+    shape_key = _gc_profile_shape_key(shape, dtype)
+    shape_stats = _gc_profile_state["shape_stats"][shape_key]
+    shape_stats[f"{kind}_count"] += count
+    shape_stats[f"{kind}_bytes"] += n_bytes
+    shape_stats[f"{kind}_cpu_s"] += duration_s
+    shape_stats[f"{kind}_wait_s"] += wait_s
+
+
+def _gc_profile_top_lines(stats_dict, primary_key: str, extra_keys: Tuple[str, ...], limit: int = 10):
+    items = [
+        (name, values)
+        for name, values in stats_dict.items()
+        if values.get(primary_key, 0.0) > 0
+    ]
+    items.sort(key = lambda item: item[1].get(primary_key, 0.0), reverse = True)
+    lines = []
+    for name, values in items[:limit]:
+        parts = [f"{primary_key}={values.get(primary_key, 0.0):.0f}" if "bytes" in primary_key or "count" in primary_key else f"{primary_key}={values.get(primary_key, 0.0):.6f}s"]
+        for key in extra_keys:
+            value = values.get(key, 0.0)
+            if "bytes" in key or "count" in key:
+                parts.append(f"{key}={value:.0f}")
+            else:
+                parts.append(f"{key}={value:.6f}s")
+        lines.append(f"  - {name}: " + ", ".join(parts))
+    return lines
+
+
+def _gc_profile_dump_summary() -> None:
+    if not _gc_profile_enabled():
+        return
+    totals = _gc_profile_state["totals"]
+    mode = _gc_profile_state["mode"] or "unknown"
+    print(f"Unsloth GC profile summary ({mode}):")
+    print(
+        "  totals: "
+        f"pack_count={totals.get('pack_count', 0):.0f}, "
+        f"pack_bytes={totals.get('pack_bytes', 0):.0f}, "
+        f"pack_cpu_s={totals.get('pack_cpu_s', 0.0):.6f}, "
+        f"unpack_count={totals.get('unpack_count', 0):.0f}, "
+        f"unpack_bytes={totals.get('unpack_bytes', 0):.0f}, "
+        f"unpack_cpu_s={totals.get('unpack_cpu_s', 0.0):.6f}, "
+        f"unpack_wait_s={totals.get('unpack_wait_s', 0.0):.6f}, "
+        f"cpu_buffer_pool_hits={totals.get('cpu_buffer_pool_hits', 0):.0f}, "
+        f"cpu_buffer_allocs={totals.get('cpu_buffer_allocs', 0):.0f}, "
+        f"wait_stream_fallbacks={totals.get('wait_stream_fallbacks', 0):.0f}"
+    )
+    if _gc_profile_state["skip_reasons"]:
+        reasons = ", ".join(
+            f"{reason}={count}"
+            for reason, count in sorted(_gc_profile_state["skip_reasons"].items())
+        )
+        print(f"  skips: {reasons}")
+
+    module_lines = _gc_profile_top_lines(
+        _gc_profile_state["module_stats"],
+        "unpack_bytes",
+        ("unpack_count", "unpack_cpu_s"),
+    )
+    if module_lines:
+        print("  top modules by unpack_bytes:")
+        for line in module_lines:
+            print(line)
+
+    module_lines = _gc_profile_top_lines(
+        _gc_profile_state["module_stats"],
+        "unpack_cpu_s",
+        ("unpack_bytes", "unpack_count"),
+    )
+    if module_lines:
+        print("  top modules by unpack_cpu_s:")
+        for line in module_lines:
+            print(line)
+
+    module_lines = _gc_profile_top_lines(
+        _gc_profile_state["module_stats"],
+        "pack_bytes",
+        ("pack_count", "pack_cpu_s"),
+    )
+    if module_lines:
+        print("  top modules by pack_bytes:")
+        for line in module_lines:
+            print(line)
+
+    shape_lines = _gc_profile_top_lines(
+        _gc_profile_state["shape_stats"],
+        "unpack_bytes",
+        ("unpack_count", "unpack_cpu_s"),
+    )
+    if shape_lines:
+        print("  top tensor shapes by unpack_bytes:")
+        for line in shape_lines:
+            print(line)
+
+    shape_lines = _gc_profile_top_lines(
+        _gc_profile_state["shape_stats"],
+        "unpack_cpu_s",
+        ("unpack_bytes", "unpack_count"),
+    )
+    if shape_lines:
+        print("  top tensor shapes by unpack_cpu_s:")
+        for line in shape_lines:
+            print(line)
 
 
 def resolve_gc_offload_backend(backend = None):
@@ -232,9 +445,30 @@ def _bind_gradient_checkpointing_func(
     else:
         bound = checkpoint_fn
 
+    named_modules = {
+        id(candidate): (name or candidate.__class__.__name__)
+        for name, candidate in model.named_modules()
+    }
     for module in model.modules():
-        if hasattr(module, "_gradient_checkpointing_func"):
+        if not hasattr(module, "_gradient_checkpointing_func"):
+            continue
+        if _gc_profile_enabled():
+            module._unsloth_gc_profile_module_name = named_modules.get(id(module), module.__class__.__name__)
+        if not _gc_profile_enabled():
             module._gradient_checkpointing_func = bound
+            continue
+
+        module_name = named_modules.get(id(module), module.__class__.__name__)
+
+        @functools.wraps(bound)
+        def profiled_checkpoint_call(function, *args, __bound = bound, __module_name = module_name, **kwargs):
+            token = _gc_profile_module.set(__module_name)
+            try:
+                return __bound(function, *args, **kwargs)
+            finally:
+                _gc_profile_module.reset(token)
+
+        module._gradient_checkpointing_func = profiled_checkpoint_call
 
 
 def set_sac_policy(model, policy):
@@ -547,6 +781,7 @@ elif DEVICE_TYPE == "xpu":
 CPU_BUFFERS = []
 CPU_INDEX = None
 _noop_offload_state: ContextVar[Optional[dict]] = ContextVar("_noop_offload_state", default=None)
+_hooks_offload_state: ContextVar[Optional[dict]] = ContextVar("_hooks_offload_state", default=None)
 pass
 
 
@@ -829,31 +1064,39 @@ class UnslothGradientCheckpointer:
     def should_offload(self, tensor: torch.Tensor) -> bool:
         cls = self.__class__
         if _gc_disable_cpu_offload():
+            _gc_profile_record_skip("cpu_offload_disabled")
             return False
         if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
             if torch.compiler.is_compiling():
+                _gc_profile_record_skip("compiler_is_compiling")
                 return False
         if tensor.numel() < cls._minimum_size:
+            _gc_profile_record_skip("below_minimum_size")
             return False
         if tensor.device.type == "cpu":
+            _gc_profile_record_skip("tensor_on_cpu")
             return False
         if self.is_last_layer:
+            _gc_profile_record_skip("last_layer")
             return False
         # Custom packed-buffer restore currently materializes contiguous tensors.
         # Restrict offload to safe tensor layouts to preserve correctness.
         if tensor.layout != torch.strided:
+            _gc_profile_record_skip("non_strided_layout")
             return False
         if (not tensor.is_contiguous()) or (tensor.storage_offset() != 0):
+            _gc_profile_record_skip("non_contiguous_or_offset")
             return False
         try:
             if tensor._is_view():
+                _gc_profile_record_skip("tensor_view")
                 return False
         except Exception:
             pass
         return True
 
     @classmethod
-    def _acquire_cpu_buffer(cls, *, numel: int, dtype: torch.dtype, device_index: int) -> torch.Tensor:
+    def _acquire_cpu_buffer(cls, *, numel: int, dtype: torch.dtype, device_index: int):
         pool = cls._cpu_free_buffers.setdefault(dtype, [])
         chosen_idx = None
         chosen_buf = None
@@ -890,11 +1133,13 @@ class UnslothGradientCheckpointer:
 
         if chosen_idx is not None:
             pool.pop(chosen_idx)
+            allocated = False
             if chosen_buf.numel() < numel:
                 chosen_buf = torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
-            return chosen_buf
+                allocated = True
+            return chosen_buf, True, allocated
 
-        return torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
+        return torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True), False, True
 
     @classmethod
     def _release_cpu_buffer(
@@ -925,7 +1170,7 @@ class UnslothGradientCheckpointer:
             print("Unsloth: Will smartly offload gradients to save VRAM!")
             cls._use_unsloth_gc_message = False
 
-        cpu_buffer = cls._acquire_cpu_buffer(
+        cpu_buffer, pool_hit, extra_allocated = cls._acquire_cpu_buffer(
             numel=numel,
             dtype=dtype,
             device_index=device_index,
@@ -939,12 +1184,26 @@ class UnslothGradientCheckpointer:
             main_stream = cls._main_streams[device_index]
         extra_stream = cls._extra_streams[device_index]
         extra_stream.wait_stream(main_stream)
+        module_name = _gc_profile_module_name()
+        start_time = time.perf_counter() if _gc_profile_enabled() else 0.0
         with torch_gpu_stream(extra_stream):
             try:
                 tensor.record_stream(extra_stream)
             except Exception:
                 pass
             cpu_buffer[:numel].view(shape).copy_(tensor, non_blocking=True)
+        if _gc_profile_enabled():
+            _gc_profile_record(
+                mode = "nonreentrant_hooks",
+                module_name = module_name,
+                shape = shape,
+                dtype = dtype,
+                numel = numel,
+                kind = "pack",
+                duration_s = time.perf_counter() - start_time,
+                extra_allocated = extra_allocated,
+                pool_hit = pool_hit,
+            )
         return PackedCPUBuffer(
             shape,
             stride,
@@ -954,6 +1213,7 @@ class UnslothGradientCheckpointer:
             numel,
             cpu_buffer,
             cls,
+            module_name,
         )
 
     @classmethod
@@ -977,6 +1237,8 @@ class UnslothGradientCheckpointer:
         else:
             main_stream = cls._main_streams[device_index]
         extra_stream = cls._extra_streams[device_index]
+        module_name = packed.module_name
+        start_time = time.perf_counter() if _gc_profile_enabled() else 0.0
         with torch_gpu_stream(extra_stream):
             result = cpu_buffer[:numel].view(shape).to(
                 device = f"{DEVICE_TYPE_TORCH}:{device_index}",
@@ -986,8 +1248,11 @@ class UnslothGradientCheckpointer:
                 result = result.as_strided(shape, original_stride)
             restore_event = cls._record_stream_event(extra_stream)
             packed.set_restore_event(restore_event)
-        if not cls._wait_event(main_stream, restore_event):
+        wait_start = time.perf_counter() if _gc_profile_enabled() else 0.0
+        wait_event_fallback = not cls._wait_event(main_stream, restore_event)
+        if wait_event_fallback:
             main_stream.wait_stream(extra_stream)
+        wait_duration = (time.perf_counter() - wait_start) if _gc_profile_enabled() else 0.0
         # Tell the allocator this tensor (allocated on extra_stream) is used
         # by main_stream, so it must not be recycled until main_stream is done.
         try:
@@ -999,6 +1264,18 @@ class UnslothGradientCheckpointer:
             result = result.to(original_dtype)
         if result.requires_grad != original_requires_grad:
             result.requires_grad_(original_requires_grad)
+        if _gc_profile_enabled():
+            _gc_profile_record(
+                mode = "nonreentrant_hooks",
+                module_name = module_name,
+                shape = shape,
+                dtype = original_dtype,
+                numel = numel,
+                kind = "unpack",
+                duration_s = time.perf_counter() - start_time,
+                wait_s = wait_duration,
+                wait_event_fallback = wait_event_fallback,
+            )
         return result
 
 
@@ -1017,6 +1294,7 @@ class PackedCPUBuffer:
         "requires_grad",
         "device_index",
         "numel",
+        "module_name",
         "_state",
         "_finalizer",
         "__weakref__",
@@ -1032,6 +1310,7 @@ class PackedCPUBuffer:
         numel,
         cpu_buffer,
         owner_cls,
+        module_name,
     ):
         self.shape = shape
         self.stride = stride
@@ -1039,6 +1318,7 @@ class PackedCPUBuffer:
         self.requires_grad = requires_grad
         self.device_index = device_index
         self.numel = numel
+        self.module_name = module_name
         self._state = {
             "cpu_buffer": cpu_buffer,
             "dtype": dtype,
@@ -1114,14 +1394,32 @@ class UnslothOffloadActivations(torch.autograd.graph.saved_tensors_hooks):
 
     @staticmethod
     def _should_offload(tensor):
-        """Mirrors UnslothGradientCheckpointer.should_offload() checks,
-        minus the is_last_layer check (not applicable for hooks-based offloading)."""
+        """Mirrors UnslothGradientCheckpointer.should_offload() checks."""
         cls = UnslothGradientCheckpointer
         if not cls._meta_initialized:
             cls.ensure_metadata()
+        # To restore the broader experimental behavior where hooks offload every
+        # large saved tensor in the checkpointed region, remove the
+        # `_hooks_offload_state` / `offloader.is_last_layer` gates below and let
+        # `_pack_hook()` use `self._offloader` directly again. That widens
+        # offload back to things like large saved weights, which increased
+        # Qwen3-VL traffic substantially in benchmarking.
+        state = _hooks_offload_state.get()
+        if state is None:
+            return False
+        offloader = state.get("offloader", None)
+        if offloader is None:
+            return False
+        if _gc_disable_cpu_offload():
+            return False
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
+            if torch.compiler.is_compiling():
+                return False
         if tensor.numel() < cls._minimum_size:
             return False
         if tensor.device.type == "cpu":
+            return False
+        if offloader.is_last_layer:
             return False
         if tensor.layout != torch.strided:
             return False
@@ -1137,9 +1435,13 @@ class UnslothOffloadActivations(torch.autograd.graph.saved_tensors_hooks):
     def _pack_hook(self, tensor):
         if not self._enabled or self._offloader is None:
             return tensor
-        if not self._should_offload(tensor):
+        state = _hooks_offload_state.get()
+        if state is None:
             return ("gpu", tensor)
-        return self._offloader.pack_hook(tensor)
+        offloader = state.get("offloader", None)
+        if offloader is None or not self._should_offload(tensor):
+            return ("gpu", tensor)
+        return offloader.pack_hook(tensor)
 
     def _unpack_hook(self, packed):
         if not self._enabled:
@@ -1222,6 +1524,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         # All Unsloth Zoo code licensed under LGPLv3
         ctx.run_function = run_function
         ctx.preserve_rng_state = preserve_rng_state
+        ctx._gc_profile_module = _gc_profile_module_name()
         # Accommodates the (remote) possibility that autocast is enabled for cpu AND gpu.
         ctx.device_type = _infer_device_type(*args)
         ctx.device_autocast_kwargs, ctx.cpu_autocast_kwargs = _get_autocast_kwargs(
@@ -1300,11 +1603,25 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         x = x[:new_size].view(shape)
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
+                        pack_start = time.perf_counter() if _gc_profile_enabled() else 0.0
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
                         with torch_gpu_stream(EXTRA_STREAM):
                             x.copy_(arg, non_blocking = True)
 
                         ctx._saved_metadata = (new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM,)
+                        if _gc_profile_enabled():
+                            ctx._gc_profile_shape = shape
+                            ctx._gc_profile_numel = new_size
+                            ctx._gc_profile_dtype = arg.dtype
+                            _gc_profile_record(
+                                mode = "reentrant",
+                                module_name = ctx._gc_profile_module,
+                                shape = shape,
+                                dtype = arg.dtype,
+                                numel = new_size,
+                                kind = "pack",
+                                duration_s = time.perf_counter() - pack_start,
+                            )
                         CPU_INDEX += 1
                         tensor_inputs.append(None)
 
@@ -1359,6 +1676,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
             x = CPU_BUFFERS[CPU_INDEX][:new_size].view(shape)
 
             # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
+            unpack_start = time.perf_counter() if _gc_profile_enabled() else 0.0
             EXTRA_STREAM.wait_stream(MAIN_STREAM)
             with torch_gpu_stream(EXTRA_STREAM):
                 buffer.copy_(x, non_blocking = True)
@@ -1410,10 +1728,23 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
             # Wait for GPU buffer to finish
             if CPU_INDEX is not None:
+                wait_start = time.perf_counter() if _gc_profile_enabled() else 0.0
                 MAIN_STREAM.wait_stream(EXTRA_STREAM)
+                wait_duration = (time.perf_counter() - wait_start) if _gc_profile_enabled() else 0.0
                 x = buffer.detach()
                 x.requires_grad_(True)
                 detached_inputs[0] = x
+                if _gc_profile_enabled():
+                    _gc_profile_record(
+                        mode = "reentrant",
+                        module_name = ctx._gc_profile_module,
+                        shape = getattr(ctx, "_gc_profile_shape", shape),
+                        dtype = getattr(ctx, "_gc_profile_dtype", x.dtype),
+                        numel = getattr(ctx, "_gc_profile_numel", new_size),
+                        kind = "unpack",
+                        duration_s = time.perf_counter() - unpack_start,
+                        wait_s = wait_duration,
+                    )
             pass
 
             with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
@@ -1479,15 +1810,24 @@ def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
     original_checkpoint = old_checkpoint or torch.utils.checkpoint.checkpoint
 
     if _gc_disable_cpu_offload() or offload_backend == "hooks":
-        return original_checkpoint(
-            function, *args,
-            use_reentrant=False,
-            preserve_rng_state=preserve,
-            context_fn=context_fn,
-            determinism_check=determinism_check,
-            debug=debug,
-            **kwargs
-        )
+        token = None
+        if (not _gc_disable_cpu_offload()) and offload_backend == "hooks":
+            token = _hooks_offload_state.set({
+                "offloader": offloader,
+            })
+        try:
+            return original_checkpoint(
+                function, *args,
+                use_reentrant=False,
+                preserve_rng_state=preserve,
+                context_fn=context_fn,
+                determinism_check=determinism_check,
+                debug=debug,
+                **kwargs
+            )
+        finally:
+            if token is not None:
+                _hooks_offload_state.reset(token)
 
     token = _noop_offload_state.set({
         "offloader": offloader,
@@ -1522,13 +1862,23 @@ def unsloth_checkpoint(
     if use_reentrant is None:
         use_reentrant = True
 
-    if use_reentrant:
-        preserve = kwargs.pop("preserve_rng_state", True)
-        if kwargs:
-            raise ValueError("Unexpected keyword arguments: " + ",".join(arg for arg in kwargs))
-        return _unsloth_checkpoint_reentrant(function, *args, preserve_rng_state=preserve)
+    token = None
+    if _gc_profile_enabled():
+        module_name = _gc_profile_resolve_function_module_name(function)
+        if module_name is not None:
+            token = _gc_profile_module.set(module_name)
 
-    return _unsloth_checkpoint_nonreentrant(function, *args, **kwargs)
+    try:
+        if use_reentrant:
+            preserve = kwargs.pop("preserve_rng_state", True)
+            if kwargs:
+                raise ValueError("Unexpected keyword arguments: " + ",".join(arg for arg in kwargs))
+            return _unsloth_checkpoint_reentrant(function, *args, preserve_rng_state=preserve)
+
+        return _unsloth_checkpoint_nonreentrant(function, *args, **kwargs)
+    finally:
+        if token is not None:
+            _gc_profile_module.reset(token)
 pass
 
 
