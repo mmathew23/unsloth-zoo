@@ -1470,18 +1470,24 @@ NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
 RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
 
 n_items = None
-_kw_val = None
-try: _kw_val = loss_kwargs
-except: pass
-if _kw_val is None:
-    try: _kw_val = kwargs
-    except: pass
-if _kw_val is None:
-    try: _kw_val = lm_kwargs
-    except: pass
-if _kw_val is not None and isinstance(_kw_val, dict):
-    n_items = _kw_val.get("num_items_in_batch", None)
-    if n_items is None: n_items = _kw_val.get("n_items", None)
+all_locals = locals()
+if 'loss_kwargs' in all_locals:
+    __kwargs = all_locals['loss_kwargs']
+    if type(__kwargs) is dict:
+        n_items = __kwargs.get("num_items_in_batch", None)
+        if n_items is None: n_items = __kwargs.get("n_items", None)
+if n_items is None and 'kwargs' in all_locals:
+    __kwargs = all_locals['kwargs']
+    if type(__kwargs) is dict:
+        n_items = __kwargs.get("num_items_in_batch", None)
+        if n_items is None: n_items = __kwargs.get("n_items", None)
+if n_items is None:
+    all_locals = all_locals.values()
+    for __kwargs in all_locals:
+        if type(__kwargs) is dict:
+            n_items = __kwargs.get("num_items_in_batch", None)
+            if n_items is None: n_items = __kwargs.get("n_items", None)
+            break
 pass
 
 requires_grad_ = self.lm_head.weight.requires_grad
@@ -1539,22 +1545,28 @@ NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
 RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
 
 n_items = None
-if (\\9) != () and isinstance(\\9, dict):
+if (\\9) != () and type(\\9) is dict:
     n_items = (\\9).get("num_items_in_batch", None)
     if n_items is None: n_items = (\\9).get("n_items", None)
 if n_items is None:
-    _kw_val = None
-    try: _kw_val = loss_kwargs
-    except: pass
-    if _kw_val is None:
-        try: _kw_val = kwargs
-        except: pass
-    if _kw_val is None:
-        try: _kw_val = lm_kwargs
-        except: pass
-    if _kw_val is not None and isinstance(_kw_val, dict):
-        n_items = _kw_val.get("num_items_in_batch", None)
-        if n_items is None: n_items = _kw_val.get("n_items", None)
+    all_locals = locals()
+    if 'loss_kwargs' in all_locals:
+        __kwargs = all_locals['loss_kwargs']
+        if type(__kwargs) is dict:
+            n_items = __kwargs.get("num_items_in_batch", None)
+            if n_items is None: n_items = __kwargs.get("n_items", None)
+    if n_items is None and 'kwargs' in all_locals:
+        __kwargs = all_locals['kwargs']
+        if type(__kwargs) is dict:
+            n_items = __kwargs.get("num_items_in_batch", None)
+            if n_items is None: n_items = __kwargs.get("n_items", None)
+    if n_items is None:
+        all_locals = all_locals.values()
+        for __kwargs in all_locals:
+            if type(__kwargs) is dict:
+                n_items = __kwargs.get("num_items_in_batch", None)
+                if n_items is None: n_items = __kwargs.get("n_items", None)
+                break
 pass
 
 requires_grad_ = self.lm_head.weight.requires_grad
@@ -1633,18 +1645,24 @@ NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
 RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
 
 n_items = None
-_kw_val = None
-try: _kw_val = loss_kwargs
-except: pass
-if _kw_val is None:
-    try: _kw_val = kwargs
-    except: pass
-if _kw_val is None:
-    try: _kw_val = lm_kwargs
-    except: pass
-if _kw_val is not None and isinstance(_kw_val, dict):
-    n_items = _kw_val.get("num_items_in_batch", None)
-    if n_items is None: n_items = _kw_val.get("n_items", None)
+all_locals = locals()
+if 'loss_kwargs' in all_locals:
+    __kwargs = all_locals['loss_kwargs']
+    if type(__kwargs) is dict:
+        n_items = __kwargs.get("num_items_in_batch", None)
+        if n_items is None: n_items = __kwargs.get("n_items", None)
+if n_items is None and 'kwargs' in all_locals:
+    __kwargs = all_locals['kwargs']
+    if type(__kwargs) is dict:
+        n_items = __kwargs.get("num_items_in_batch", None)
+        if n_items is None: n_items = __kwargs.get("n_items", None)
+if n_items is None:
+    all_locals = all_locals.values()
+    for __kwargs in all_locals:
+        if type(__kwargs) is dict:
+            n_items = __kwargs.get("num_items_in_batch", None)
+            if n_items is None: n_items = __kwargs.get("n_items", None)
+            break
 pass
 
 requires_grad_ = self.lm_head.weight.requires_grad

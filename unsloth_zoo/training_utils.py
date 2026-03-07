@@ -24,13 +24,15 @@ from transformers import Trainer
 from transformers.trainer_utils import seed_worker as trainer_utils_seed_worker
 from tqdm import tqdm as ProgressBar
 import time
-from typing import Any, Optional, List, Dict, Tuple
+from typing import Any, Optional
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
 from .gradient_checkpointing import (
     unpatch_unsloth_gradient_checkpointing,
     unpatch_unsloth_smart_gradient_checkpointing,
     _bind_gradient_checkpointing_func,
+    UnslothOffloadActivations,
+    resolve_gc_offload_backend,
 )
 import os
 import re
@@ -41,6 +43,52 @@ __all__ = [
     "prepare_model_for_training",
 ]
 
+
+def _resolve_offload_wrapper_target(model):
+    inner_model = model
+    while hasattr(inner_model, "model"):
+        inner_model = inner_model.model
+    return inner_model
+
+
+def _remove_hook_based_offload_wrapper(model):
+    target = getattr(model, "_unsloth_offload_wrapper_target", None)
+    original_forward = getattr(model, "_unsloth_offload_original_forward", None)
+    if target is not None and original_forward is not None:
+        target.forward = original_forward
+    if hasattr(model, "_unsloth_offload_wrapper_target"):
+        delattr(model, "_unsloth_offload_wrapper_target")
+    if hasattr(model, "_unsloth_offload_original_forward"):
+        delattr(model, "_unsloth_offload_original_forward")
+    if hasattr(model, "_unsloth_offload_ctx"):
+        delattr(model, "_unsloth_offload_ctx")
+    model._unsloth_offload_forward_installed = False
+
+
+def _install_hook_based_offload_wrapper(model, dtype):
+    target = _resolve_offload_wrapper_target(model)
+    current_target = getattr(model, "_unsloth_offload_wrapper_target", None)
+    if current_target is not None and current_target is not target:
+        _remove_hook_based_offload_wrapper(model)
+
+    if getattr(model, "_unsloth_offload_forward_installed", False):
+        return
+
+    offload_ctx = UnslothOffloadActivations(dtype=dtype)
+    original_forward = target.forward
+
+    @functools.wraps(original_forward)
+    def _offloading_forward(*args, **kwargs):
+        if target.training:
+            with offload_ctx:
+                return original_forward(*args, **kwargs)
+        return original_forward(*args, **kwargs)
+
+    target.forward = _offloading_forward
+    model._unsloth_offload_ctx = offload_ctx
+    model._unsloth_offload_original_forward = original_forward
+    model._unsloth_offload_wrapper_target = target
+    model._unsloth_offload_forward_installed = True
 
 @torch.inference_mode
 def fix_zero_training_loss(model, tokenizer, train_dataset):
@@ -247,9 +295,23 @@ def prepare_model_for_training(
         effective_reentrant = getattr(model, "_unsloth_use_reentrant", None)
         if type(effective_reentrant) is not bool:
             effective_reentrant = bool(use_reentrant)
+        offload_backend = getattr(model, "_unsloth_gc_offload_backend", None)
+        offload_backend = resolve_gc_offload_backend(offload_backend)
+        model._unsloth_gc_offload_backend = offload_backend
         _bind_gradient_checkpointing_func(
-            model, checkpoint_fn, effective_reentrant, context_fn,
+            model, checkpoint_fn, effective_reentrant, context_fn, offload_backend,
         )
+
+        if (
+            use_gradient_checkpointing == "unsloth" and
+            (not effective_reentrant) and
+            offload_backend == "hooks"
+        ):
+            _install_hook_based_offload_wrapper(model, dtype)
+        else:
+            _remove_hook_based_offload_wrapper(model)
+    else:
+        _remove_hook_based_offload_wrapper(model)
 
     # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
     if use_reentrant:
@@ -260,33 +322,6 @@ def prepare_model_for_training(
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
     pass
-
-    # For non-reentrant + unsloth, install a forward wrapper that enters
-    # UnslothOffloadActivations around the forward pass during training.
-    # saved_tensors_hooks fire at the autograd runtime level, AFTER compiled
-    # graphs produce tensors, so this is invisible to torch.compile.
-    #
-    # IMPORTANT: We wrap the innermost model's forward (the decoder/encoder),
-    # NOT the outermost model.forward. This avoids wrapping the loss
-    # computation (e.g., fused cross entropy) which may use torch.func
-    # transforms that are incompatible with saved_tensors_hooks.
-    if use_gradient_checkpointing == "unsloth" and not use_reentrant:
-        from .gradient_checkpointing import UnslothOffloadActivations
-        inner_model = model
-        while hasattr(inner_model, "model"):
-            inner_model = inner_model.model
-        offload_ctx = UnslothOffloadActivations(dtype=dtype)
-        original_forward = inner_model.forward
-
-        @functools.wraps(original_forward)
-        def _offloading_forward(*args, **kwargs):
-            if inner_model.training:
-                with offload_ctx:
-                    return original_forward(*args, **kwargs)
-            return original_forward(*args, **kwargs)
-
-        inner_model.forward = _offloading_forward
-        model._unsloth_offload_forward_installed = True
 
     # Upcast modules_to_save
     if patch_modules_to_save:
@@ -499,29 +534,6 @@ def unsloth_train(trainer):
     if leftover_samples == 0: leftover_ga = ga
 
     logging_steps = training_args.logging_steps
-
-    # Safety net: install offloading on the inner model if prepare_model_for_training
-    # didn't already do it. We wrap the innermost model's forward (not the
-    # outermost) to avoid wrapping the loss computation, which may use
-    # torch.func transforms incompatible with saved_tensors_hooks.
-    if (getattr(model, '_offloaded_gradient_checkpointing', False)
-            and not getattr(model, '_unsloth_offload_forward_installed', False)):
-        from .gradient_checkpointing import UnslothOffloadActivations
-        inner_model = model
-        while hasattr(inner_model, "model"):
-            inner_model = inner_model.model
-        offload_ctx = UnslothOffloadActivations(enabled=True)
-        _orig_inner_fwd = inner_model.forward
-
-        @functools.wraps(_orig_inner_fwd)
-        def _inner_offloading_forward(*args, **kwargs):
-            if inner_model.training:
-                with offload_ctx:
-                    return _orig_inner_fwd(*args, **kwargs)
-            return _orig_inner_fwd(*args, **kwargs)
-
-        inner_model.forward = _inner_offloading_forward
-        model._unsloth_offload_forward_installed = True
 
     # Go through each epoch
     start_time = time.time()

@@ -22,6 +22,7 @@ import os
 import warnings
 import gc
 import weakref
+from contextvars import ContextVar
 from .utils import _get_dtype, Version
 from .device_type import (
     is_hip,
@@ -52,6 +53,8 @@ __all__ = [
     "UnslothOffloadActivations",
     "resolve_sac_context_fn",
     "set_sac_policy",
+    "resolve_gc_offload_backend",
+    "set_offload_backend",
     "_bind_gradient_checkpointing_func",
 ]
 
@@ -77,6 +80,19 @@ except ImportError:
 # Op sets are resolved lazily on first SAC use, not at import time.
 _SAC_ATTENTION_OPS = None
 _SAC_MATMUL_OPS = None
+_GC_OFFLOAD_BACKENDS = {"noop", "hooks"}
+
+
+def resolve_gc_offload_backend(backend = None):
+    if backend is None:
+        backend = os.environ.get("UNSLOTH_GC_OFFLOAD_BACKEND", "hooks")
+    backend = str(backend).strip().lower()
+    if backend not in _GC_OFFLOAD_BACKENDS:
+        raise ValueError(
+            f"Unsloth: Unknown GC offload backend {backend!r}. "
+            f"Available: {sorted(_GC_OFFLOAD_BACKENDS)}"
+        )
+    return backend
 
 
 def _try_resolve_op(name):
@@ -188,7 +204,13 @@ def resolve_sac_context_fn(policy):
 
 
 # Useful for more than just SAC
-def _bind_gradient_checkpointing_func(model, checkpoint_fn, use_reentrant, context_fn=None):
+def _bind_gradient_checkpointing_func(
+    model,
+    checkpoint_fn,
+    use_reentrant,
+    context_fn = None,
+    offload_backend = None,
+):
     """Bind _gradient_checkpointing_func on all modules with the given settings.
 
     Builds a functools.partial from non-None kwargs and assigns it to every
@@ -199,6 +221,8 @@ def _bind_gradient_checkpointing_func(model, checkpoint_fn, use_reentrant, conte
         partial_kwargs["use_reentrant"] = use_reentrant
     if context_fn is not None:
         partial_kwargs["context_fn"] = context_fn
+    if offload_backend is not None:
+        partial_kwargs["offload_backend"] = resolve_gc_offload_backend(offload_backend)
 
     if partial_kwargs:
         bound = functools.partial(checkpoint_fn, **partial_kwargs)
@@ -229,11 +253,37 @@ def set_sac_policy(model, policy):
 
     context_fn = resolve_sac_context_fn(policy)
     model._unsloth_sac_context_fn = context_fn
+    offload_backend = getattr(model, "_unsloth_gc_offload_backend", None)
 
     checkpoint_fn = torch.utils.checkpoint.checkpoint
     _bind_gradient_checkpointing_func(
-        model, checkpoint_fn, use_reentrant, context_fn,
+        model, checkpoint_fn, use_reentrant, context_fn, offload_backend,
     )
+
+
+def set_offload_backend(model, backend):
+    backend = resolve_gc_offload_backend(backend)
+    model._unsloth_gc_offload_backend = backend
+    use_reentrant = getattr(model, "_unsloth_use_reentrant", True)
+    context_fn = getattr(model, "_unsloth_sac_context_fn", None)
+    checkpoint_fn = torch.utils.checkpoint.checkpoint
+    _bind_gradient_checkpointing_func(
+        model, checkpoint_fn, use_reentrant, context_fn, backend,
+    )
+    if not use_reentrant:
+        try:
+            from .training_utils import (
+                _install_hook_based_offload_wrapper,
+                _remove_hook_based_offload_wrapper,
+            )
+            dtype = getattr(getattr(model, "config", None), "torch_dtype", None)
+            if backend == "hooks":
+                _install_hook_based_offload_wrapper(model, dtype)
+            else:
+                _remove_hook_based_offload_wrapper(model)
+        except Exception:
+            pass
+    return backend
 
 
 # Initial buffer sizes for gradient checkpointing
@@ -444,12 +494,15 @@ pass
 
 
 from torch.utils.checkpoint import (
+    ContextManager,
+    _DEFAULT_DETERMINISM_MODE,
     _infer_device_type,
     _get_autocast_kwargs,
     _get_device_module,
     get_device_states,
     contextlib,
     DefaultDeviceType,
+    noop_context_fn,
 )
 # Added [device_type] in Torch 2.5!
 def set_device_states(devices, states, *, device_type=None) -> None:
@@ -491,6 +544,88 @@ elif DEVICE_TYPE == "xpu":
 
 CPU_BUFFERS = []
 CPU_INDEX = None
+_noop_offload_state: ContextVar[Optional[dict]] = ContextVar("_noop_offload_state", default=None)
+pass
+
+
+def _patch_noop_save_inputs():
+    cls = getattr(torch.utils.checkpoint, "_NoopSaveInputs", None)
+    if cls is None:
+        return
+    if UnslothGradientCheckpointer._original_noop_setup_context is not None:
+        return
+    UnslothGradientCheckpointer._original_noop_setup_context = cls.setup_context
+
+    def unsloth_setup_context(ctx: Any, inputs: Tuple[Any, ...], output: Any) -> None:
+        state = _noop_offload_state.get()
+        if state is None:
+            return UnslothGradientCheckpointer._original_noop_setup_context(ctx, inputs, output)
+
+        offloader = state.get("offloader", None)
+        target_input_index = int(state.get("target_input_index", 2))
+        if offloader is None:
+            return UnslothGradientCheckpointer._original_noop_setup_context(ctx, inputs, output)
+
+        n_inputs = len(inputs)
+        # 0 = non-tensor, 1 = saved tensor, 2 = offloaded tensor
+        entry_kind = [0] * n_inputs
+        entry_index = [-1] * n_inputs
+        non_tensor_values = [None] * n_inputs
+        saved_tensors = []
+        offloaded = []
+
+        for i, o in enumerate(inputs):
+            if not isinstance(o, torch.Tensor):
+                non_tensor_values[i] = o
+                continue
+
+            should_try_offload = (
+                i == target_input_index and
+                o.requires_grad and
+                o.device.type != "cpu"
+            )
+            if should_try_offload:
+                packed = offloader.pack_hook(o)
+                if isinstance(packed, PackedCPUBuffer):
+                    off_idx = len(offloaded)
+                    offloaded.append(packed)
+                    entry_kind[i] = 2
+                    entry_index[i] = off_idx
+                    continue
+
+            saved_idx = len(saved_tensors)
+            saved_tensors.append(o)
+            entry_kind[i] = 1
+            entry_index[i] = saved_idx
+
+        def get_args(saved_tensors_runtime):
+            ret = [None] * (n_inputs - 1)
+            for i in range(1, n_inputs):
+                kind = entry_kind[i]
+                if kind == 0:
+                    ret[i - 1] = non_tensor_values[i]
+                elif kind == 1:
+                    ret[i - 1] = saved_tensors_runtime[entry_index[i]]
+                else:
+                    ret[i - 1] = UnslothGradientCheckpointer.unpack_packed(offloaded[entry_index[i]])
+            return ret
+
+        ctx.get_args = get_args
+        ctx.save_for_backward(*saved_tensors)
+
+    cls.setup_context = staticmethod(unsloth_setup_context)
+pass
+
+
+def _unpatch_noop_save_inputs():
+    cls = getattr(torch.utils.checkpoint, "_NoopSaveInputs", None)
+    if cls is None:
+        return
+    if UnslothGradientCheckpointer._original_noop_setup_context is None:
+        return
+    cls.setup_context = UnslothGradientCheckpointer._original_noop_setup_context
+    UnslothGradientCheckpointer._original_noop_setup_context = None
+    _noop_offload_state.set(None)
 pass
 
 
@@ -524,6 +659,7 @@ class UnslothGradientCheckpointer:
     _dtype: torch.dtype = None
     _events_supported: Optional[bool] = None
     _meta_initialized: bool = False
+    _original_noop_setup_context: Optional[Any] = None
 
     @classmethod
     def ensure_metadata(cls, dtype: torch.dtype = None):
@@ -1321,19 +1457,52 @@ def _unsloth_checkpoint_reentrant(function, *args, preserve_rng_state=True):
 
 
 def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
-    """Non-reentrant checkpoint that delegates DIRECTLY to native PyTorch checkpoint.
+    """Non-reentrant checkpoint using native PyTorch checkpoint plus scoped input offload."""
+    preserve = kwargs.pop("preserve_rng_state", True)
+    context_fn = kwargs.pop("context_fn", noop_context_fn)
+    offload_backend = resolve_gc_offload_backend(kwargs.pop("offload_backend", None))
+    determinism_check = kwargs.pop("determinism_check", _DEFAULT_DETERMINISM_MODE)
+    debug = kwargs.pop("debug", False)
 
-    No _NoopSaveInputs patch, no ContextVar, no offloader.
-    Offloading is handled externally by UnslothOffloadActivations.
-    """
+    cls = UnslothGradientCheckpointer
+    determinism_check = "none"
+    dtype = None
+    first_arg = args[0] if args else None
+    if torch.is_tensor(first_arg):
+        dtype = first_arg.dtype
+
+    offloader = cls.begin_checkpoint(dtype)
     old_checkpoint = getattr(torch.utils.checkpoint, "_old_checkpoint", None)
     original_checkpoint = old_checkpoint or torch.utils.checkpoint.checkpoint
-    return original_checkpoint(
-        function, *args,
-        use_reentrant=False,
-        determinism_check="none",
-        **kwargs
-    )
+
+    if _gc_disable_cpu_offload() or offload_backend == "hooks":
+        return original_checkpoint(
+            function, *args,
+            use_reentrant=False,
+            preserve_rng_state=preserve,
+            context_fn=context_fn,
+            determinism_check=determinism_check,
+            debug=debug,
+            **kwargs
+        )
+
+    token = _noop_offload_state.set({
+        "offloader": offloader,
+        # _NoopSaveInputs gets: (dummy, kwargs, *args), so first model arg is index 2.
+        "target_input_index": 2,
+    })
+    try:
+        return original_checkpoint(
+            function, *args,
+            use_reentrant=False,
+            preserve_rng_state=preserve,
+            context_fn=context_fn,
+            determinism_check=determinism_check,
+            debug=debug,
+            **kwargs
+        )
+    finally:
+        _noop_offload_state.reset(token)
 
 
 def unsloth_checkpoint(
@@ -1389,6 +1558,7 @@ def patch_unsloth_smart_gradient_checkpointing(dtype = None, use_reentrant = Non
             transformers.modeling_utils.checkpoint = unsloth_checkpoint
     except Exception:
         pass
+    _patch_noop_save_inputs()
 pass
 
 
@@ -1429,7 +1599,7 @@ def unpatch_unsloth_smart_gradient_checkpointing():
             del transformers.modeling_utils._old_checkpoint
     except Exception:
         pass
-
+    _unpatch_noop_save_inputs()
 pass
 
 
