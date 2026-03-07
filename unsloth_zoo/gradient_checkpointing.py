@@ -219,9 +219,12 @@ def _bind_gradient_checkpointing_func(
     partial_kwargs = {}
     if use_reentrant is not None:
         partial_kwargs["use_reentrant"] = use_reentrant
-    if context_fn is not None:
+    # context_fn / offload_backend are only valid for the non-reentrant path.
+    # Keeping them bound in reentrant mode can route layers back into the
+    # non-reentrant runtime after a mode switch.
+    if (use_reentrant is False) and context_fn is not None:
         partial_kwargs["context_fn"] = context_fn
-    if offload_backend is not None:
+    if (use_reentrant is False) and offload_backend is not None:
         partial_kwargs["offload_backend"] = resolve_gc_offload_backend(offload_backend)
 
     if partial_kwargs:
@@ -270,19 +273,18 @@ def set_offload_backend(model, backend):
     _bind_gradient_checkpointing_func(
         model, checkpoint_fn, use_reentrant, context_fn, backend,
     )
-    if not use_reentrant:
-        try:
-            from .training_utils import (
-                _install_hook_based_offload_wrapper,
-                _remove_hook_based_offload_wrapper,
-            )
-            dtype = getattr(getattr(model, "config", None), "torch_dtype", None)
-            if backend == "hooks":
-                _install_hook_based_offload_wrapper(model, dtype)
-            else:
-                _remove_hook_based_offload_wrapper(model)
-        except Exception:
-            pass
+    try:
+        from .training_utils import (
+            _install_hook_based_offload_wrapper,
+            _remove_hook_based_offload_wrapper,
+        )
+        dtype = getattr(getattr(model, "config", None), "torch_dtype", None)
+        if (not use_reentrant) and backend == "hooks":
+            _install_hook_based_offload_wrapper(model, dtype)
+        else:
+            _remove_hook_based_offload_wrapper(model)
+    except Exception:
+        pass
     return backend
 
 
@@ -678,6 +680,7 @@ class UnslothGradientCheckpointer:
 
     @classmethod
     def initialize(cls, dtype: torch.dtype = None, num_devices: int = None):
+        print('non reentrant initialized')
         if cls._initialized:
             return
 
