@@ -115,43 +115,6 @@ class HideLoggingMessage(logging.Filter):
 
 pass
 
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name, None)
-    if value is None:
-        return bool(default)
-    value = value.strip().lower()
-    return value in ("1", "true", "yes", "on")
-
-
-def _get_nonreentrant_qwen3vl_compile_policy(model_type: str) -> dict[str, bool]:
-    if model_type != "qwen3_vl":
-        return {
-            "active": False,
-            "disable_fast_lora": False,
-            "disable_text_mlp_compile": False,
-            "disable_vision_mlp_compile": False,
-            "disable_vision_merger_compile": False,
-        }
-
-    experiment_use_reentrant = _env_flag("UNSLOTH_EXPERIMENT_USE_REENTRANT", default = True)
-    if experiment_use_reentrant:
-        return {
-            "active": False,
-            "disable_fast_lora": False,
-            "disable_text_mlp_compile": False,
-            "disable_vision_mlp_compile": False,
-            "disable_vision_merger_compile": False,
-        }
-
-    return {
-        "active": True,
-        "disable_fast_lora": _env_flag("UNSLOTH_NR_DISABLE_FAST_LORA"),
-        "disable_text_mlp_compile": _env_flag("UNSLOTH_NR_DISABLE_QWEN3VL_TEXT_MLP_COMPILE"),
-        "disable_vision_mlp_compile": _env_flag("UNSLOTH_NR_DISABLE_QWEN3VL_VISION_MLP_COMPILE"),
-        "disable_vision_merger_compile": _env_flag("UNSLOTH_NR_DISABLE_QWEN3VL_VISION_MERGER_COMPILE"),
-    }
-
 DISABLED_KEYWORDS = [
     "select_best_resolution",  # Llava NeXT errors out
     "original_aspect_ratio > current_aspect_ratio",  # Llava NeXT errors out
@@ -3089,13 +3052,6 @@ def unsloth_compile_transformers(
         return
     modeling_file = eval(model_location)
     disable_compile_functions = set(DISABLE_COMPILE_FUNCTIONS)
-    nonreentrant_qwen3vl_policy = _get_nonreentrant_qwen3vl_compile_policy(model_type)
-    if nonreentrant_qwen3vl_policy["disable_text_mlp_compile"]:
-        disable_compile_functions.add("Qwen3VLTextMLP_forward")
-    if nonreentrant_qwen3vl_policy["disable_vision_mlp_compile"]:
-        disable_compile_functions.add("Qwen3VLVisionMLP_forward")
-    if nonreentrant_qwen3vl_policy["disable_vision_merger_compile"]:
-        disable_compile_functions.add("Qwen3VLVisionPatchMerger_forward")
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
@@ -3179,8 +3135,6 @@ def unsloth_compile_transformers(
     UNSLOTH_FULLGRAPH = UNSLOTH_FULLGRAPH == "1"
 
     # Patch PEFT lora forwards
-    if nonreentrant_qwen3vl_policy["disable_fast_lora"]:
-        fast_lora_forwards = False
     if (not disable) and fast_lora_forwards:
         print("Unsloth: Patching LoRA to make it faster")
         patch_lora_forwards(torch_compile_options)
