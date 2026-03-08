@@ -3092,13 +3092,10 @@ def unsloth_compile_transformers(
     nonreentrant_qwen3vl_policy = _get_nonreentrant_qwen3vl_compile_policy(model_type)
     if nonreentrant_qwen3vl_policy["disable_text_mlp_compile"]:
         disable_compile_functions.add("Qwen3VLTextMLP_forward")
-        disable_compile_functions.add("Qwen3VLTextMLP")
     if nonreentrant_qwen3vl_policy["disable_vision_mlp_compile"]:
         disable_compile_functions.add("Qwen3VLVisionMLP_forward")
-        disable_compile_functions.add("Qwen3VLVisionMLP")
     if nonreentrant_qwen3vl_policy["disable_vision_merger_compile"]:
         disable_compile_functions.add("Qwen3VLVisionPatchMerger_forward")
-        disable_compile_functions.add("Qwen3VLVisionPatchMerger")
 
     if hasattr(modeling_file, "__UNSLOTH_PATCHED__"):
         # Get __UNSLOTH_SUPPORTS_SDPA__
