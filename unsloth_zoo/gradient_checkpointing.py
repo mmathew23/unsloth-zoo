@@ -16,10 +16,16 @@
 
 import torch
 import numpy as np
+import functools
 from typing import Union, Optional, List, Any, Callable, Tuple
 import os
 import warnings
 import gc
+import weakref
+import time
+import atexit
+from collections import defaultdict
+from contextvars import ContextVar
 from .utils import _get_dtype, Version
 from .device_type import (
     is_hip,
@@ -46,7 +52,475 @@ __all__ = [
     "patch_unsloth_smart_gradient_checkpointing",
     "unpatch_unsloth_smart_gradient_checkpointing",
     "reset_unsloth_gradient_checkpointing_buffers",
+    "UnslothGradientCheckpointer",
+    "UnslothOffloadActivations",
+    "resolve_sac_context_fn",
+    "set_sac_policy",
+    "resolve_gc_offload_backend",
+    "set_offload_backend",
+    "_bind_gradient_checkpointing_func",
 ]
+
+# ── Selective Activation Checkpointing (SAC) ──────────────────────────
+#
+# SAC lets you selectively save expensive ops' outputs (e.g. attention, matmul)
+# instead of recomputing everything during backward.  It composes with CPU
+# offloading: SAC decides *what* to save, saved_tensors_hooks decides *where*.
+# However under torch compile saved_tensors_hooks may not be compatible with 
+# SAC CPU_OFFLOAD policies.
+#
+# Only available with use_reentrant=False (PyTorch checkpoint context_fn kwarg).
+
+try:
+    from torch.utils.checkpoint import (
+        CheckpointPolicy,
+        create_selective_checkpoint_contexts,
+    )
+    _SAC_AVAILABLE = True
+except ImportError:
+    _SAC_AVAILABLE = False
+
+# Op sets are resolved lazily on first SAC use, not at import time.
+_SAC_ATTENTION_OPS = None
+_SAC_MATMUL_OPS = None
+_GC_OFFLOAD_BACKENDS = {"noop", "hooks"}
+_gc_profile_module: ContextVar[Optional[str]] = ContextVar("_gc_profile_module", default=None)
+_gc_profile_enabled_cache: Optional[bool] = None
+_gc_profile_registered = False
+_gc_profile_state = {
+    "mode": None,
+    "totals": defaultdict(float),
+    "module_stats": defaultdict(lambda: defaultdict(float)),
+    "shape_stats": defaultdict(lambda: defaultdict(float)),
+    "skip_reasons": defaultdict(int),
+}
+
+
+def _gc_profile_enabled() -> bool:
+    global _gc_profile_enabled_cache
+    if _gc_profile_enabled_cache is None:
+        value = os.environ.get("UNSLOTH_GC_PROFILE", "0")
+        _gc_profile_enabled_cache = str(value).strip().lower() not in ("0", "false", "no", "off", "")
+    return bool(_gc_profile_enabled_cache)
+
+
+def _gc_profile_module_name() -> str:
+    name = _gc_profile_module.get()
+    if name:
+        return name
+    return "<unknown>"
+
+
+def _gc_profile_resolve_function_module_name(function) -> Optional[str]:
+    module = getattr(function, "__self__", None)
+    if isinstance(module, torch.nn.Module):
+        return getattr(module, "_unsloth_gc_profile_module_name", None) or module.__class__.__name__
+
+    closure = getattr(function, "__closure__", None)
+    if closure:
+        for cell in closure:
+            try:
+                value = cell.cell_contents
+            except ValueError:
+                continue
+            if isinstance(value, torch.nn.Module):
+                return getattr(value, "_unsloth_gc_profile_module_name", None) or value.__class__.__name__
+            maybe_module = getattr(value, "__self__", None)
+            if isinstance(maybe_module, torch.nn.Module):
+                return getattr(maybe_module, "_unsloth_gc_profile_module_name", None) or maybe_module.__class__.__name__
+    return None
+
+
+def _gc_profile_shape_key(shape, dtype) -> str:
+    dims = "x".join(str(int(x)) for x in shape)
+    return f"{dims}:{dtype}"
+
+
+def _gc_profile_ensure(mode: str) -> bool:
+    global _gc_profile_registered
+    if not _gc_profile_enabled():
+        return False
+    if _gc_profile_state["mode"] is None:
+        _gc_profile_state["mode"] = mode
+    if not _gc_profile_registered:
+        atexit.register(_gc_profile_dump_summary)
+        _gc_profile_registered = True
+    return True
+
+
+def _gc_profile_record_skip(reason: str) -> None:
+    if not _gc_profile_enabled():
+        return
+    _gc_profile_state["skip_reasons"][reason] += 1
+
+
+def _gc_profile_record(
+    *,
+    mode: str,
+    module_name: str,
+    shape,
+    dtype,
+    numel: int,
+    kind: str,
+    duration_s: float = 0.0,
+    wait_s: float = 0.0,
+    count: int = 1,
+    extra_allocated: bool = False,
+    pool_hit: bool = False,
+    wait_event_fallback: bool = False,
+) -> None:
+    if not _gc_profile_ensure(mode):
+        return
+
+    n_bytes = int(numel) * torch.tensor([], dtype=dtype).element_size()
+    totals = _gc_profile_state["totals"]
+    totals[f"{kind}_count"] += count
+    totals[f"{kind}_bytes"] += n_bytes
+    totals[f"{kind}_cpu_s"] += duration_s
+    totals[f"{kind}_wait_s"] += wait_s
+    if extra_allocated:
+        totals["cpu_buffer_allocs"] += 1
+    if pool_hit:
+        totals["cpu_buffer_pool_hits"] += 1
+    if wait_event_fallback:
+        totals["wait_stream_fallbacks"] += 1
+
+    module_stats = _gc_profile_state["module_stats"][module_name]
+    module_stats[f"{kind}_count"] += count
+    module_stats[f"{kind}_bytes"] += n_bytes
+    module_stats[f"{kind}_cpu_s"] += duration_s
+    module_stats[f"{kind}_wait_s"] += wait_s
+
+    shape_key = _gc_profile_shape_key(shape, dtype)
+    shape_stats = _gc_profile_state["shape_stats"][shape_key]
+    shape_stats[f"{kind}_count"] += count
+    shape_stats[f"{kind}_bytes"] += n_bytes
+    shape_stats[f"{kind}_cpu_s"] += duration_s
+    shape_stats[f"{kind}_wait_s"] += wait_s
+
+
+def _gc_profile_top_lines(stats_dict, primary_key: str, extra_keys: Tuple[str, ...], limit: int = 10):
+    items = [
+        (name, values)
+        for name, values in stats_dict.items()
+        if values.get(primary_key, 0.0) > 0
+    ]
+    items.sort(key = lambda item: item[1].get(primary_key, 0.0), reverse = True)
+    lines = []
+    for name, values in items[:limit]:
+        parts = [f"{primary_key}={values.get(primary_key, 0.0):.0f}" if "bytes" in primary_key or "count" in primary_key else f"{primary_key}={values.get(primary_key, 0.0):.6f}s"]
+        for key in extra_keys:
+            value = values.get(key, 0.0)
+            if "bytes" in key or "count" in key:
+                parts.append(f"{key}={value:.0f}")
+            else:
+                parts.append(f"{key}={value:.6f}s")
+        lines.append(f"  - {name}: " + ", ".join(parts))
+    return lines
+
+
+def _gc_profile_dump_summary() -> None:
+    if not _gc_profile_enabled():
+        return
+    totals = _gc_profile_state["totals"]
+    mode = _gc_profile_state["mode"] or "unknown"
+    print(f"Unsloth GC profile summary ({mode}):")
+    print(
+        "  totals: "
+        f"pack_count={totals.get('pack_count', 0):.0f}, "
+        f"pack_bytes={totals.get('pack_bytes', 0):.0f}, "
+        f"pack_cpu_s={totals.get('pack_cpu_s', 0.0):.6f}, "
+        f"unpack_count={totals.get('unpack_count', 0):.0f}, "
+        f"unpack_bytes={totals.get('unpack_bytes', 0):.0f}, "
+        f"unpack_cpu_s={totals.get('unpack_cpu_s', 0.0):.6f}, "
+        f"unpack_wait_s={totals.get('unpack_wait_s', 0.0):.6f}, "
+        f"cpu_buffer_pool_hits={totals.get('cpu_buffer_pool_hits', 0):.0f}, "
+        f"cpu_buffer_allocs={totals.get('cpu_buffer_allocs', 0):.0f}, "
+        f"wait_stream_fallbacks={totals.get('wait_stream_fallbacks', 0):.0f}"
+    )
+    if _gc_profile_state["skip_reasons"]:
+        reasons = ", ".join(
+            f"{reason}={count}"
+            for reason, count in sorted(_gc_profile_state["skip_reasons"].items())
+        )
+        print(f"  skips: {reasons}")
+
+    module_lines = _gc_profile_top_lines(
+        _gc_profile_state["module_stats"],
+        "unpack_bytes",
+        ("unpack_count", "unpack_cpu_s"),
+    )
+    if module_lines:
+        print("  top modules by unpack_bytes:")
+        for line in module_lines:
+            print(line)
+
+    module_lines = _gc_profile_top_lines(
+        _gc_profile_state["module_stats"],
+        "unpack_cpu_s",
+        ("unpack_bytes", "unpack_count"),
+    )
+    if module_lines:
+        print("  top modules by unpack_cpu_s:")
+        for line in module_lines:
+            print(line)
+
+    module_lines = _gc_profile_top_lines(
+        _gc_profile_state["module_stats"],
+        "pack_bytes",
+        ("pack_count", "pack_cpu_s"),
+    )
+    if module_lines:
+        print("  top modules by pack_bytes:")
+        for line in module_lines:
+            print(line)
+
+    shape_lines = _gc_profile_top_lines(
+        _gc_profile_state["shape_stats"],
+        "unpack_bytes",
+        ("unpack_count", "unpack_cpu_s"),
+    )
+    if shape_lines:
+        print("  top tensor shapes by unpack_bytes:")
+        for line in shape_lines:
+            print(line)
+
+    shape_lines = _gc_profile_top_lines(
+        _gc_profile_state["shape_stats"],
+        "unpack_cpu_s",
+        ("unpack_bytes", "unpack_count"),
+    )
+    if shape_lines:
+        print("  top tensor shapes by unpack_cpu_s:")
+        for line in shape_lines:
+            print(line)
+
+
+def resolve_gc_offload_backend(backend = None):
+    if backend is None:
+        backend = os.environ.get("UNSLOTH_GC_OFFLOAD_BACKEND", "hooks")
+    backend = str(backend).strip().lower()
+    if backend not in _GC_OFFLOAD_BACKENDS:
+        raise ValueError(
+            f"Unsloth: Unknown GC offload backend {backend!r}. "
+            f"Available: {sorted(_GC_OFFLOAD_BACKENDS)}"
+        )
+    return backend
+
+
+def _try_resolve_op(name):
+    try:
+        parts = name.split(".")
+        obj = torch.ops
+        for p in parts:
+            obj = getattr(obj, p)
+        return obj
+    except AttributeError:
+        return None
+
+
+def _ensure_sac_ops():
+    """Lazily resolve op handles on first use."""
+    global _SAC_ATTENTION_OPS, _SAC_MATMUL_OPS
+    if _SAC_ATTENTION_OPS is not None:
+        return
+
+    _SAC_ATTENTION_OPS = set()
+    for op_name in (
+        "aten._scaled_dot_product_flash_attention.default",
+        "aten._scaled_dot_product_efficient_attention.default",
+        "aten._scaled_dot_product_math.default",
+        "aten._scaled_dot_product_cudnn_attention.default",
+        "aten._flash_attention_forward.default",
+        "aten._efficient_attention_forward.default",
+    ):
+        op = _try_resolve_op(op_name)
+        if op is not None:
+            _SAC_ATTENTION_OPS.add(op)
+
+    _SAC_MATMUL_OPS = set()
+    for op_name in (
+        "aten.mm.default",
+        "aten.bmm.default",
+        "aten.addmm.default",
+    ):
+        op = _try_resolve_op(op_name)
+        if op is not None:
+            _SAC_MATMUL_OPS.add(op)
+
+
+def _sac_policy_attn_only(ctx, op, *args, **kwargs):
+    if op in _SAC_ATTENTION_OPS:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def _sac_policy_attn_and_matmul(ctx, op, *args, **kwargs):
+    if op in _SAC_ATTENTION_OPS or op in _SAC_MATMUL_OPS:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+_SAC_PRESETS = {
+    "attn_only": _sac_policy_attn_only,
+    "attn_and_matmul": _sac_policy_attn_and_matmul,
+}
+
+
+def resolve_sac_context_fn(policy):
+    """Resolve a user-provided SAC policy to a context_fn callable (or None).
+
+    Args:
+        policy: One of:
+            - None → no SAC (returns None)
+            - str  → preset name ("attn_only", "attn_and_matmul")
+            - list of OpOverloads → ops whose outputs to save
+            - callable(ctx, op, *args, **kwargs) → CheckpointPolicy
+
+    Returns:
+        A callable suitable for the ``context_fn`` kwarg of
+        ``torch.utils.checkpoint.checkpoint``, or None.
+    """
+    if policy is None:
+        return None
+
+    if not _SAC_AVAILABLE:
+        raise RuntimeError(
+            "Unsloth: SAC requires PyTorch >= 2.4 with "
+            "torch.utils.checkpoint.CheckpointPolicy support."
+        )
+
+    _ensure_sac_ops()
+
+    if isinstance(policy, str):
+        if policy not in _SAC_PRESETS:
+            raise ValueError(
+                f"Unsloth: Unknown SAC preset {policy!r}. "
+                f"Available: {list(_SAC_PRESETS.keys())}"
+            )
+        policy_fn = _SAC_PRESETS[policy]
+    elif isinstance(policy, (list, tuple, set)):
+        save_ops = set(policy)
+        def policy_fn(ctx, op, *args, **kwargs):
+            if op in save_ops:
+                return CheckpointPolicy.MUST_SAVE
+            return CheckpointPolicy.PREFER_RECOMPUTE
+    elif callable(policy):
+        policy_fn = policy
+    else:
+        raise TypeError(
+            f"Unsloth: sac_policy must be None, a string, a list of ops, "
+            f"or a callable, got {type(policy).__name__}"
+        )
+
+    return functools.partial(create_selective_checkpoint_contexts, policy_fn)
+
+
+# Useful for more than just SAC
+def _bind_gradient_checkpointing_func(
+    model,
+    checkpoint_fn,
+    use_reentrant,
+    context_fn = None,
+    offload_backend = None,
+):
+    """Bind _gradient_checkpointing_func on all modules with the given settings.
+
+    Builds a functools.partial from non-None kwargs and assigns it to every
+    module that already has _gradient_checkpointing_func.
+    """
+    partial_kwargs = {}
+    if use_reentrant is not None:
+        partial_kwargs["use_reentrant"] = use_reentrant
+    # context_fn / offload_backend are only valid for the non-reentrant path.
+    # Keeping them bound in reentrant mode can route layers back into the
+    # non-reentrant runtime after a mode switch.
+    if (use_reentrant is False) and context_fn is not None:
+        partial_kwargs["context_fn"] = context_fn
+    if (use_reentrant is False) and offload_backend is not None:
+        partial_kwargs["offload_backend"] = resolve_gc_offload_backend(offload_backend)
+
+    if partial_kwargs:
+        bound = functools.partial(checkpoint_fn, **partial_kwargs)
+    else:
+        bound = checkpoint_fn
+
+    named_modules = {
+        id(candidate): (name or candidate.__class__.__name__)
+        for name, candidate in model.named_modules()
+    }
+    for module in model.modules():
+        if not hasattr(module, "_gradient_checkpointing_func"):
+            continue
+        if _gc_profile_enabled():
+            module._unsloth_gc_profile_module_name = named_modules.get(id(module), module.__class__.__name__)
+        if not _gc_profile_enabled():
+            module._gradient_checkpointing_func = bound
+            continue
+
+        module_name = named_modules.get(id(module), module.__class__.__name__)
+
+        @functools.wraps(bound)
+        def profiled_checkpoint_call(function, *args, __bound = bound, __module_name = module_name, **kwargs):
+            token = _gc_profile_module.set(__module_name)
+            try:
+                return __bound(function, *args, **kwargs)
+            finally:
+                _gc_profile_module.reset(token)
+
+        module._gradient_checkpointing_func = profiled_checkpoint_call
+
+
+def set_sac_policy(model, policy):
+    """Set or clear SAC policy at runtime (no model reload needed).
+
+    Args:
+        model: The model (must have been loaded with use_reentrant=False).
+        policy: Same as ``sac_policy`` in ``from_pretrained``, or None to disable.
+
+    Raises:
+        ValueError: If the model uses reentrant checkpointing.
+    """
+    use_reentrant = getattr(model, "_unsloth_use_reentrant", True)
+    if use_reentrant and policy is not None:
+        raise ValueError(
+            "Unsloth: SAC requires use_reentrant=False. "
+            "Re-load the model with use_reentrant=False to use SAC."
+        )
+
+    context_fn = resolve_sac_context_fn(policy)
+    model._unsloth_sac_context_fn = context_fn
+    offload_backend = getattr(model, "_unsloth_gc_offload_backend", None)
+
+    checkpoint_fn = torch.utils.checkpoint.checkpoint
+    _bind_gradient_checkpointing_func(
+        model, checkpoint_fn, use_reentrant, context_fn, offload_backend,
+    )
+
+
+def set_offload_backend(model, backend):
+    backend = resolve_gc_offload_backend(backend)
+    model._unsloth_gc_offload_backend = backend
+    use_reentrant = getattr(model, "_unsloth_use_reentrant", True)
+    context_fn = getattr(model, "_unsloth_sac_context_fn", None)
+    checkpoint_fn = torch.utils.checkpoint.checkpoint
+    _bind_gradient_checkpointing_func(
+        model, checkpoint_fn, use_reentrant, context_fn, backend,
+    )
+    try:
+        from .training_utils import (
+            _install_hook_based_offload_wrapper,
+            _remove_hook_based_offload_wrapper,
+        )
+        dtype = getattr(getattr(model, "config", None), "torch_dtype", None)
+        if (not use_reentrant) and backend == "hooks":
+            _install_hook_based_offload_wrapper(model, dtype)
+        else:
+            _remove_hook_based_offload_wrapper(model)
+    except Exception:
+        pass
+    return backend
+
 
 # Initial buffer sizes for gradient checkpointing
 INITIAL_CPU_BUFFER_SIZE = 128 * 1024       # Initial size per CPU buffer
@@ -137,10 +611,6 @@ def prepare_n_gradient_checkpoints(
         raise TypeError("`model` or `model.model` does not have attribute `layers`. Are you sure this is a model?")
     pass
 
-    if use_reentrant is False:
-        use_reentrant = True
-    pass
-
     n_layers = len(_model.layers)
     boundaries = calculate_n_gradient_checkpoints(n_layers, layers_per_checkpoint)
     _model._gradient_checkpointing_boundaries    = boundaries
@@ -211,12 +681,6 @@ class Unsloth_Gradient_Checkpointer(torch.autograd.Function):
 pass
 
 
-# @torch._disable_dynamo
-# def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
-#     return Unsloth_Offloaded_Gradient_Checkpointer.apply(function, *args)
-# pass
-
-
 @torch._disable_dynamo
 def unsloth_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
     return Unsloth_Gradient_Checkpointer.apply(function, *args)
@@ -266,15 +730,15 @@ pass
 
 
 from torch.utils.checkpoint import (
-    check_backward_validity,
+    ContextManager,
+    _DEFAULT_DETERMINISM_MODE,
     _infer_device_type,
     _get_autocast_kwargs,
     _get_device_module,
     get_device_states,
-    # set_device_states,
-    detach_variable,
     contextlib,
     DefaultDeviceType,
+    noop_context_fn,
 )
 # Added [device_type] in Torch 2.5!
 def set_device_states(devices, states, *, device_type=None) -> None:
@@ -316,6 +780,678 @@ elif DEVICE_TYPE == "xpu":
 
 CPU_BUFFERS = []
 CPU_INDEX = None
+_noop_offload_state: ContextVar[Optional[dict]] = ContextVar("_noop_offload_state", default=None)
+_hooks_offload_state: ContextVar[Optional[dict]] = ContextVar("_hooks_offload_state", default=None)
+pass
+
+
+def _patch_noop_save_inputs():
+    cls = getattr(torch.utils.checkpoint, "_NoopSaveInputs", None)
+    if cls is None:
+        return
+    if UnslothGradientCheckpointer._original_noop_setup_context is not None:
+        return
+    UnslothGradientCheckpointer._original_noop_setup_context = cls.setup_context
+
+    def unsloth_setup_context(ctx: Any, inputs: Tuple[Any, ...], output: Any) -> None:
+        state = _noop_offload_state.get()
+        if state is None:
+            return UnslothGradientCheckpointer._original_noop_setup_context(ctx, inputs, output)
+
+        offloader = state.get("offloader", None)
+        target_input_index = int(state.get("target_input_index", 2))
+        if offloader is None:
+            return UnslothGradientCheckpointer._original_noop_setup_context(ctx, inputs, output)
+
+        n_inputs = len(inputs)
+        # 0 = non-tensor, 1 = saved tensor, 2 = offloaded tensor
+        entry_kind = [0] * n_inputs
+        entry_index = [-1] * n_inputs
+        non_tensor_values = [None] * n_inputs
+        saved_tensors = []
+        offloaded = []
+
+        for i, o in enumerate(inputs):
+            if not isinstance(o, torch.Tensor):
+                non_tensor_values[i] = o
+                continue
+
+            should_try_offload = (
+                i == target_input_index and
+                o.requires_grad and
+                o.device.type != "cpu"
+            )
+            if should_try_offload:
+                packed = offloader.pack_hook(o)
+                if isinstance(packed, PackedCPUBuffer):
+                    off_idx = len(offloaded)
+                    offloaded.append(packed)
+                    entry_kind[i] = 2
+                    entry_index[i] = off_idx
+                    continue
+
+            saved_idx = len(saved_tensors)
+            saved_tensors.append(o)
+            entry_kind[i] = 1
+            entry_index[i] = saved_idx
+
+        def get_args(saved_tensors_runtime):
+            ret = [None] * (n_inputs - 1)
+            for i in range(1, n_inputs):
+                kind = entry_kind[i]
+                if kind == 0:
+                    ret[i - 1] = non_tensor_values[i]
+                elif kind == 1:
+                    ret[i - 1] = saved_tensors_runtime[entry_index[i]]
+                else:
+                    ret[i - 1] = UnslothGradientCheckpointer.unpack_packed(offloaded[entry_index[i]])
+            return ret
+
+        ctx.get_args = get_args
+        ctx.save_for_backward(*saved_tensors)
+
+    cls.setup_context = staticmethod(unsloth_setup_context)
+pass
+
+
+def _unpatch_noop_save_inputs():
+    cls = getattr(torch.utils.checkpoint, "_NoopSaveInputs", None)
+    if cls is None:
+        return
+    if UnslothGradientCheckpointer._original_noop_setup_context is None:
+        return
+    cls.setup_context = UnslothGradientCheckpointer._original_noop_setup_context
+    UnslothGradientCheckpointer._original_noop_setup_context = None
+    _noop_offload_state.set(None)
+pass
+
+
+def _gc_disable_cpu_offload():
+    value = os.environ.get("UNSLOTH_GC_DISABLE_CPU_OFFLOAD", None)
+    if value is None:
+        return False
+    return str(value).strip().lower() not in ("0", "false", "no", "off", "")
+pass
+
+
+class UnslothGradientCheckpointer:
+    """
+    All Unsloth Zoo code licensed under LGPLv3
+
+    Non-reentrant gradient checkpointing with smart CPU offloading.
+    """
+    _cpu_buffers: List[torch.Tensor] = []
+    _cpu_free_buffers: dict = {}
+    _gpu_buffers: dict = {}
+    _main_streams: dict = {}
+    _extra_streams: dict = {}
+    _initialized: bool = False
+
+    _current_gc_index: int = 0
+    _last_gc_index: int = 0
+    _first_pass: bool = True
+    _backward_pass: bool = True
+    _minimum_size: int = 2 * 1024 * 1024 // 2
+    _use_unsloth_gc_message: bool = True
+    _dtype: torch.dtype = None
+    _events_supported: Optional[bool] = None
+    _meta_initialized: bool = False
+    _original_noop_setup_context: Optional[Any] = None
+
+    @classmethod
+    def ensure_metadata(cls, dtype: torch.dtype = None):
+        if dtype is None:
+            if cls._dtype is not None:
+                dtype = cls._dtype
+            elif DEVICE_TYPE == "cuda":
+                major_version, _ = torch.cuda.get_device_capability()
+                dtype = torch.bfloat16 if (major_version >= 8) else torch.float16
+            else:
+                dtype = torch.bfloat16
+        cls._dtype = dtype
+        n_bytes = torch.finfo(dtype).bits // 8
+        cls._minimum_size = 2 * 1024 * 1024 // n_bytes
+        cls._meta_initialized = True
+
+    @classmethod
+    def initialize(cls, dtype: torch.dtype = None, num_devices: int = None):
+        print('non reentrant initialized')
+        if cls._initialized:
+            return
+
+        if dtype is None:
+            if DEVICE_TYPE == "cuda":
+                major_version, minor_version = torch.cuda.get_device_capability()
+                supports_bfloat16 = (major_version >= 8)
+            elif DEVICE_TYPE in ("hip", "xpu"):
+                supports_bfloat16 = True
+            else:
+                supports_bfloat16 = True
+            dtype = torch.bfloat16 if supports_bfloat16 else torch.float16
+
+        cls._dtype = dtype
+        n_bytes = torch.finfo(dtype).bits // 8
+        cls._minimum_size = 2 * 1024 * 1024 // n_bytes
+        cls._meta_initialized = True
+
+        cls._cpu_buffers = [
+            torch.empty(INITIAL_CPU_BUFFER_SIZE, dtype=dtype, device="cpu", pin_memory=True)
+            for _ in range(INITIAL_CPU_BUFFER_COUNT)
+        ]
+        cls._cpu_free_buffers = {
+            dtype: [(buf, None, None) for buf in cls._cpu_buffers]
+        }
+
+        if num_devices is None:
+            num_devices = torch.cuda.device_count() if DEVICE_TYPE in ("cuda", "hip") else torch.xpu.device_count()
+
+        try:
+            for device_idx in range(num_devices):
+                device = torch.device(f"{DEVICE_TYPE_TORCH}:{device_idx}")
+                cls._gpu_buffers[device_idx] = torch.empty(
+                    INITIAL_GPU_BUFFER_SIZE, dtype=dtype, device=device,
+                )
+                if DEVICE_TYPE in ("cuda", "hip"):
+                    cls._main_streams[device_idx] = torch.cuda.default_stream(device)
+                    cls._extra_streams[device_idx] = torch.cuda.Stream(device)
+                elif DEVICE_TYPE == "xpu":
+                    cls._main_streams[device_idx] = torch.xpu.current_stream(device)
+                    cls._extra_streams[device_idx] = torch.xpu.Stream(device)
+        except Exception:
+            print("="*10 + "\n")
+            print("Unsloth: Your setup does not support `PYTORCH_CUDA_ALLOC_CONF`\n")
+            print("Please set `import os; os.environ['PYTORCH_CUDA_ALLOC_CONF'] = '';`\n")
+            print("Then re-run Unsloth from the start.")
+            print("="*10 + "\n")
+            raise
+
+        cls._initialized = True
+
+    @classmethod
+    def reset_for_new_training(cls):
+        if not cls._initialized:
+            return
+
+        cls._cpu_free_buffers = {}
+        cls._current_gc_index = 0
+        cls._last_gc_index = 0
+        cls._first_pass = True
+        cls._backward_pass = True
+        cls._use_unsloth_gc_message = True
+
+        for i in range(len(cls._cpu_buffers)):
+            if i < INITIAL_CPU_BUFFER_COUNT:
+                if cls._cpu_buffers[i] is not None and hasattr(cls._cpu_buffers[i], "resize_"):
+                    cls._cpu_buffers[i].resize_(INITIAL_CPU_BUFFER_SIZE)
+            else:
+                if cls._cpu_buffers[i] is not None and hasattr(cls._cpu_buffers[i], "resize_"):
+                    cls._cpu_buffers[i].resize_(0)
+                cls._cpu_buffers[i] = None
+
+        if len(cls._cpu_buffers) > INITIAL_CPU_BUFFER_COUNT:
+            del cls._cpu_buffers[INITIAL_CPU_BUFFER_COUNT:]
+        cls._cpu_free_buffers[cls._dtype] = [
+            (buf, None, None)
+            for buf in cls._cpu_buffers
+            if buf is not None
+        ]
+
+        for device_idx in cls._gpu_buffers:
+            if cls._gpu_buffers[device_idx] is not None and hasattr(cls._gpu_buffers[device_idx], "resize_"):
+                cls._gpu_buffers[device_idx].resize_(INITIAL_GPU_BUFFER_SIZE)
+
+    @classmethod
+    def cleanup(cls):
+        if not cls._initialized:
+            return
+
+        for i in range(len(cls._cpu_buffers)):
+            if cls._cpu_buffers[i] is not None and hasattr(cls._cpu_buffers[i], "resize_"):
+                cls._cpu_buffers[i].resize_(0)
+            cls._cpu_buffers[i] = None
+        cls._cpu_buffers = []
+        cls._cpu_free_buffers = {}
+
+        for device_idx in list(cls._gpu_buffers.keys()):
+            if cls._gpu_buffers[device_idx] is not None and hasattr(cls._gpu_buffers[device_idx], "resize_"):
+                cls._gpu_buffers[device_idx].resize_(0)
+            cls._gpu_buffers[device_idx] = None
+        cls._gpu_buffers = {}
+        cls._main_streams = {}
+        cls._extra_streams = {}
+        cls._initialized = False
+
+    def __init__(self, is_last_layer: bool = False):
+        self.is_last_layer = is_last_layer
+
+    @classmethod
+    def begin_checkpoint(cls, dtype=None):
+        """Per-call bookkeeping: initialize if needed, track layer index, return offloader."""
+        if not cls._initialized:
+            cls.initialize(dtype)
+        if cls._backward_pass:
+            cls._backward_pass = False
+            cls._current_gc_index = 0
+        if cls._first_pass:
+            cls._last_gc_index += 1
+        cls._current_gc_index += 1
+        is_last_layer = (cls._current_gc_index == cls._last_gc_index) and not cls._first_pass
+        return cls(is_last_layer=is_last_layer)
+
+    @classmethod
+    def _record_stream_event(cls, stream):
+        if cls._events_supported is False:
+            return None
+        try:
+            event = stream.record_event()
+            cls._events_supported = True
+            return event
+        except Exception:
+            cls._events_supported = False
+            return None
+
+    @classmethod
+    def _wait_event(cls, stream, event):
+        if event is None:
+            return False
+        try:
+            stream.wait_event(event)
+            return True
+        except Exception:
+            cls._events_supported = False
+            return False
+
+    def should_offload(self, tensor: torch.Tensor) -> bool:
+        cls = self.__class__
+        if _gc_disable_cpu_offload():
+            _gc_profile_record_skip("cpu_offload_disabled")
+            return False
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
+            if torch.compiler.is_compiling():
+                _gc_profile_record_skip("compiler_is_compiling")
+                return False
+        if tensor.numel() < cls._minimum_size:
+            _gc_profile_record_skip("below_minimum_size")
+            return False
+        if tensor.device.type == "cpu":
+            _gc_profile_record_skip("tensor_on_cpu")
+            return False
+        if self.is_last_layer:
+            _gc_profile_record_skip("last_layer")
+            return False
+        # Custom packed-buffer restore currently materializes contiguous tensors.
+        # Restrict offload to safe tensor layouts to preserve correctness.
+        if tensor.layout != torch.strided:
+            _gc_profile_record_skip("non_strided_layout")
+            return False
+        if (not tensor.is_contiguous()) or (tensor.storage_offset() != 0):
+            _gc_profile_record_skip("non_contiguous_or_offset")
+            return False
+        try:
+            if tensor._is_view():
+                _gc_profile_record_skip("tensor_view")
+                return False
+        except Exception:
+            pass
+        return True
+
+    @classmethod
+    def _acquire_cpu_buffer(cls, *, numel: int, dtype: torch.dtype, device_index: int):
+        pool = cls._cpu_free_buffers.setdefault(dtype, [])
+        chosen_idx = None
+        chosen_buf = None
+        # this whole bit may not be needed but in the future if we move to multi stream
+        # this will be helpful infra
+        # could be made more efficient so we don't over query events
+        for i in range(len(pool) - 1, -1, -1):
+            buf, fence_device_index, fence_event = pool[i]
+            # Skip other devices FIRST (avoid device switch + query)
+            if fence_device_index is not None and fence_device_index != device_index:
+                continue
+
+            ready = True
+            if fence_event is not None:
+                try:
+                    if DEVICE_TYPE in ("cuda", "hip") and fence_device_index is not None:
+                        with torch.cuda.device(fence_device_index):
+                            ready = bool(fence_event.query())
+                    elif DEVICE_TYPE == "xpu" and fence_device_index is not None:
+                        with torch.xpu.device(fence_device_index):
+                            ready = bool(fence_event.query())
+                    else:
+                        ready = bool(fence_event.query())
+                except Exception:
+                    ready = False
+            if not ready:
+                continue
+            if fence_device_index is not None and fence_device_index != device_index:
+                # Keep per-device stream-fenced buffers isolated.
+                continue
+            chosen_idx = i
+            chosen_buf = buf
+            break
+
+        if chosen_idx is not None:
+            pool.pop(chosen_idx)
+            allocated = False
+            if chosen_buf.numel() < numel:
+                chosen_buf = torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
+                allocated = True
+            return chosen_buf, True, allocated
+
+        return torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True), False, True
+
+    @classmethod
+    def _release_cpu_buffer(
+        cls,
+        *,
+        cpu_buffer: torch.Tensor,
+        dtype: torch.dtype,
+        device_index: int,
+        restore_event,
+    ) -> None:
+        pool = cls._cpu_free_buffers.setdefault(dtype, [])
+        pool.append((cpu_buffer, device_index, restore_event))
+
+    def pack_hook(self, tensor: torch.Tensor):
+        cls = self.__class__
+        if not self.should_offload(tensor):
+            return ("gpu", tensor)
+
+        device = tensor.device
+        device_index = device.index if device.index is not None else 0
+        numel = tensor.numel()
+        shape = tensor.shape
+        stride = tensor.stride()
+        dtype = tensor.dtype
+        requires_grad = tensor.requires_grad
+
+        if cls._use_unsloth_gc_message:
+            print("Unsloth: Will smartly offload gradients to save VRAM!")
+            cls._use_unsloth_gc_message = False
+
+        cpu_buffer, pool_hit, extra_allocated = cls._acquire_cpu_buffer(
+            numel=numel,
+            dtype=dtype,
+            device_index=device_index,
+        )
+
+        if DEVICE_TYPE in ("cuda", "hip"):
+            main_stream = torch.cuda.current_stream(device)
+        elif DEVICE_TYPE == "xpu":
+            main_stream = torch.xpu.current_stream(device)
+        else:
+            main_stream = cls._main_streams[device_index]
+        extra_stream = cls._extra_streams[device_index]
+        extra_stream.wait_stream(main_stream)
+        module_name = _gc_profile_module_name()
+        start_time = time.perf_counter() if _gc_profile_enabled() else 0.0
+        with torch_gpu_stream(extra_stream):
+            try:
+                tensor.record_stream(extra_stream)
+            except Exception:
+                pass
+            cpu_buffer[:numel].view(shape).copy_(tensor, non_blocking=True)
+        if _gc_profile_enabled():
+            _gc_profile_record(
+                mode = "nonreentrant_hooks",
+                module_name = module_name,
+                shape = shape,
+                dtype = dtype,
+                numel = numel,
+                kind = "pack",
+                duration_s = time.perf_counter() - start_time,
+                extra_allocated = extra_allocated,
+                pool_hit = pool_hit,
+            )
+        return PackedCPUBuffer(
+            shape,
+            stride,
+            dtype,
+            requires_grad,
+            device_index,
+            numel,
+            cpu_buffer,
+            cls,
+            module_name,
+        )
+
+    @classmethod
+    def unpack_packed(cls, packed):
+        cls._backward_pass = True
+        cls._first_pass = False
+
+        shape = packed.shape
+        original_stride = packed.stride
+        original_dtype = packed.dtype
+        original_requires_grad = packed.requires_grad
+        device_index = packed.device_index
+        numel = packed.numel
+        cpu_buffer = packed.cpu_buffer
+
+        device = torch.device(f"{DEVICE_TYPE_TORCH}:{device_index}")
+        if DEVICE_TYPE in ("cuda", "hip"):
+            main_stream = torch.cuda.current_stream(device)
+        elif DEVICE_TYPE == "xpu":
+            main_stream = torch.xpu.current_stream(device)
+        else:
+            main_stream = cls._main_streams[device_index]
+        extra_stream = cls._extra_streams[device_index]
+        module_name = packed.module_name
+        start_time = time.perf_counter() if _gc_profile_enabled() else 0.0
+        with torch_gpu_stream(extra_stream):
+            result = cpu_buffer[:numel].view(shape).to(
+                device = f"{DEVICE_TYPE_TORCH}:{device_index}",
+                non_blocking = True,
+            )
+            if tuple(result.stride()) != tuple(original_stride):
+                result = result.as_strided(shape, original_stride)
+            restore_event = cls._record_stream_event(extra_stream)
+            packed.set_restore_event(restore_event)
+        wait_start = time.perf_counter() if _gc_profile_enabled() else 0.0
+        wait_event_fallback = not cls._wait_event(main_stream, restore_event)
+        if wait_event_fallback:
+            main_stream.wait_stream(extra_stream)
+        wait_duration = (time.perf_counter() - wait_start) if _gc_profile_enabled() else 0.0
+        # Tell the allocator this tensor (allocated on extra_stream) is used
+        # by main_stream, so it must not be recycled until main_stream is done.
+        try:
+            result.record_stream(main_stream)
+        except Exception:
+            pass
+
+        if result.dtype != original_dtype:
+            result = result.to(original_dtype)
+        if result.requires_grad != original_requires_grad:
+            result.requires_grad_(original_requires_grad)
+        if _gc_profile_enabled():
+            _gc_profile_record(
+                mode = "nonreentrant_hooks",
+                module_name = module_name,
+                shape = shape,
+                dtype = original_dtype,
+                numel = numel,
+                kind = "unpack",
+                duration_s = time.perf_counter() - start_time,
+                wait_s = wait_duration,
+                wait_event_fallback = wait_event_fallback,
+            )
+        return result
+
+
+class PackedCPUBuffer:
+    """Packed representation for offloaded activations.
+
+    The backing pinned CPU buffer stays alive for as long as this object stays
+    alive, which matches saved_tensors_hooks lifetime requirements. Cleanup is
+    tied to object destruction instead of the start of a future forward pass.
+    """
+
+    __slots__ = (
+        "shape",
+        "stride",
+        "dtype",
+        "requires_grad",
+        "device_index",
+        "numel",
+        "module_name",
+        "_state",
+        "_finalizer",
+        "__weakref__",
+    )
+
+    def __init__(
+        self,
+        shape,
+        stride,
+        dtype,
+        requires_grad,
+        device_index,
+        numel,
+        cpu_buffer,
+        owner_cls,
+        module_name,
+    ):
+        self.shape = shape
+        self.stride = stride
+        self.dtype = dtype
+        self.requires_grad = requires_grad
+        self.device_index = device_index
+        self.numel = numel
+        self.module_name = module_name
+        self._state = {
+            "cpu_buffer": cpu_buffer,
+            "dtype": dtype,
+            "device_index": device_index,
+            "restore_event": None,
+            "released": False,
+            "owner_cls": owner_cls,
+        }
+        self._finalizer = weakref.finalize(self, PackedCPUBuffer._finalize, self._state)
+
+    @staticmethod
+    def _finalize(state):
+        if state["released"]:
+            return
+        state["released"] = True
+        state["owner_cls"]._release_cpu_buffer(
+            cpu_buffer=state["cpu_buffer"],
+            dtype=state["dtype"],
+            device_index=state["device_index"],
+            restore_event=state["restore_event"],
+        )
+
+    @property
+    def cpu_buffer(self):
+        return self._state["cpu_buffer"]
+
+    def set_restore_event(self, restore_event):
+        if not self._state["released"]:
+            self._state["restore_event"] = restore_event
+
+
+class UnslothOffloadActivations(torch.autograd.graph.saved_tensors_hooks):
+    """
+    All Unsloth Zoo code licensed under LGPLv3
+
+    Compile-compatible CPU activation offloading via saved_tensors_hooks.
+
+    This operates at the autograd runtime level, AFTER compiled graphs
+    produce tensors. saved_tensors_hooks are invisible to torch.compile,
+    so this avoids graph breaks entirely.
+
+    Reuses all existing UnslothGradientCheckpointer infrastructure:
+    buffer pooling, event-fenced reuse, async stream coordination.
+    """
+
+    def __init__(self, *, dtype=None, enabled=True):
+        self._enabled = enabled and not _gc_disable_cpu_offload()
+        self._dtype = dtype
+        self._offloader = None
+        self._first_pass = True
+        super().__init__(self._pack_hook, self._unpack_hook)
+
+    def __enter__(self):
+        if not self._enabled:
+            return self
+        cls = UnslothGradientCheckpointer
+        if not cls._initialized:
+            cls.initialize(self._dtype)
+        # Reset forward/backward state tracking for this forward pass
+        cls._backward_pass = False
+        cls._current_gc_index = 0
+        if self._first_pass:
+            cls._last_gc_index = 0
+        # Create a fresh offloader instance for this forward pass
+        self._offloader = cls(is_last_layer=False)
+        return super().__enter__()
+
+    def __exit__(self, *args):
+        if not self._enabled:
+            return
+        super().__exit__(*args)
+        self._first_pass = False
+
+    @staticmethod
+    def _should_offload(tensor):
+        """Mirrors UnslothGradientCheckpointer.should_offload() checks."""
+        cls = UnslothGradientCheckpointer
+        if not cls._meta_initialized:
+            cls.ensure_metadata()
+        # To restore the broader experimental behavior where hooks offload every
+        # large saved tensor in the checkpointed region, remove the
+        # `_hooks_offload_state` / `offloader.is_last_layer` gates below and let
+        # `_pack_hook()` use `self._offloader` directly again. That widens
+        # offload back to things like large saved weights, which increased
+        # Qwen3-VL traffic substantially in benchmarking.
+        state = _hooks_offload_state.get()
+        if state is None:
+            return False
+        offloader = state.get("offloader", None)
+        if offloader is None:
+            return False
+        if _gc_disable_cpu_offload():
+            return False
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
+            if torch.compiler.is_compiling():
+                return False
+        if tensor.numel() < cls._minimum_size:
+            return False
+        if tensor.device.type == "cpu":
+            return False
+        if offloader.is_last_layer:
+            return False
+        if tensor.layout != torch.strided:
+            return False
+        if (not tensor.is_contiguous()) or (tensor.storage_offset() != 0):
+            return False
+        try:
+            if tensor._is_view():
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _pack_hook(self, tensor):
+        if not self._enabled or self._offloader is None:
+            return tensor
+        state = _hooks_offload_state.get()
+        if state is None:
+            return ("gpu", tensor)
+        offloader = state.get("offloader", None)
+        if offloader is None or not self._should_offload(tensor):
+            return ("gpu", tensor)
+        return offloader.pack_hook(tensor)
+
+    def _unpack_hook(self, packed):
+        if not self._enabled:
+            return packed
+        if isinstance(packed, PackedCPUBuffer):
+            return UnslothGradientCheckpointer.unpack_packed(packed)
+        if isinstance(packed, tuple) and packed[0] == "gpu":
+            return packed[1]
+        return packed
+
 
 def initialize_unsloth_gradient_checkpointing(dtype = None):
     # All Unsloth Zoo code licensed under LGPLv3
@@ -386,10 +1522,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, run_function, preserve_rng_state, *args):
         # All Unsloth Zoo code licensed under LGPLv3
-        # check_backward_validity(args)
-        # Check if no requires_grad in inputs
         ctx.run_function = run_function
         ctx.preserve_rng_state = preserve_rng_state
+        ctx._gc_profile_module = _gc_profile_module_name()
         # Accommodates the (remote) possibility that autocast is enabled for cpu AND gpu.
         ctx.device_type = _infer_device_type(*args)
         ctx.device_autocast_kwargs, ctx.cpu_autocast_kwargs = _get_autocast_kwargs(
@@ -414,6 +1549,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
         tensor_inputs = []
         ctx._requires_gradient = False
         use_gpu_buffer = False
+        disable_cpu_offload = _gc_disable_cpu_offload()
 
         for i, arg in enumerate(args):
             if torch.is_tensor(arg):
@@ -435,7 +1571,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
                     global MINIMUM_SIZE
                     global CPU_INDEX
-                    if new_size > MINIMUM_SIZE and ((CURRENT_GC_INDEX != LAST_GC_INDEX) or FIRST_PASS):
+                    if (not disable_cpu_offload) and new_size > MINIMUM_SIZE and ((CURRENT_GC_INDEX != LAST_GC_INDEX) or FIRST_PASS):
                         use_gpu_buffer = True
                         global CPU_BUFFERS
                         global GPU_BUFFERS
@@ -467,11 +1603,25 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         x = x[:new_size].view(shape)
 
                         # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
+                        pack_start = time.perf_counter() if _gc_profile_enabled() else 0.0
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
                         with torch_gpu_stream(EXTRA_STREAM):
                             x.copy_(arg, non_blocking = True)
 
                         ctx._saved_metadata = (new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM,)
+                        if _gc_profile_enabled():
+                            ctx._gc_profile_shape = shape
+                            ctx._gc_profile_numel = new_size
+                            ctx._gc_profile_dtype = arg.dtype
+                            _gc_profile_record(
+                                mode = "reentrant",
+                                module_name = ctx._gc_profile_module,
+                                shape = shape,
+                                dtype = arg.dtype,
+                                numel = new_size,
+                                kind = "pack",
+                                duration_s = time.perf_counter() - pack_start,
+                            )
                         CPU_INDEX += 1
                         tensor_inputs.append(None)
 
@@ -522,11 +1672,11 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
         new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM = ctx._saved_metadata
         if CPU_INDEX is not None:
-            global GPU_BUFFER
             buffer = GPU_BUFFERS[device_index][:new_size].view(shape)
             x = CPU_BUFFERS[CPU_INDEX][:new_size].view(shape)
 
             # See https://pytorch.org/docs/stable/notes/cuda.html#cuda-streams
+            unpack_start = time.perf_counter() if _gc_profile_enabled() else 0.0
             EXTRA_STREAM.wait_stream(MAIN_STREAM)
             with torch_gpu_stream(EXTRA_STREAM):
                 buffer.copy_(x, non_blocking = True)
@@ -566,7 +1716,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 device_type=ctx.device_type, **ctx.device_autocast_kwargs
             ) if torch.amp.is_autocast_available(ctx.device_type) else contextlib.nullcontext()
 
-            # detached_inputs = detach_variable(tuple(inputs))
             detached_inputs = []
             for inp in inputs:
                 if not isinstance(inp, torch.Tensor):
@@ -579,10 +1728,23 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
             # Wait for GPU buffer to finish
             if CPU_INDEX is not None:
+                wait_start = time.perf_counter() if _gc_profile_enabled() else 0.0
                 MAIN_STREAM.wait_stream(EXTRA_STREAM)
+                wait_duration = (time.perf_counter() - wait_start) if _gc_profile_enabled() else 0.0
                 x = buffer.detach()
                 x.requires_grad_(True)
                 detached_inputs[0] = x
+                if _gc_profile_enabled():
+                    _gc_profile_record(
+                        mode = "reentrant",
+                        module_name = ctx._gc_profile_module,
+                        shape = getattr(ctx, "_gc_profile_shape", shape),
+                        dtype = getattr(ctx, "_gc_profile_dtype", x.dtype),
+                        numel = getattr(ctx, "_gc_profile_numel", new_size),
+                        kind = "unpack",
+                        duration_s = time.perf_counter() - unpack_start,
+                        wait_s = wait_duration,
+                    )
             pass
 
             with torch.enable_grad(), device_autocast_ctx, torch.amp.autocast("cpu", **ctx.cpu_autocast_kwargs):  # type: ignore[attr-defined]
@@ -604,10 +1766,6 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
         if len(outputs_with_grad) == 0:
             pass
-            # raise RuntimeError(
-            #     "none of output has requires_grad=True,"
-            #     " this checkpoint() is not necessary"
-            # )
         else:
             torch.autograd.backward(outputs_with_grad, args_with_grad)
         pass
@@ -627,193 +1785,145 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 pass
 
 
-from torch.utils.checkpoint import (
-    ContextManager,
-    _DEFAULT_DETERMINISM_MODE,
-    _checkpoint_without_reentrant_generator,
-    noop_context_fn,
-)
 @torch._disable_dynamo
+def _unsloth_checkpoint_reentrant(function, *args, preserve_rng_state=True):
+    return UnslothCheckpointFunction.apply(function, preserve_rng_state, *args)
+
+
+def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
+    """Non-reentrant checkpoint using native PyTorch checkpoint plus scoped input offload."""
+    preserve = kwargs.pop("preserve_rng_state", True)
+    context_fn = kwargs.pop("context_fn", noop_context_fn)
+    offload_backend = resolve_gc_offload_backend(kwargs.pop("offload_backend", None))
+    determinism_check = kwargs.pop("determinism_check", _DEFAULT_DETERMINISM_MODE)
+    debug = kwargs.pop("debug", False)
+
+    cls = UnslothGradientCheckpointer
+    determinism_check = "none"
+    dtype = None
+    first_arg = args[0] if args else None
+    if torch.is_tensor(first_arg):
+        dtype = first_arg.dtype
+
+    offloader = cls.begin_checkpoint(dtype)
+    old_checkpoint = getattr(torch.utils.checkpoint, "_old_checkpoint", None)
+    original_checkpoint = old_checkpoint or torch.utils.checkpoint.checkpoint
+
+    if _gc_disable_cpu_offload() or offload_backend == "hooks":
+        token = None
+        if (not _gc_disable_cpu_offload()) and offload_backend == "hooks":
+            token = _hooks_offload_state.set({
+                "offloader": offloader,
+            })
+        try:
+            return original_checkpoint(
+                function, *args,
+                use_reentrant=False,
+                preserve_rng_state=preserve,
+                context_fn=context_fn,
+                determinism_check=determinism_check,
+                debug=debug,
+                **kwargs
+            )
+        finally:
+            if token is not None:
+                _hooks_offload_state.reset(token)
+
+    token = _noop_offload_state.set({
+        "offloader": offloader,
+        # _NoopSaveInputs gets: (dummy, kwargs, *args), so first model arg is index 2.
+        "target_input_index": 2,
+    })
+    try:
+        return original_checkpoint(
+            function, *args,
+            use_reentrant=False,
+            preserve_rng_state=preserve,
+            context_fn=context_fn,
+            determinism_check=determinism_check,
+            debug=debug,
+            **kwargs
+        )
+    finally:
+        _noop_offload_state.reset(token)
+
+
 def unsloth_checkpoint(
     function,
     *args,
     use_reentrant: Optional[bool] = None,
-    context_fn: Callable[[], Tuple[ContextManager, ContextManager]] = noop_context_fn,
-    determinism_check: str = _DEFAULT_DETERMINISM_MODE,
-    debug: bool = False,
     **kwargs
 ):
-    r"""Checkpoint a model or part of the model.
+    """Unsloth gradient checkpoint: dispatches to reentrant or non-reentrant.
 
-    Activation checkpointing is a technique that trades compute for memory.
-    Instead of keeping tensors needed for backward alive until they are used in
-    gradient computation during backward, forward computation in checkpointed
-    regions omits saving tensors for backward and recomputes them during the
-    backward pass. Activation checkpointing can be applied to any part of a
-    model.
-
-    There are currently two checkpointing implementations available, determined
-    by the :attr:`use_reentrant` parameter. It is recommended that you use
-    ``use_reentrant=False``. Please refer the note below for a discussion of
-    their differences.
-
-    .. warning::
-
-        If the :attr:`function` invocation during the backward pass differs
-        from the forward pass, e.g., due to a global variable, the checkpointed
-        version may not be equivalent, potentially causing an
-        error being raised or leading to silently incorrect gradients.
-
-    .. warning::
-
-        The ``use_reentrant`` parameter should be passed explicitly. In version
-        2.4 we will raise an exception if ``use_reentrant`` is not passed.
-        If you are using the ``use_reentrant=True`` variant, please refer to the
-        note below for important considerations and potential limitations.
-
-    .. note::
-
-        The reentrant variant of checkpoint (``use_reentrant=True``) and
-        the non-reentrant variant of checkpoint (``use_reentrant=False``)
-        differ in the following ways:
-
-        * Non-reentrant checkpoint stops recomputation as soon as all needed
-          intermediate activations have been recomputed. This feature is enabled
-          by default, but can be disabled with :func:`set_checkpoint_early_stop`.
-          Reentrant checkpoint always recomputes :attr:`function` in its
-          entirety during the backward pass.
-
-        * The reentrant variant does not record the autograd graph during the
-          forward pass, as it runs with the forward pass under
-          :func:`torch.no_grad`. The non-reentrant version does record the
-          autograd graph, allowing one to perform backward on the graph within
-          checkpointed regions.
-
-        * The reentrant checkpoint only supports the
-          :func:`torch.autograd.backward` API for the backward pass without its
-          `inputs` argument, while the non-reentrant version supports all ways
-          of performing the backward pass.
-
-        * At least one input and output must have ``requires_grad=True`` for the
-          reentrant variant. If this condition is unmet, the checkpointed part
-          of the model will not have gradients. The non-reentrant version does
-          not have this requirement.
-
-        * The reentrant version does not consider tensors in nested structures
-          (e.g., custom objects, lists, dicts, etc) as participating in
-          autograd, while the non-reentrant version does.
-
-        * The reentrant checkpoint does not support checkpointed regions with
-          detached tensors from the computational graph, whereas the
-          non-reentrant version does. For the reentrant variant, if the
-          checkpointed segment contains tensors detached using ``detach()`` or
-          with :func:`torch.no_grad`, the backward pass will raise an error.
-          This is because ``checkpoint`` makes all the outputs require gradients
-          and this causes issues when a tensor is defined to have no gradient in
-          the model. To avoid this, detach the tensors outside of the
-          ``checkpoint`` function.
-
-    Args:
-        function: describes what to run in the forward pass of the model or
-            part of the model. It should also know how to handle the inputs
-            passed as the tuple. For example, in LSTM, if user passes
-            ``(activation, hidden)``, :attr:`function` should correctly use the
-            first input as ``activation`` and the second input as ``hidden``
-        preserve_rng_state(bool, optional):  Omit stashing and restoring
-            the RNG state during each checkpoint. Note that under torch.compile,
-            this flag doesn't take effect and we always preserve RNG state.
-            Default: ``True``
-        use_reentrant(bool):
-            specify whether to use the activation checkpoint variant that
-            requires reentrant autograd. This parameter should be passed
-            explicitly. In version 2.5 we will raise an exception if
-            ``use_reentrant`` is not passed. If ``use_reentrant=False``,
-            ``checkpoint`` will use an implementation that does not require
-            reentrant autograd. This allows ``checkpoint`` to support additional
-            functionality, such as working as expected with
-            ``torch.autograd.grad`` and support for keyword arguments input into
-            the checkpointed function.
-        context_fn(Callable, optional): A callable returning a tuple of two
-            context managers. The function and its recomputation will be run
-            under the first and second context managers respectively.
-            This argument is only supported if ``use_reentrant=False``.
-        determinism_check(str, optional): A string specifying the determinism
-            check to perform. By default it is set to ``"default"`` which
-            compares the shapes, dtypes, and devices of the recomputed tensors
-            against those the saved tensors. To turn off this check, specify
-            ``"none"``. Currently these are the only two supported values.
-            Please open an issue if you would like to see more determinism
-            checks. This argument is only supported if ``use_reentrant=False``,
-            if ``use_reentrant=True``, the determinism check is always disabled.
-        debug(bool, optional): If ``True``, error messages will also include
-            a trace of the operators ran during the original forward computation
-            as well as the recomputation. This argument is only supported if
-            ``use_reentrant=False``.
-        args: tuple containing inputs to the :attr:`function`
-
-    Returns:
-        Output of running :attr:`function` on :attr:`*args`
+    No @torch._disable_dynamo -- this is a pure dispatcher so it does not
+    create graph breaks for the non-reentrant path.
     """
     if use_reentrant is None:
-        warnings.warn(
-            "torch.utils.checkpoint: the use_reentrant parameter should be "
-            "passed explicitly. In version 2.5 we will raise an exception "
-            "if use_reentrant is not passed. use_reentrant=False is "
-            "recommended, but if you need to preserve the current default "
-            "behavior, you can pass use_reentrant=True. Refer to docs for more "
-            "details on the differences between the two variants.",
-            stacklevel=2
-        )
         use_reentrant = True
 
-    # Hack to mix *args with **kwargs in a python 2.7-compliant way
-    preserve = kwargs.pop("preserve_rng_state", True)
-    if kwargs and use_reentrant:
-        raise ValueError(
-            "Unexpected keyword arguments: " + ",".join(arg for arg in kwargs)
-        )
+    token = None
+    if _gc_profile_enabled():
+        module_name = _gc_profile_resolve_function_module_name(function)
+        if module_name is not None:
+            token = _gc_profile_module.set(module_name)
 
-    if use_reentrant:
-        if context_fn is not noop_context_fn or debug is not False:
-            raise ValueError(
-                "Passing `context_fn` or `debug` is only supported when "
-                "use_reentrant=False."
-            )
-        return UnslothCheckpointFunction.apply(function, preserve, *args)
-    else:
-        gen = _checkpoint_without_reentrant_generator(
-            function, preserve, context_fn, determinism_check, debug, *args, **kwargs
-        )
-        # Runs pre-forward logic
-        next(gen)
-        ret = function(*args, **kwargs)
-        # Runs post-forward logic
-        try:
-            next(gen)
-        except StopIteration:
-            return ret
+    try:
+        if use_reentrant:
+            preserve = kwargs.pop("preserve_rng_state", True)
+            if kwargs:
+                raise ValueError("Unexpected keyword arguments: " + ",".join(arg for arg in kwargs))
+            return _unsloth_checkpoint_reentrant(function, *args, preserve_rng_state=preserve)
+
+        return _unsloth_checkpoint_nonreentrant(function, *args, **kwargs)
+    finally:
+        if token is not None:
+            _gc_profile_module.reset(token)
 pass
 
 
-def patch_unsloth_smart_gradient_checkpointing(dtype = None):
+def patch_unsloth_smart_gradient_checkpointing(dtype = None, use_reentrant = None):
     # All Unsloth Zoo code licensed under LGPLv3
-    if torch.utils.checkpoint.CheckpointFunction.__name__ != "UnslothCheckpointFunction":
-        initialize_unsloth_gradient_checkpointing(dtype)
-        torch.utils.checkpoint._old_CheckpointFunction = torch.utils.checkpoint.CheckpointFunction
-        torch.utils.checkpoint.CheckpointFunction = UnslothCheckpointFunction
+    effective_use_reentrant = bool(use_reentrant) if use_reentrant is not None else True
+
+    if effective_use_reentrant:
+        UnslothGradientCheckpointer.cleanup()
+        if torch.utils.checkpoint.CheckpointFunction.__name__ != "UnslothCheckpointFunction":
+            initialize_unsloth_gradient_checkpointing(dtype)
+            torch.utils.checkpoint._old_CheckpointFunction = torch.utils.checkpoint.CheckpointFunction
+            torch.utils.checkpoint.CheckpointFunction = UnslothCheckpointFunction
+    else:
+        UnslothGradientCheckpointer.initialize(dtype)
+        if (torch.utils.checkpoint.CheckpointFunction.__name__ == "UnslothCheckpointFunction") and \
+            hasattr(torch.utils.checkpoint, "_old_CheckpointFunction"):
+            torch.utils.checkpoint.CheckpointFunction = torch.utils.checkpoint._old_CheckpointFunction
+            del torch.utils.checkpoint._old_CheckpointFunction
 
     if torch.utils.checkpoint.checkpoint.__name__ != "unsloth_checkpoint":
         torch.utils.checkpoint._old_checkpoint = torch.utils.checkpoint.checkpoint
         torch.utils.checkpoint.checkpoint = unsloth_checkpoint
+
+    try:
+        import transformers.modeling_utils
+        if hasattr(transformers.modeling_utils, "checkpoint") and \
+            transformers.modeling_utils.checkpoint.__name__ != "unsloth_checkpoint":
+            transformers.modeling_utils._old_checkpoint = transformers.modeling_utils.checkpoint
+            transformers.modeling_utils.checkpoint = unsloth_checkpoint
+    except Exception:
+        pass
+    _patch_noop_save_inputs()
 pass
 
 
 def unpatch_unsloth_smart_gradient_checkpointing():
     # All Unsloth Zoo code licensed under LGPLv3
+    UnslothGradientCheckpointer.cleanup()
+
     if (torch.utils.checkpoint.CheckpointFunction.__name__ == "UnslothCheckpointFunction") and \
         hasattr(torch.utils.checkpoint, "_old_CheckpointFunction"):
 
         torch.utils.checkpoint.CheckpointFunction = torch.utils.checkpoint._old_CheckpointFunction
+        del torch.utils.checkpoint._old_CheckpointFunction
         global CPU_BUFFERS
         global GPU_BUFFERS
         for i in range(len(CPU_BUFFERS)):
@@ -831,6 +1941,18 @@ def unpatch_unsloth_smart_gradient_checkpointing():
         hasattr(torch.utils.checkpoint, "_old_checkpoint"):
 
         torch.utils.checkpoint.checkpoint = torch.utils.checkpoint._old_checkpoint
+        del torch.utils.checkpoint._old_checkpoint
+
+    try:
+        import transformers.modeling_utils
+        if (hasattr(transformers.modeling_utils, "_old_checkpoint") and
+            hasattr(transformers.modeling_utils, "checkpoint") and
+            transformers.modeling_utils.checkpoint.__name__ == "unsloth_checkpoint"):
+            transformers.modeling_utils.checkpoint = transformers.modeling_utils._old_checkpoint
+            del transformers.modeling_utils._old_checkpoint
+    except Exception:
+        pass
+    _unpatch_noop_save_inputs()
 pass
 
 
@@ -859,6 +1981,8 @@ def reset_unsloth_gradient_checkpointing_buffers():
     global FIRST_PASS
     global CURRENT_GC_INDEX
     global USE_UNSLOTH_GC
+
+    UnslothGradientCheckpointer.reset_for_new_training()
 
     # Check if buffers exist
     if CPU_BUFFERS is None or GPU_BUFFERS is None:
@@ -904,12 +2028,8 @@ def reset_unsloth_gradient_checkpointing_buffers():
 pass
 
 
-@torch._disable_dynamo
 def unsloth_offloaded_gradient_checkpoint(function, *args, use_reentrant = None, **kwargs):
-    global CPU_BUFFERS
-    if len(CPU_BUFFERS) == 0:
-        initialize_unsloth_gradient_checkpointing(args[0].dtype)
-    return UnslothCheckpointFunction.apply(function, *args)
+    return unsloth_checkpoint(function, *args, use_reentrant = False, **kwargs)
 pass
 
 # Unsloth Zoo - Utilities for Unsloth

@@ -16,6 +16,7 @@
 
 import torch
 import math
+import functools
 import datasets
 from transformers import set_seed as transformers_set_seed
 from transformers import get_scheduler as transformers_get_scheduler
@@ -23,12 +24,15 @@ from transformers import Trainer
 from transformers.trainer_utils import seed_worker as trainer_utils_seed_worker
 from tqdm import tqdm as ProgressBar
 import time
-from typing import Any, Optional, List, Dict, Tuple
+from typing import Any, Optional
 from .utils import _get_dtype, Version
 from .hf_utils import dtype_from_config
 from .gradient_checkpointing import (
     unpatch_unsloth_gradient_checkpointing,
     unpatch_unsloth_smart_gradient_checkpointing,
+    _bind_gradient_checkpointing_func,
+    UnslothOffloadActivations,
+    resolve_gc_offload_backend,
 )
 import os
 import re
@@ -39,6 +43,52 @@ __all__ = [
     "prepare_model_for_training",
 ]
 
+
+def _resolve_offload_wrapper_target(model):
+    inner_model = model
+    while hasattr(inner_model, "model"):
+        inner_model = inner_model.model
+    return inner_model
+
+
+def _remove_hook_based_offload_wrapper(model):
+    target = getattr(model, "_unsloth_offload_wrapper_target", None)
+    original_forward = getattr(model, "_unsloth_offload_original_forward", None)
+    if target is not None and original_forward is not None:
+        target.forward = original_forward
+    if hasattr(model, "_unsloth_offload_wrapper_target"):
+        delattr(model, "_unsloth_offload_wrapper_target")
+    if hasattr(model, "_unsloth_offload_original_forward"):
+        delattr(model, "_unsloth_offload_original_forward")
+    if hasattr(model, "_unsloth_offload_ctx"):
+        delattr(model, "_unsloth_offload_ctx")
+    model._unsloth_offload_forward_installed = False
+
+
+def _install_hook_based_offload_wrapper(model, dtype):
+    target = _resolve_offload_wrapper_target(model)
+    current_target = getattr(model, "_unsloth_offload_wrapper_target", None)
+    if current_target is not None and current_target is not target:
+        _remove_hook_based_offload_wrapper(model)
+
+    if getattr(model, "_unsloth_offload_forward_installed", False):
+        return
+
+    offload_ctx = UnslothOffloadActivations(dtype=dtype)
+    original_forward = target.forward
+
+    @functools.wraps(original_forward)
+    def _offloading_forward(*args, **kwargs):
+        if target.training:
+            with offload_ctx:
+                return original_forward(*args, **kwargs)
+        return original_forward(*args, **kwargs)
+
+    target.forward = _offloading_forward
+    model._unsloth_offload_ctx = offload_ctx
+    model._unsloth_offload_original_forward = original_forward
+    model._unsloth_offload_wrapper_target = target
+    model._unsloth_offload_forward_installed = True
 
 @torch.inference_mode
 def fix_zero_training_loss(model, tokenizer, train_dataset):
@@ -200,18 +250,32 @@ def prepare_model_for_training(
     if use_gradient_checkpointing != "unsloth":
         unpatch_unsloth_gradient_checkpointing()
         unpatch_unsloth_smart_gradient_checkpointing()
+
+    def _enable_gc(_module):
+        if not hasattr(_module, "gradient_checkpointing_enable"):
+            return
+        try:
+            _module.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": use_reentrant},
+            )
+            return
+        except TypeError:
+            # Older HF signatures might not accept kwargs; fall back.
+            pass
+        _module.gradient_checkpointing_enable()
+
     m = model
     while hasattr(m, "model"):
         if use_gradient_checkpointing == "unsloth":
             m._offloaded_gradient_checkpointing = True
         if use_gradient_checkpointing == True and hasattr(m, "gradient_checkpointing_enable"):
-            m.gradient_checkpointing_enable()
+            _enable_gc(m)
         m = m.model
     pass
     if use_gradient_checkpointing == "unsloth":
         m._offloaded_gradient_checkpointing = True
     if use_gradient_checkpointing == True and hasattr(m, "gradient_checkpointing_enable"):
-        m.gradient_checkpointing_enable()
+        _enable_gc(m)
 
     # Also set HF version manually to stop failures
     if hasattr(model, "_set_gradient_checkpointing"):
@@ -222,6 +286,32 @@ def prepare_model_for_training(
             for module in model.modules():
                 if hasattr(module, "gradient_checkpointing"):
                     module.gradient_checkpointing = False
+
+    # HF caches checkpoint callables on modules; rebind to the active one so
+    # mode switches and monkey patches apply consistently.
+    if use_gradient_checkpointing in (True, "unsloth"):
+        checkpoint_fn = torch.utils.checkpoint.checkpoint
+        context_fn = getattr(model, "_unsloth_sac_context_fn", None)
+        effective_reentrant = getattr(model, "_unsloth_use_reentrant", None)
+        if type(effective_reentrant) is not bool:
+            effective_reentrant = bool(use_reentrant)
+        offload_backend = getattr(model, "_unsloth_gc_offload_backend", None)
+        offload_backend = resolve_gc_offload_backend(offload_backend)
+        model._unsloth_gc_offload_backend = offload_backend
+        _bind_gradient_checkpointing_func(
+            model, checkpoint_fn, effective_reentrant, context_fn, offload_backend,
+        )
+
+        if (
+            use_gradient_checkpointing == "unsloth" and
+            (not effective_reentrant) and
+            offload_backend == "hooks"
+        ):
+            _install_hook_based_offload_wrapper(model, dtype)
+        else:
+            _remove_hook_based_offload_wrapper(model)
+    else:
+        _remove_hook_based_offload_wrapper(model)
 
     # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
     if use_reentrant:
@@ -444,6 +534,7 @@ def unsloth_train(trainer):
     if leftover_samples == 0: leftover_ga = ga
 
     logging_steps = training_args.logging_steps
+
     # Go through each epoch
     start_time = time.time()
     with ProgressBar(total = max_steps, dynamic_ncols = True) as progress_bar:

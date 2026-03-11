@@ -17,9 +17,6 @@
 import torch
 from .utils import Version
 import os
-import math
-import functools
-from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
 from . import DEVICE_TYPE
@@ -282,6 +279,9 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
 
     # Check if model allows **kwargs
     m = self.model
+    # Unwrap torch.compile's OptimizedModule to access the original model
+    if hasattr(m, "_orig_mod"):
+        m = m._orig_mod
     if hasattr(m, "get_base_model"):
         # Removes PeftModelForCausalLM and gets internal model
         m = m.get_base_model()
@@ -377,7 +377,7 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     pass
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: num_items_in_batch = {num_items_in_batch}")
-    
+
     # [TODO] Unfortunately skip_guard_eval_unsafe = True fails
     # Increment counter and set compiler stance
     # if not hasattr(self.model, "vllm_engine"):
