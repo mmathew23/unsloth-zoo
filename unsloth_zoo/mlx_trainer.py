@@ -75,7 +75,9 @@ class MLXTrainingConfig:
     # Optimization
     optim: str = "adafactor"  # "adafactor", "adamw", "adam", "sgd", "muon", "lion"
     weight_decay: float = 0.01
-    max_grad_norm: float = 0.0  # 0 = disabled (default); > 0 adds overhead inside compile
+    max_grad_norm: float = (
+        0.0  # 0 = disabled (default); > 0 adds overhead inside compile
+    )
     seed: int = 3407
     lora_plus_ratio: float = 0.0  # 0 = disabled, 16.0 = recommended
 
@@ -214,14 +216,10 @@ class MLXTrainer:
         if warmup > 0:
             warmup_fn = optim.linear_schedule(0.0, lr, warmup)
             if callable(main_schedule):
-                return optim.join_schedules(
-                    [warmup_fn, main_schedule], [warmup + 1]
-                )
+                return optim.join_schedules([warmup_fn, main_schedule], [warmup + 1])
             else:
                 const_fn = optim.linear_schedule(lr, lr, decay_steps)
-                return optim.join_schedules(
-                    [warmup_fn, const_fn], [warmup + 1]
-                )
+                return optim.join_schedules([warmup_fn, const_fn], [warmup + 1])
 
         return main_schedule
 
@@ -291,9 +289,7 @@ class MLXTrainer:
 
         # Set wired memory limit (reduces page faults)
         if mx.metal.is_available():
-            mx.set_wired_limit(
-                mx.device_info()["max_recommended_working_set_size"]
-            )
+            mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
 
         # Apply gradient checkpointing if requested
         if args.gradient_checkpointing:
@@ -322,7 +318,10 @@ class MLXTrainer:
 
         if use_cce:
             loss_fn = make_cce_loss_fn(model)
-            print("Unsloth: Using CCE loss for memory-efficient training.")
+            cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
+            print(
+                f"Unsloth: Using CCE loss ({cce_backend}) for memory-efficient training."
+            )
         else:
             loss_fn = make_baseline_loss_fn()
             print("Unsloth: Using standard cross-entropy loss.")
@@ -345,7 +344,8 @@ class MLXTrainer:
         else:
             total_batches_needed = (
                 args.max_steps * args.gradient_accumulation_steps
-                if args.max_steps > 0 else None
+                if args.max_steps > 0
+                else None
             )
             batches = create_batches(
                 dataset=self.train_dataset,
@@ -367,15 +367,12 @@ class MLXTrainer:
         grad_accum = args.gradient_accumulation_steps
         if batches is not None:
             total_steps = (
-                args.max_steps if args.max_steps > 0
-                else len(batches) // grad_accum
+                args.max_steps if args.max_steps > 0 else len(batches) // grad_accum
             )
         else:
             total_steps = args.max_steps
             if total_steps <= 0:
-                raise ValueError(
-                    "max_steps must be > 0 when using streaming mode."
-                )
+                raise ValueError("max_steps must be > 0 when using streaming mode.")
 
         # Build optimizer with LR schedule
         optimizer = self._build_optimizer(total_steps)
@@ -432,8 +429,10 @@ class MLXTrainer:
                 formatting_func=self.formatting_func,
             )
             if eval_batches:
-                print(f"Unsloth: Eval enabled every {args.eval_steps} steps "
-                      f"({len(eval_batches)} eval batches).")
+                print(
+                    f"Unsloth: Eval enabled every {args.eval_steps} steps "
+                    f"({len(eval_batches)} eval batches)."
+                )
 
         features = []
         if use_cce:
@@ -447,10 +446,12 @@ class MLXTrainer:
         features.append(f"LR={args.lr_scheduler_type}")
         features.append(f"opt={args.optim}")
 
-        print(f"Unsloth: Training for {total_steps} steps, "
-              f"BS={args.per_device_train_batch_size}, "
-              f"grad_accum={grad_accum}, "
-              f"seq_len={args.max_seq_length}")
+        print(
+            f"Unsloth: Training for {total_steps} steps, "
+            f"BS={args.per_device_train_batch_size}, "
+            f"grad_accum={grad_accum}, "
+            f"seq_len={args.max_seq_length}"
+        )
         print(f"Unsloth: Features: {', '.join(features)}")
 
         # Training loop — mlx-lm pattern
@@ -474,10 +475,11 @@ class MLXTrainer:
                 batch_data = batches[batch_idx % len(batches)]
                 batch_idx += 1
 
-            do_update = (it % grad_accum == 0)
+            do_update = it % grad_accum == 0
 
             lvalue, toks, grad_accum_state = step(
-                batch_data[0], batch_data[1],
+                batch_data[0],
+                batch_data[1],
                 grad_accum_state,
                 do_update,
             )
@@ -521,8 +523,11 @@ class MLXTrainer:
                 train_time = 0
 
             # Eval
-            if (eval_batches and args.eval_steps > 0
-                    and current_step % args.eval_steps == 0):
+            if (
+                eval_batches
+                and args.eval_steps > 0
+                and current_step % args.eval_steps == 0
+            ):
                 val_loss, ppl = self._evaluate(eval_batches, loss_fn)
                 model.train()
                 print(
@@ -540,14 +545,17 @@ class MLXTrainer:
         total_time = time.perf_counter() - start_time
         avg_loss = (
             sum(self._train_loss_history) / len(self._train_loss_history)
-            if self._train_loss_history else 0.0
+            if self._train_loss_history
+            else 0.0
         )
 
-        print(f"\nUnsloth: Training complete! "
-              f"Avg loss: {avg_loss:.4f} | "
-              f"Total time: {total_time:.1f}s | "
-              f"Steps: {total_steps} | "
-              f"Tokens: {trained_tokens}")
+        print(
+            f"\nUnsloth: Training complete! "
+            f"Avg loss: {avg_loss:.4f} | "
+            f"Total time: {total_time:.1f}s | "
+            f"Steps: {total_steps} | "
+            f"Tokens: {trained_tokens}"
+        )
 
         return {
             "train_loss": avg_loss,
@@ -562,12 +570,16 @@ class MLXTrainer:
     def save_model(self, output_dir=None):
         """Save LoRA adapters (or full model if no LoRA)."""
         output_dir = output_dir or self.args.output_dir
-        save_lora_adapters(self.model, output_dir, adapter_config={
-            "learning_rate": self.args.learning_rate,
-            "max_steps": self.args.max_steps,
-            "max_seq_length": self.args.max_seq_length,
-            "use_cce": self.args.use_cce,
-        })
+        save_lora_adapters(
+            self.model,
+            output_dir,
+            adapter_config={
+                "learning_rate": self.args.learning_rate,
+                "max_steps": self.args.max_steps,
+                "max_seq_length": self.args.max_seq_length,
+                "use_cce": self.args.use_cce,
+            },
+        )
         self.tokenizer.save_pretrained(output_dir)
         print(f"Unsloth: Model saved to {output_dir}")
 
@@ -581,6 +593,7 @@ class MLXTrainer:
         """Upload model to HuggingFace Hub."""
         try:
             from mlx_lm import upload_to_hub
+
             upload_to_hub(
                 model=self.model,
                 tokenizer=self.tokenizer,
@@ -591,6 +604,7 @@ class MLXTrainer:
         except ImportError:
             import tempfile
             from huggingface_hub import HfApi
+
             with tempfile.TemporaryDirectory() as tmp:
                 self.save_model(tmp)
                 api = HfApi()
