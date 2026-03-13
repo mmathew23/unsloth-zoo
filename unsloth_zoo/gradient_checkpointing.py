@@ -874,6 +874,91 @@ def _gc_disable_cpu_offload():
 pass
 
 
+_pinned_bytes_allocated: int = 0
+_cpu_ram_warned: bool = False
+
+def _check_cpu_ram_before_pin(alloc_bytes: int):
+    """Check CPU RAM availability before pinned allocation.
+
+    Pinned memory (cudaHostAlloc) locks physical pages and cannot be swapped.
+    Exhaustion produces cryptic CUDA errors rather than clean Python MemoryError.
+    This checks once per new allocation and warns with actionable context.
+    """
+    global _cpu_ram_warned, _pinned_bytes_allocated
+    if _cpu_ram_warned:
+        return
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+    except ImportError:
+        return
+
+    avail = mem.available
+    total = mem.total
+    pct_used = mem.percent
+    new_total_pinned = _pinned_bytes_allocated + alloc_bytes
+
+    # Warn if: >85% used AND this alloc would consume >50% of remaining,
+    # or >95% used regardless of alloc size
+    headroom_ratio = alloc_bytes / avail if avail > 0 else float("inf")
+    critical = pct_used > 95 or (pct_used > 85 and headroom_ratio > 0.5)
+    if not critical:
+        return
+
+    _cpu_ram_warned = True
+    warnings.warn(
+        f"\nUnsloth: CPU RAM is {pct_used:.0f}% used "
+        f"({avail / 2**30:.1f}GB free / {total / 2**30:.1f}GB total). "
+        f"Pinned memory allocated by Unsloth so far: {_pinned_bytes_allocated / 2**30:.2f}GB. "
+        f"Next allocation: {alloc_bytes / 2**20:.0f}MB. "
+        f"Pinned memory cannot be swapped and exhaustion causes cryptic CUDA errors. "
+        f"To disable CPU offloading: set UNSLOTH_GC_DISABLE_CPU_OFFLOAD=1",
+        stacklevel=4,
+    )
+
+
+def _track_pinned_alloc(numel: int, dtype: torch.dtype):
+    """Track bytes allocated as pinned memory."""
+    global _pinned_bytes_allocated
+    n_bytes = torch.finfo(dtype).bits // 8 if dtype.is_floating_point else dtype.itemsize
+    alloc_bytes = numel * n_bytes
+    _check_cpu_ram_before_pin(alloc_bytes)
+    _pinned_bytes_allocated += alloc_bytes
+
+
+def _unwrap_dtensor(tensor):
+    """Unwrap FSDP2 DTensor to its local shard.
+
+    DTensor overrides .copy_(), .to(), etc. to coordinate across ranks.
+    For CPU offloading we only need the raw local bytes on this GPU,
+    so we extract ._local_tensor to avoid triggering distributed dispatch.
+    Plain tensors pass through unchanged.
+    """
+    if hasattr(tensor, "_local_tensor"):
+        return tensor._local_tensor
+    return tensor
+
+
+# In practice you probably don't need to rewrap after restoring from CPU,
+# because autograd only needs the local shard for backward and FSDP2
+# handles gradient reduction separately. Kept here for completeness
+# in case a future codepath requires DTensor metadata on restored tensors.
+#
+# def _rewrap_dtensor(restored, original):
+#     """Re-wrap a plain tensor as DTensor using the original's metadata."""
+#     if hasattr(original, "_spec") and hasattr(original, "device_mesh"):
+#         try:
+#             from torch.distributed.tensor import DTensor
+#             return DTensor.from_local(
+#                 restored,
+#                 device_mesh=original.device_mesh,
+#                 placements=original.placements,
+#             )
+#         except Exception:
+#             pass
+#     return restored
+
+
 class UnslothGradientCheckpointer:
     """
     All Unsloth Zoo code licensed under LGPLv3
@@ -934,6 +1019,7 @@ class UnslothGradientCheckpointer:
         cls._minimum_size = 2 * 1024 * 1024 // n_bytes
         cls._meta_initialized = True
 
+        _track_pinned_alloc(INITIAL_CPU_BUFFER_SIZE * INITIAL_CPU_BUFFER_COUNT, dtype)
         cls._cpu_buffers = [
             torch.empty(INITIAL_CPU_BUFFER_SIZE, dtype=dtype, device="cpu", pin_memory=True)
             for _ in range(INITIAL_CPU_BUFFER_COUNT)
@@ -969,9 +1055,12 @@ class UnslothGradientCheckpointer:
 
     @classmethod
     def reset_for_new_training(cls):
+        global _pinned_bytes_allocated, _cpu_ram_warned
         if not cls._initialized:
             return
 
+        _pinned_bytes_allocated = 0
+        _cpu_ram_warned = False
         cls._cpu_free_buffers = {}
         cls._current_gc_index = 0
         cls._last_gc_index = 0
@@ -1066,6 +1155,15 @@ class UnslothGradientCheckpointer:
         if _gc_disable_cpu_offload():
             _gc_profile_record_skip("cpu_offload_disabled")
             return False
+        # Skip parameter-like tensors (requires_grad=True leaf tensors).
+        # Under FSDP, all-gathered params lose nn.Parameter type, but
+        # they remain leaf tensors (no grad_fn). Activations always have grad_fn.
+        if tensor.requires_grad and tensor.grad_fn is None:
+            _gc_profile_record_skip("parameter_like_tensor")
+            return False
+        # Unwrap FSDP2 DTensors so .numel(), .is_contiguous(), etc.
+        # check the local shard, not the virtualized distributed shape.
+        tensor = _unwrap_dtensor(tensor)
         if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
             if torch.compiler.is_compiling():
                 _gc_profile_record_skip("compiler_is_compiling")
@@ -1135,10 +1233,12 @@ class UnslothGradientCheckpointer:
             pool.pop(chosen_idx)
             allocated = False
             if chosen_buf.numel() < numel:
+                _track_pinned_alloc(numel, dtype)
                 chosen_buf = torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
                 allocated = True
             return chosen_buf, True, allocated
 
+        _track_pinned_alloc(numel, dtype)
         return torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True), False, True
 
     @classmethod
@@ -1158,6 +1258,8 @@ class UnslothGradientCheckpointer:
         if not self.should_offload(tensor):
             return ("gpu", tensor)
 
+        # Unwrap DTensor to local shard for plain memcpy (avoids distributed dispatch)
+        tensor = _unwrap_dtensor(tensor)
         device = tensor.device
         device_index = device.index if device.index is not None else 0
         numel = tensor.numel()
@@ -1264,6 +1366,10 @@ class UnslothGradientCheckpointer:
             result = result.to(original_dtype)
         if result.requires_grad != original_requires_grad:
             result.requires_grad_(original_requires_grad)
+        # Restored tensor is a plain torch.Tensor (local shard).
+        # No DTensor rewrap needed: autograd uses local shard for
+        # backward, and FSDP2 handles gradient reduction separately.
+        # result = _rewrap_dtensor(result, original_dtensor)
         if _gc_profile_enabled():
             _gc_profile_record(
                 mode = "nonreentrant_hooks",
@@ -1412,6 +1518,10 @@ class UnslothOffloadActivations(torch.autograd.graph.saved_tensors_hooks):
             return False
         if _gc_disable_cpu_offload():
             return False
+        if tensor.requires_grad and tensor.grad_fn is None:
+            return False
+        # Unwrap FSDP2 DTensors so checks see the local shard
+        tensor = _unwrap_dtensor(tensor)
         if hasattr(torch, "compiler") and hasattr(torch.compiler, "is_compiling"):
             if torch.compiler.is_compiling():
                 return False
@@ -1480,6 +1590,7 @@ def initialize_unsloth_gradient_checkpointing(dtype = None):
         dtype = torch.bfloat16 if SUPPORTS_BFLOAT16 else torch.float16
     pass
 
+    _track_pinned_alloc(128*1024 * 200, dtype)
     for i in range(200):
         x = torch.empty(128*1024, dtype = dtype, device = "cpu", pin_memory = True)
         CPU_BUFFERS.append(x)
@@ -1567,7 +1678,9 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                     CURRENT_GC_INDEX += 1
 
                     ctx._requires_gradient = True
-                    new_size = arg.numel()
+                    # Unwrap DTensor to local shard for plain memcpy
+                    _arg = _unwrap_dtensor(arg)
+                    new_size = _arg.numel()
 
                     global MINIMUM_SIZE
                     global CPU_INDEX
@@ -1578,7 +1691,7 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         global BACKWARD_PASS
                         global EXTRA_STREAMS
                         global MAIN_STREAMS
-                        device = arg.device
+                        device = _arg.device
                         device_index = device.index
                         GPU_BUFFER   = GPU_BUFFERS  [device_index]
                         MAIN_STREAM  = MAIN_STREAMS [device_index]
@@ -1592,12 +1705,13 @@ class UnslothCheckpointFunction(torch.autograd.Function):
 
                         # Extend buffer size
                         if CPU_INDEX >= len(CPU_BUFFERS):
-                            x = torch.empty(new_size, dtype = arg.dtype, device = "cpu", pin_memory = True)
+                            _track_pinned_alloc(new_size, _arg.dtype)
+                            x = torch.empty(new_size, dtype = _arg.dtype, device = "cpu", pin_memory = True)
                             CPU_BUFFERS.append(x)
                         pass
 
                         x = CPU_BUFFERS[CPU_INDEX]
-                        shape = arg.shape
+                        shape = _arg.shape
                         if new_size > x.numel(): x.resize_(new_size)
                         if new_size > GPU_BUFFER.numel(): GPU_BUFFER.resize_(new_size)
                         x = x[:new_size].view(shape)
@@ -1606,13 +1720,13 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                         pack_start = time.perf_counter() if _gc_profile_enabled() else 0.0
                         EXTRA_STREAM.wait_stream(MAIN_STREAM)
                         with torch_gpu_stream(EXTRA_STREAM):
-                            x.copy_(arg, non_blocking = True)
+                            x.copy_(_arg, non_blocking = True)
 
                         ctx._saved_metadata = (new_size, shape, CPU_INDEX, device_index, MAIN_STREAM, EXTRA_STREAM,)
                         if _gc_profile_enabled():
                             ctx._gc_profile_shape = shape
                             ctx._gc_profile_numel = new_size
-                            ctx._gc_profile_dtype = arg.dtype
+                            ctx._gc_profile_dtype = _arg.dtype
                             _gc_profile_record(
                                 mode = "reentrant",
                                 module_name = ctx._gc_profile_module,
@@ -1733,6 +1847,10 @@ class UnslothCheckpointFunction(torch.autograd.Function):
                 wait_duration = (time.perf_counter() - wait_start) if _gc_profile_enabled() else 0.0
                 x = buffer.detach()
                 x.requires_grad_(True)
+                # Restored tensor is a plain torch.Tensor (local shard).
+                # No DTensor rewrap needed: autograd uses local shard for
+                # backward, and FSDP2 handles gradient reduction separately.
+                # x = _rewrap_dtensor(x, original_dtensor)
                 detached_inputs[0] = x
                 if _gc_profile_enabled():
                     _gc_profile_record(
