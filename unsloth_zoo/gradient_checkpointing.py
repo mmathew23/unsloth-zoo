@@ -968,6 +968,10 @@ class UnslothGradientCheckpointer:
     _cpu_buffers: List[torch.Tensor] = []
     _cpu_free_buffers: dict = {}
     _gpu_buffers: dict = {}
+    # Persistent GPU restore buffer -- mirrors reentrant's GPU_BUFFERS pattern.
+    # One buffer per (dtype, device_index), never freed, only grown.
+    # Avoids CUDA allocator fragmentation from repeated alloc/free during backward.
+    _gpu_restore_persistent: dict = {}  # (dtype, device_index) -> GPU tensor
     _main_streams: dict = {}
     _extra_streams: dict = {}
     _initialized: bool = False
@@ -1000,7 +1004,6 @@ class UnslothGradientCheckpointer:
 
     @classmethod
     def initialize(cls, dtype: torch.dtype = None, num_devices: int = None):
-        print('non reentrant initialized')
         if cls._initialized:
             return
 
@@ -1088,6 +1091,7 @@ class UnslothGradientCheckpointer:
         for device_idx in cls._gpu_buffers:
             if cls._gpu_buffers[device_idx] is not None and hasattr(cls._gpu_buffers[device_idx], "resize_"):
                 cls._gpu_buffers[device_idx].resize_(INITIAL_GPU_BUFFER_SIZE)
+        # Keep persistent GPU restore buffers allocated -- they'll be reused next training.
 
     @classmethod
     def cleanup(cls):
@@ -1106,6 +1110,10 @@ class UnslothGradientCheckpointer:
                 cls._gpu_buffers[device_idx].resize_(0)
             cls._gpu_buffers[device_idx] = None
         cls._gpu_buffers = {}
+        for key, buf in cls._gpu_restore_persistent.items():
+            if buf is not None and hasattr(buf, "resize_"):
+                buf.resize_(0)
+        cls._gpu_restore_persistent = {}
         cls._main_streams = {}
         cls._extra_streams = {}
         cls._initialized = False
@@ -1253,6 +1261,23 @@ class UnslothGradientCheckpointer:
         pool = cls._cpu_free_buffers.setdefault(dtype, [])
         pool.append((cpu_buffer, device_index, restore_event))
 
+    @classmethod
+    def _get_gpu_restore_buffer(cls, *, numel: int, dtype: torch.dtype, device_index: int):
+        """Get persistent GPU restore buffer, matching reentrant's GPU_BUFFERS pattern.
+
+        One buffer per (dtype, device_index). Never freed, only grown via resize_().
+        Eliminates CUDA allocator fragmentation from repeated alloc/free during backward.
+        """
+        key = (dtype, device_index)
+        buf = cls._gpu_restore_persistent.get(key)
+        if buf is None:
+            buf = torch.empty(numel, dtype=dtype,
+                device=f"{DEVICE_TYPE_TORCH}:{device_index}")
+            cls._gpu_restore_persistent[key] = buf
+        elif buf.numel() < numel:
+            buf.resize_(numel)
+        return buf
+
     def pack_hook(self, tensor: torch.Tensor):
         cls = self.__class__
         if not self.should_offload(tensor):
@@ -1341,11 +1366,13 @@ class UnslothGradientCheckpointer:
         extra_stream = cls._extra_streams[device_index]
         module_name = packed.module_name
         start_time = time.perf_counter() if _gc_profile_enabled() else 0.0
+        gpu_buf = cls._get_gpu_restore_buffer(
+            numel=numel, dtype=original_dtype, device_index=device_index,
+        )
+        extra_stream.wait_stream(main_stream)
         with torch_gpu_stream(extra_stream):
-            result = cpu_buffer[:numel].view(shape).to(
-                device = f"{DEVICE_TYPE_TORCH}:{device_index}",
-                non_blocking = True,
-            )
+            gpu_buf[:numel].copy_(cpu_buffer[:numel], non_blocking=True)
+            result = gpu_buf[:numel].view(shape)
             if tuple(result.stride()) != tuple(original_stride):
                 result = result.as_strided(shape, original_stride)
             restore_event = cls._record_stream_event(extra_stream)
@@ -1355,12 +1382,6 @@ class UnslothGradientCheckpointer:
         if wait_event_fallback:
             main_stream.wait_stream(extra_stream)
         wait_duration = (time.perf_counter() - wait_start) if _gc_profile_enabled() else 0.0
-        # Tell the allocator this tensor (allocated on extra_stream) is used
-        # by main_stream, so it must not be recycled until main_stream is done.
-        try:
-            result.record_stream(main_stream)
-        except Exception:
-            pass
 
         if result.dtype != original_dtype:
             result = result.to(original_dtype)
