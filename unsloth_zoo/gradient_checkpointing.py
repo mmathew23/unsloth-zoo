@@ -499,8 +499,10 @@ def set_sac_policy(model, policy):
 
 
 def set_offload_backend(model, backend):
+    global _default_offload_backend
     backend = resolve_gc_offload_backend(backend)
     model._unsloth_gc_offload_backend = backend
+    _default_offload_backend = backend
     use_reentrant = getattr(model, "_unsloth_use_reentrant", True)
     context_fn = getattr(model, "_unsloth_sac_context_fn", None)
     checkpoint_fn = torch.utils.checkpoint.checkpoint
@@ -782,6 +784,10 @@ CPU_BUFFERS = []
 CPU_INDEX = None
 _noop_offload_state: ContextVar[Optional[dict]] = ContextVar("_noop_offload_state", default=None)
 _hooks_offload_state: ContextVar[Optional[dict]] = ContextVar("_hooks_offload_state", default=None)
+# Module-level default offload backend, set by set_offload_backend().
+# Used as fallback when HF's gradient_checkpointing_enable() overwrites the
+# per-module partial binding and drops the offload_backend kwarg.
+_default_offload_backend: Optional[str] = None
 pass
 
 
@@ -799,7 +805,6 @@ def _patch_noop_save_inputs():
             return UnslothGradientCheckpointer._original_noop_setup_context(ctx, inputs, output)
 
         offloader = state.get("offloader", None)
-        target_input_index = int(state.get("target_input_index", 2))
         if offloader is None:
             return UnslothGradientCheckpointer._original_noop_setup_context(ctx, inputs, output)
 
@@ -816,12 +821,7 @@ def _patch_noop_save_inputs():
                 non_tensor_values[i] = o
                 continue
 
-            should_try_offload = (
-                i == target_input_index and
-                o.requires_grad and
-                o.device.type != "cpu"
-            )
-            if should_try_offload:
+            if offloader.should_offload(o):
                 packed = offloader.pack_hook(o)
                 if isinstance(packed, PackedCPUBuffer):
                     off_idx = len(offloaded)
@@ -1933,7 +1933,9 @@ def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
     """Non-reentrant checkpoint using native PyTorch checkpoint plus scoped input offload."""
     preserve = kwargs.pop("preserve_rng_state", True)
     context_fn = kwargs.pop("context_fn", noop_context_fn)
-    offload_backend = resolve_gc_offload_backend(kwargs.pop("offload_backend", None))
+    offload_backend = resolve_gc_offload_backend(
+        kwargs.pop("offload_backend", None) or _default_offload_backend
+    )
     determinism_check = kwargs.pop("determinism_check", _DEFAULT_DETERMINISM_MODE)
     debug = kwargs.pop("debug", False)
 
@@ -1970,8 +1972,6 @@ def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
 
     token = _noop_offload_state.set({
         "offloader": offloader,
-        # _NoopSaveInputs gets: (dummy, kwargs, *args), so first model arg is index 2.
-        "target_input_index": 2,
     })
     try:
         return original_checkpoint(
