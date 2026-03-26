@@ -287,9 +287,25 @@ class MLXTrainer:
         args = self.args
         model = self.model
 
-        # Set wired memory limit (reduces page faults)
+        # Memory management: be a good citizen on shared hardware.
+        #
+        # Apple's max_recommended_working_set_size is ~75% of physical RAM,
+        # leaving room for the OS, browsers, etc. We use it as both the
+        # memory limit (scheduler stalls to avoid pushing other apps to swap)
+        # and the wired limit (keeps our pages resident to avoid faults).
+        #
+        # Cache limit prevents the allocator pool from hoarding freed buffers.
+        # Without a limit, the pool grows to 30+ GB for large batch sizes.
+        # We cap it at 2x the model's active memory — enough for intra-step
+        # buffer recycling, but not unlimited growth.
         if mx.metal.is_available():
-            mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+            recommended = mx.device_info()["max_recommended_working_set_size"]
+            mx.set_wired_limit(recommended)
+            mx.set_memory_limit(recommended)
+
+            mx.eval(model.parameters())
+            active_after_load = mx.get_active_memory()
+            mx.set_cache_limit(active_after_load * 2)
 
         # Apply gradient checkpointing if requested
         if args.gradient_checkpointing:
@@ -489,6 +505,13 @@ class MLXTrainer:
             steps += 1
             mx.eval(state, losses, n_tokens, grad_accum_state)
             train_time += time.perf_counter() - tic
+
+            # Clear the allocator cache after the first step (warmup/compilation).
+            # Step 1 creates mismatched buffer sizes that pollute the cache pool
+            # with buffers that won't be reused in steady-state. Clearing forces
+            # step 2 to rebuild the pool with only the sizes it actually needs.
+            if it == 1:
+                mx.clear_cache()
 
             # Only log/eval on actual optimizer steps
             if not do_update:
