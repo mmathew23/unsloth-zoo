@@ -454,7 +454,9 @@ class MLXTrainer:
                 )
 
                 # Scale gradient by token count: ∇(sum_CE/toks) * toks = ∇(sum_CE)
-                grad = tree_map(lambda g: g * toks, grad)
+                # Cast toks to float32 to prevent fp16 overflow (fp16 max=65504)
+                toks_f = toks.astype(mx.float32)
+                grad = tree_map(lambda g: g * toks_f, grad)
 
                 if prev_state is not None:
                     prev_grad, prev_toks = prev_state
@@ -465,7 +467,8 @@ class MLXTrainer:
 
                 if do_update:
                     # Normalize by total tokens across all micro-batches
-                    grad = tree_map(lambda g: g / toks_accum, grad)
+                    toks_accum_f = toks_accum.astype(mx.float32)
+                    grad = tree_map(lambda g: g / toks_accum_f, grad)
                     if use_lora_plus:
                         flat = tree_flatten(grad)
                         scaled = [
@@ -486,7 +489,9 @@ class MLXTrainer:
                 (lvalue, toks), grad = loss_and_grad_fn(model, batch, lengths)
 
                 # Scale gradient by token count: ∇(sum_CE/toks) * toks = ∇(sum_CE)
-                grad = tree_map(lambda g: g * toks, grad)
+                # Cast toks to float32 to prevent fp16 overflow (fp16 max=65504)
+                toks_f = toks.astype(mx.float32)
+                grad = tree_map(lambda g: g * toks_f, grad)
 
                 if prev_state is not None:
                     prev_grad, prev_toks = prev_state
@@ -497,7 +502,8 @@ class MLXTrainer:
 
                 if do_update:
                     # Normalize by total tokens across all micro-batches
-                    grad = tree_map(lambda g: g / toks_accum, grad)
+                    toks_accum_f = toks_accum.astype(mx.float32)
+                    grad = tree_map(lambda g: g / toks_accum_f, grad)
                     if use_lora_plus:
                         flat = tree_flatten(grad)
                         scaled = [
