@@ -49,13 +49,18 @@ from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from .mlx_utils import (
     make_cce_loss_fn,
     make_baseline_loss_fn,
+    make_packed_cce_loss_fn,
+    make_packed_baseline_loss_fn,
     has_cce_kernel,
     create_batches,
+    create_packed_batches,
     iterate_training_batches,
     save_lora_adapters,
     save_merged_model,
     apply_gradient_checkpointing,
     remove_gradient_checkpointing,
+    apply_packing_patches,
+    remove_packing_patches,
 )
 
 
@@ -317,6 +322,8 @@ class MLXTrainer:
         finally:
             if args.gradient_checkpointing:
                 remove_gradient_checkpointing(model)
+            if args.packing:
+                remove_packing_patches(model)
 
     def _train_inner(self):
         """Inner training loop, separated for GC cleanup in finally block."""
@@ -325,26 +332,54 @@ class MLXTrainer:
 
         # Pick loss function — returns (loss, ntoks) tuples
         use_cce = args.use_cce and has_cce_kernel()
-        if args.use_cce and not has_cce_kernel():
-            print(
-                "Unsloth: mx.fast.cce_loss not found. "
-                "Install mlx-cce for memory-efficient CCE. "
-                "Falling back to standard cross-entropy."
-            )
+        use_packing = args.packing
 
-        if use_cce:
-            loss_fn = make_cce_loss_fn(model)
-            cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
-            print(
-                f"Unsloth: Using CCE loss ({cce_backend}) for memory-efficient training."
-            )
+        if use_packing:
+            # Packing mode: use packed loss functions
+            if use_cce:
+                loss_fn = make_packed_cce_loss_fn(model)
+                print("Unsloth: Using packed CCE loss (sequence packing enabled).")
+            else:
+                loss_fn = make_packed_baseline_loss_fn()
+                print("Unsloth: Using packed baseline loss (sequence packing enabled).")
+            apply_packing_patches(model)
         else:
-            loss_fn = make_baseline_loss_fn()
-            print("Unsloth: Using standard cross-entropy loss.")
+            if args.use_cce and not has_cce_kernel():
+                print(
+                    "Unsloth: mx.fast.cce_loss not found. "
+                    "Install mlx-cce for memory-efficient CCE. "
+                    "Falling back to standard cross-entropy."
+                )
+            if use_cce:
+                loss_fn = make_cce_loss_fn(model)
+                cce_backend = getattr(loss_fn, "_unsloth_cce_backend", "unknown")
+                print(
+                    f"Unsloth: Using CCE loss ({cce_backend}) for memory-efficient training."
+                )
+            else:
+                loss_fn = make_baseline_loss_fn()
+                print("Unsloth: Using standard cross-entropy loss.")
 
         # Prepare data — determine total_steps first
         if self._batches is not None:
             batches = self._batches
+            batch_iter = None
+        elif use_packing:
+            total_batches_needed = (
+                args.max_steps * args.gradient_accumulation_steps
+                if args.max_steps > 0
+                else None
+            )
+            batches = create_packed_batches(
+                dataset=self.train_dataset,
+                tokenizer=self.tokenizer,
+                batch_size=args.per_device_train_batch_size,
+                max_seq_length=args.max_seq_length,
+                num_batches=total_batches_needed,
+                seed=args.seed,
+                dataset_text_field=args.dataset_text_field,
+                formatting_func=self.formatting_func,
+            )
             batch_iter = None
         elif args.streaming:
             batches = None
@@ -406,28 +441,78 @@ class MLXTrainer:
         max_grad_norm = args.max_grad_norm
         state = [model.state, optimizer.state, mx.random.state]
 
-        def step(batch, lengths, prev_grad, do_update):
-            (lvalue, toks), grad = loss_and_grad_fn(model, batch, lengths)
+        # Token-weighted gradient accumulation:
+        # loss_fn returns (loss=sum_CE/ntoks, ntoks). The gradient ∇loss is
+        # scaled by 1/ntoks. To combine micro-batches correctly, we scale
+        # each gradient by its ntoks (recovering ∇sum_CE), accumulate, then
+        # divide by total tokens. This ensures every token has equal weight
+        # regardless of how many tokens each micro-batch has.
+        if use_packing:
+            def step(batch, loss_mask, attn_mask, position_ids, prev_state, do_update):
+                (lvalue, toks), grad = loss_and_grad_fn(
+                    model, batch, loss_mask, attn_mask, position_ids
+                )
 
-            if prev_grad is not None:
-                grad = tree_map(lambda x, y: x + y, grad, prev_grad)
+                # Scale gradient by token count: ∇(sum_CE/toks) * toks = ∇(sum_CE)
+                grad = tree_map(lambda g: g * toks, grad)
 
-            if do_update:
-                if grad_accum > 1:
-                    grad = tree_map(lambda x: x / grad_accum, grad)
-                if use_lora_plus:
-                    flat = tree_flatten(grad)
-                    scaled = [
-                        (k, v * lora_plus_ratio if "lora_b" in k else v)
-                        for k, v in flat
-                    ]
-                    grad = tree_unflatten(scaled)
-                if max_grad_norm > 0:
-                    grad, _ = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
-                optimizer.update(model, grad)
-                grad = None
+                if prev_state is not None:
+                    prev_grad, prev_toks = prev_state
+                    grad = tree_map(lambda x, y: x + y, grad, prev_grad)
+                    toks_accum = toks + prev_toks
+                else:
+                    toks_accum = toks
 
-            return lvalue, toks, grad
+                if do_update:
+                    # Normalize by total tokens across all micro-batches
+                    grad = tree_map(lambda g: g / toks_accum, grad)
+                    if use_lora_plus:
+                        flat = tree_flatten(grad)
+                        scaled = [
+                            (k, v * lora_plus_ratio if "lora_b" in k else v)
+                            for k, v in flat
+                        ]
+                        grad = tree_unflatten(scaled)
+                    if max_grad_norm > 0:
+                        grad, _ = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
+                    optimizer.update(model, grad)
+                    accum_state = None
+                else:
+                    accum_state = (grad, toks_accum)
+
+                return lvalue, toks, accum_state
+        else:
+            def step(batch, lengths, prev_state, do_update):
+                (lvalue, toks), grad = loss_and_grad_fn(model, batch, lengths)
+
+                # Scale gradient by token count: ∇(sum_CE/toks) * toks = ∇(sum_CE)
+                grad = tree_map(lambda g: g * toks, grad)
+
+                if prev_state is not None:
+                    prev_grad, prev_toks = prev_state
+                    grad = tree_map(lambda x, y: x + y, grad, prev_grad)
+                    toks_accum = toks + prev_toks
+                else:
+                    toks_accum = toks
+
+                if do_update:
+                    # Normalize by total tokens across all micro-batches
+                    grad = tree_map(lambda g: g / toks_accum, grad)
+                    if use_lora_plus:
+                        flat = tree_flatten(grad)
+                        scaled = [
+                            (k, v * lora_plus_ratio if "lora_b" in k else v)
+                            for k, v in flat
+                        ]
+                        grad = tree_unflatten(scaled)
+                    if max_grad_norm > 0:
+                        grad, _ = optim.clip_grad_norm(grad, max_norm=max_grad_norm)
+                    optimizer.update(model, grad)
+                    accum_state = None
+                else:
+                    accum_state = (grad, toks_accum)
+
+                return lvalue, toks, accum_state
 
         if args.compile:
             step = mx.compile(step, inputs=state, outputs=state)
@@ -451,6 +536,8 @@ class MLXTrainer:
                 )
 
         features = []
+        if use_packing:
+            features.append("packing")
         if use_cce:
             features.append("CCE")
         if args.gradient_checkpointing:
@@ -473,12 +560,12 @@ class MLXTrainer:
         # Training loop — mlx-lm pattern
         model.train()
         start_time = time.perf_counter()
-        losses = 0
-        n_tokens = 0
+        loss_sum = 0      # token-weighted loss sum: Σ(lvalue * toks)
+        n_tokens = 0      # total trainable tokens: Σ(toks)
         steps = 0
         trained_tokens = 0
         train_time = 0
-        grad_accum_state = None
+        accum_state = None  # (grad_tree, accumulated_toks) or None
         batch_idx = 0
 
         for it in range(1, total_steps * grad_accum + 1):
@@ -493,17 +580,24 @@ class MLXTrainer:
 
             do_update = it % grad_accum == 0
 
-            lvalue, toks, grad_accum_state = step(
-                batch_data[0],
-                batch_data[1],
-                grad_accum_state,
-                do_update,
-            )
+            if use_packing:
+                # Packed format: (batch, loss_mask, attn_mask, position_ids)
+                lvalue, toks, accum_state = step(
+                    batch_data[0], batch_data[1], batch_data[2], batch_data[3],
+                    accum_state, do_update,
+                )
+            else:
+                # Standard format: (batch, lengths)
+                lvalue, toks, accum_state = step(
+                    batch_data[0], batch_data[1],
+                    accum_state, do_update,
+                )
 
-            losses += lvalue
+            # Token-weighted loss accumulation for correct logging
+            loss_sum += lvalue * toks
             n_tokens += toks
             steps += 1
-            mx.eval(state, losses, n_tokens, grad_accum_state)
+            mx.eval(state, loss_sum, n_tokens, accum_state)
             train_time += time.perf_counter() - tic
 
             # Clear the allocator cache after the first step (warmup/compilation).
@@ -522,8 +616,8 @@ class MLXTrainer:
 
             # Logging
             if current_step % args.logging_steps == 0 or current_step == total_steps:
-                train_loss = losses.item() / steps
                 tok_count = n_tokens.item()
+                train_loss = loss_sum.item() / tok_count if tok_count > 0 else 0.0
                 trained_tokens += tok_count
                 lr_val = optimizer.learning_rate.item()
                 tokens_sec = tok_count / train_time if train_time > 0 else 0
@@ -540,7 +634,7 @@ class MLXTrainer:
                     f"Peak: {peak_mem:.2f} GB"
                 )
 
-                losses = 0
+                loss_sum = 0
                 n_tokens = 0
                 steps = 0
                 train_time = 0

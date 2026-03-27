@@ -322,6 +322,123 @@ def make_baseline_loss_fn():
     return loss_fn
 
 
+def make_packed_cce_loss_fn(model):
+    """Create a CCE loss function for packed sequence training.
+
+    Like make_cce_loss_fn but accepts (model, batch, loss_mask, attn_mask, position_ids)
+    and passes packed attention mask and position IDs through the model.
+    """
+    if not has_cce_kernel():
+        raise RuntimeError("mx.fast.cce_loss not available for packed CCE.")
+
+    softcap = _get_logit_softcap(model)
+    lm_layer = _get_lm_head_layer(model)
+    use_quantized = _is_quantized_layer(lm_layer)
+
+    if use_quantized:
+        group_size = getattr(lm_layer, "group_size", 64)
+        bits = getattr(lm_layer, "bits", 4)
+        runtime_cce = _get_runtime_cce(
+            ignore_index=-100, logit_softcap=softcap,
+            quantized=True, group_size=group_size, bits=bits,
+        )
+        _has_lm_head_q = (
+            hasattr(model, "lm_head") and model.lm_head is not None
+            and hasattr(model.lm_head, "scales")
+        )
+        _has_biases = hasattr(lm_layer, "biases")
+
+        def loss_fn(model, batch, loss_mask, attn_mask, position_ids):
+            inputs, targets = batch[:, :-1], batch[:, 1:]
+            hidden = model.model(
+                inputs, packed_attn_mask=attn_mask, packed_position_ids=position_ids
+            )
+            layer = model.lm_head if _has_lm_head_q else model.model.embed_tokens
+            w, sc = layer.weight, layer.scales
+            bi = layer.biases if _has_biases else None
+            masked_targets = mx.where(loss_mask, targets, -100)
+            ntoks = loss_mask.sum()
+            if runtime_cce is not None:
+                hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
+                targets_flat = masked_targets.reshape((-1,))
+                loss = runtime_cce(hidden_flat, w, sc, bi, targets_flat).reshape(
+                    masked_targets.shape
+                )
+            else:
+                loss = mx.fast.cce_loss(
+                    hidden, w, masked_targets, scales=sc, biases=bi,
+                    group_size=group_size, bits=bits,
+                    ignore_index=-100, logit_softcap=softcap,
+                )
+            loss = loss.astype(mx.float32).sum() / ntoks
+            return loss, ntoks
+    else:
+        runtime_cce = _get_runtime_cce(ignore_index=-100, logit_softcap=softcap)
+        _has_lm_head = (
+            hasattr(model, "lm_head") and model.lm_head is not None
+            and hasattr(model.lm_head, "weight")
+        )
+        _skip_weight_grad = not _is_lm_head_trainable(model)
+
+        def loss_fn(model, batch, loss_mask, attn_mask, position_ids):
+            inputs, targets = batch[:, :-1], batch[:, 1:]
+            hidden = model.model(
+                inputs, packed_attn_mask=attn_mask, packed_position_ids=position_ids
+            )
+            w = (model.lm_head.weight if _has_lm_head
+                 else model.model.embed_tokens.weight)
+            if _skip_weight_grad:
+                w = mx.stop_gradient(w)
+            masked_targets = mx.where(loss_mask, targets, -100)
+            ntoks = loss_mask.sum()
+            if runtime_cce is not None:
+                hidden_flat = hidden.reshape((-1, hidden.shape[-1]))
+                targets_flat = masked_targets.reshape((-1,))
+                loss = runtime_cce(hidden_flat, w, targets_flat).reshape(
+                    masked_targets.shape
+                )
+            else:
+                loss = mx.fast.cce_loss(
+                    hidden, w, masked_targets,
+                    ignore_index=-100, logit_softcap=softcap,
+                )
+            loss = loss.astype(mx.float32).sum() / ntoks
+            return loss, ntoks
+
+    return loss_fn
+
+
+def make_packed_baseline_loss_fn():
+    """Create a standard cross-entropy loss for packed sequence training.
+
+    Like make_baseline_loss_fn but accepts (model, batch, loss_mask, attn_mask, position_ids).
+    """
+    upcast_logits = os.environ.get("UNSLOTH_MLX_UPCAST_LOGITS", "0") == "1"
+
+    def loss_fn(model, batch, loss_mask, attn_mask, position_ids):
+        inputs, targets = batch[:, :-1], batch[:, 1:]
+        # For baseline loss, we need the full model forward (including LM head).
+        # The model's __call__ typically does: hidden = model.model(inputs); logits = lm_head(hidden)
+        # We need to intercept to pass packed args to model.model.
+        hidden = model.model(
+            inputs, packed_attn_mask=attn_mask, packed_position_ids=position_ids
+        )
+        # Apply LM head manually
+        if hasattr(model, "lm_head") and model.lm_head is not None:
+            logits = model.lm_head(hidden)
+        else:
+            logits = model.model.embed_tokens.as_linear(hidden)
+        if upcast_logits:
+            logits = logits.astype(mx.float32)
+        masked_targets = mx.where(loss_mask, targets, -100)
+        ce = nn.losses.cross_entropy(logits, masked_targets) * loss_mask
+        ntoks = loss_mask.sum()
+        loss = ce.astype(mx.float32).sum() / ntoks
+        return loss, ntoks
+
+    return loss_fn
+
+
 def _prepare_dataset(
     dataset, tokenizer, dataset_text_field="text", formatting_func=None
 ):
@@ -490,3 +607,415 @@ def save_merged_model(model, tokenizer, path):
 
     # Save tokenizer
     tokenizer.save_pretrained(str(path))
+
+
+# ---------------------------------------------------------------------------
+# Sequence packing for padding-free training
+# ---------------------------------------------------------------------------
+
+import numpy as np
+
+
+def pack_sequences(token_sequences, max_len, pad_token_id=0):
+    """Pack variable-length sequences into fixed-length rows using first-fit-decreasing.
+
+    Args:
+        token_sequences: List of (token_ids, offset) tuples from the dataset.
+            offset is the prompt length — tokens before offset are prompt (masked from loss),
+            tokens from offset onward are response (trained on).
+        max_len: Maximum packed row length (e.g. 2048).
+        pad_token_id: Token ID used for padding (default 0).
+
+    Returns:
+        List of dicts, each containing:
+          - "input_ids": np.array [max_len] of packed token IDs
+          - "seq_lengths": list of individual sequence lengths in this row
+          - "seq_offsets": list of per-sequence prompt offsets (for response-only training)
+          - "num_sequences": number of sequences packed in this row
+    """
+    # Extract token lists with offsets, sort by length descending (first-fit-decreasing)
+    seqs = []
+    for item in token_sequences:
+        tokens, offset = item
+        if len(tokens) > max_len:
+            tokens = tokens[:max_len]
+            offset = min(offset, max_len)
+        if len(tokens) > 0:
+            seqs.append((tokens, offset))
+    seqs.sort(key=lambda x: len(x[0]), reverse=True)
+
+    # First-fit-decreasing bin packing
+    bins = []
+    for tokens, offset in seqs:
+        seq_len = len(tokens)
+        placed = False
+        for b in bins:
+            if b["remaining"] >= seq_len:
+                b["tokens"].extend(tokens)
+                b["seq_lengths"].append(seq_len)
+                b["seq_offsets"].append(offset)
+                b["remaining"] -= seq_len
+                placed = True
+                break
+        if not placed:
+            bins.append({
+                "tokens": list(tokens),
+                "seq_lengths": [seq_len],
+                "seq_offsets": [offset],
+                "remaining": max_len - seq_len,
+            })
+
+    # Convert to fixed-length arrays
+    packed_rows = []
+    for b in bins:
+        input_ids = np.zeros(max_len, dtype=np.int32)
+        input_ids[:len(b["tokens"])] = b["tokens"]
+        packed_rows.append({
+            "input_ids": input_ids,
+            "seq_lengths": b["seq_lengths"],
+            "seq_offsets": b["seq_offsets"],
+            "num_sequences": len(b["seq_lengths"]),
+        })
+
+    return packed_rows
+
+
+def build_block_diagonal_mask(seq_lengths, max_len):
+    """Build a block-diagonal causal attention mask for packed sequences.
+
+    Args:
+        seq_lengths: List of sequence lengths in this packed row (e.g. [500, 700, 848]).
+        max_len: Total row length.
+
+    Returns:
+        np.array of shape [max_len, max_len], dtype bool.
+        True where attention is allowed (causal within each block, zero across blocks).
+    """
+    mask = np.zeros((max_len, max_len), dtype=bool)
+    offset = 0
+    for length in seq_lengths:
+        # Causal mask within this block: lower triangular
+        block = np.tril(np.ones((length, length), dtype=bool))
+        mask[offset:offset + length, offset:offset + length] = block
+        offset += length
+    return mask
+
+
+def compute_position_ids(seq_lengths, max_len):
+    """Compute per-token position IDs that reset at each sequence boundary.
+
+    Args:
+        seq_lengths: List of sequence lengths in this packed row.
+        max_len: Total row length.
+
+    Returns:
+        np.array of shape [max_len], dtype int32.
+        E.g. for seq_lengths=[3, 4]: [0, 1, 2, 0, 1, 2, 3, 0, 0, ...]
+    """
+    positions = np.zeros(max_len, dtype=np.int32)
+    offset = 0
+    for length in seq_lengths:
+        positions[offset:offset + length] = np.arange(length, dtype=np.int32)
+        offset += length
+    return positions
+
+
+def compute_loss_mask(seq_lengths, max_len, seq_offsets=None):
+    """Compute loss mask for packed sequences (applied to targets, which are shifted by 1).
+
+    Handles both full-sequence training (offset=0) and response-only training
+    (offset>0, where tokens before offset are prompt and masked from loss).
+
+    For inter-sequence boundaries within a packed row, the last token of each
+    sub-sequence (except the final one) is masked because it predicts into
+    the next sequence's first token.
+
+    Args:
+        seq_lengths: List of sequence lengths in this packed row.
+        max_len: Total row length.
+        seq_offsets: Optional list of per-sequence prompt offsets. If None,
+            defaults to 0 for all sequences (train on everything).
+            offset=N means skip the first N tokens of that sequence from loss.
+
+    Returns:
+        np.array of shape [max_len - 1], dtype bool.
+        True where loss should be computed.
+    """
+    if seq_offsets is None:
+        seq_offsets = [0] * len(seq_lengths)
+
+    # Build mask in target space (shifted by 1 from input space).
+    # targets[t] = batch[t+1], so target position t corresponds to
+    # predicting token at position t+1 given input at position t.
+    #
+    # For a sub-sequence at packed position [start, start+length):
+    #   - Prompt tokens: positions start..start+offset-1 → mask these
+    #   - Response tokens: positions start+offset..start+length-1 → train on these
+    #   - In target space: target[t] is valid when BOTH input[t] and target[t]=batch[t+1]
+    #     are within the response portion of the same sub-sequence.
+    mask_targets = np.zeros(max_len - 1, dtype=bool)
+    pos = 0
+    for i, (length, prompt_offset) in enumerate(zip(seq_lengths, seq_offsets)):
+        is_last = (i == len(seq_lengths) - 1)
+
+        # Response starts at position pos + prompt_offset within the packed row.
+        # In target space, the first valid target is at position pos + prompt_offset
+        # (input[pos+prompt_offset] predicts target[pos+prompt_offset] = batch[pos+prompt_offset+1],
+        # both within the response).
+        resp_start = pos + prompt_offset
+
+        # Last valid target position within this sub-sequence:
+        # - For intermediate sub-sequences: pos + length - 2
+        #   (because input[pos+length-1] predicts batch[pos+length] which is in the next sequence)
+        # - For the last sub-sequence: pos + length - 1
+        #   (predicts into padding, matching unpacked behavior)
+        if is_last:
+            resp_end = pos + length  # exclusive, in target space
+        else:
+            resp_end = pos + length - 1  # exclusive, skip boundary
+
+        # Clamp to valid target range
+        t_start = max(resp_start, 0)
+        t_end = min(resp_end, max_len - 1)
+
+        if t_end > t_start:
+            mask_targets[t_start:t_end] = True
+
+        pos += length
+
+    return mask_targets
+
+
+def create_packed_batches(
+    dataset,
+    tokenizer,
+    batch_size,
+    max_seq_length,
+    num_batches=None,
+    seed=42,
+    dataset_text_field="text",
+    formatting_func=None,
+):
+    """Create packed batches with pre-computed attention masks and position IDs.
+
+    Like create_batches() but packs multiple sequences per row to eliminate
+    padding waste. Returns a different tuple format with mask/position metadata.
+
+    Returns:
+        List of (batch, loss_mask, attn_mask, position_ids) tuples where:
+          - batch: mx.array [B, max_seq_length]
+          - loss_mask: mx.array [B, max_seq_length - 1] bool
+          - attn_mask: mx.array [max_seq_length - 1, max_seq_length - 1] bool
+            (shared across batch — all rows use same mask structure if possible,
+             otherwise [B, 1, max_seq_length-1, max_seq_length-1])
+          - position_ids: mx.array [B, max_seq_length - 1]
+    """
+    ds = _prepare_dataset(dataset, tokenizer, dataset_text_field, formatting_func)
+
+    # Collect all tokenized sequences
+    all_seqs = []
+    for i in range(len(ds)):
+        item = ds[i]
+        all_seqs.append(item)
+
+    # Pack sequences into rows
+    packed_rows = pack_sequences(all_seqs, max_seq_length, pad_token_id=0)
+
+    # Shuffle packed rows
+    rng = np.random.default_rng(seed)
+    rng.shuffle(packed_rows)
+
+    # Group into batches
+    batch_pairs = []
+    for b_start in range(0, len(packed_rows), batch_size):
+        b_end = min(b_start + batch_size, len(packed_rows))
+        rows = packed_rows[b_start:b_end]
+
+        if len(rows) < batch_size:
+            # Skip incomplete last batch
+            continue
+
+        # Stack input_ids
+        batch_arr = np.stack([r["input_ids"] for r in rows])  # [B, T]
+
+        # Compute per-row position_ids and loss_mask
+        T = max_seq_length
+        pos_ids = np.stack([
+            compute_position_ids(r["seq_lengths"], T) for r in rows
+        ])  # [B, T]
+        loss_masks = np.stack([
+            compute_loss_mask(r["seq_lengths"], T, r.get("seq_offsets"))
+            for r in rows
+        ])  # [B, T-1]
+
+        # Compute attention masks — one per row since packing varies
+        attn_masks = np.stack([
+            build_block_diagonal_mask(r["seq_lengths"], T) for r in rows
+        ])  # [B, T, T]
+
+        # Slice to input length (T-1, since inputs = batch[:, :-1])
+        T_in = T - 1
+        pos_ids_in = pos_ids[:, :T_in]
+        attn_masks_in = attn_masks[:, :T_in, :T_in]  # [B, T_in, T_in]
+        # Add head dimension for broadcast: [B, 1, T_in, T_in]
+        attn_masks_in = attn_masks_in[:, np.newaxis, :, :]
+
+        batch_pairs.append((
+            mx.array(batch_arr),
+            mx.array(loss_masks),
+            mx.array(attn_masks_in),
+            mx.array(pos_ids_in),
+        ))
+
+        if num_batches is not None and len(batch_pairs) >= num_batches:
+            break
+
+    # Pre-evaluate all arrays
+    all_arrays = []
+    for b, lm, am, pi in batch_pairs:
+        all_arrays.extend([b, lm, am, pi])
+    mx.eval(all_arrays)
+
+    packing_ratio = len(all_seqs) / max(1, sum(len(packed_rows) for _ in [1]))
+    total_tokens = sum(sum(r["seq_lengths"]) for r in packed_rows)
+    total_capacity = len(packed_rows) * max_seq_length
+    utilization = total_tokens / max(1, total_capacity)
+    print(f"Unsloth: Packed {len(all_seqs)} sequences into {len(packed_rows)} rows "
+          f"({utilization:.0%} utilization, {len(batch_pairs)} batches)")
+
+    return batch_pairs
+
+
+# ---------------------------------------------------------------------------
+# Packing monkey-patches for model forward pass
+# ---------------------------------------------------------------------------
+
+def _apply_rope_per_token(rope_module, x, position_ids):
+    """Apply RoPE with per-token position IDs using the reshape trick.
+
+    Args:
+        rope_module: The model's RoPE module (nn.RoPE, Llama3RoPE, etc.)
+        x: [B, N_heads, T, D] tensor
+        position_ids: [B, T] per-token position IDs
+
+    Returns:
+        [B, N_heads, T, D] tensor with per-token RoPE applied.
+    """
+    B, N, T, D = x.shape
+    # Reshape to [B*T, N, 1, D] — each token becomes its own "batch"
+    x_flat = x.transpose(0, 2, 1, 3).reshape(B * T, N, 1, D)
+    offsets = position_ids.reshape(B * T)
+    # Apply RoPE with per-"batch" offsets
+    x_roped = rope_module(x_flat, offset=offsets)
+    # Reshape back to [B, N, T, D]
+    return x_roped.reshape(B, T, N, D).transpose(0, 2, 1, 3)
+
+
+def apply_packing_patches(model):
+    """Monkey-patch the model to support packed sequence training.
+
+    Patches:
+      1. Attention.__call__ — uses per-token RoPE when _packed_position_ids is set
+      2. The inner model's __call__ — passes packed mask/positions through layers
+
+    Follows the same pattern as apply_gradient_checkpointing().
+    """
+    inner_model = model.model if hasattr(model, "model") else model
+    layers = getattr(inner_model, "layers", None)
+    if not layers or len(layers) == 0:
+        print("Unsloth: Warning — no layers found for packing patches")
+        return
+
+    # Patch 1: Attention class — per-token RoPE
+    attn_module = layers[0].self_attn
+    attn_cls = type(attn_module)
+
+    if getattr(attn_cls, "_orig_call_packing", None) is not None:
+        return  # already patched
+
+    attn_cls._orig_call_packing = attn_cls.__call__
+    orig_attn_fn = attn_cls.__call__
+
+    def patched_attn_call(self, x, mask=None, cache=None):
+        position_ids = getattr(self, "_packed_position_ids", None)
+        if position_ids is not None and cache is None:
+            B, L, D = x.shape
+            queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+            queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+            keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+            values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+
+            queries = _apply_rope_per_token(self.rope, queries, position_ids)
+            keys = _apply_rope_per_token(self.rope, keys, position_ids)
+
+            output = mx.fast.scaled_dot_product_attention(
+                queries, keys, values, scale=self.scale, mask=mask
+            )
+            output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+            return self.o_proj(output)
+        else:
+            return orig_attn_fn(self, x, mask, cache)
+
+    attn_cls.__call__ = patched_attn_call
+
+    # Patch 2: Inner model class — thread packed mask and position_ids
+    inner_cls = type(inner_model)
+
+    if getattr(inner_cls, "_orig_call_packing", None) is not None:
+        return
+
+    inner_cls._orig_call_packing = inner_cls.__call__
+    orig_model_fn = inner_cls.__call__
+
+    def patched_model_call(self, inputs, cache=None, input_embeddings=None,
+                           packed_attn_mask=None, packed_position_ids=None):
+        if packed_attn_mask is not None and cache is None:
+            # Set position_ids on each attention module
+            for layer in self.layers:
+                layer.self_attn._packed_position_ids = packed_position_ids
+
+            h = self.embed_tokens(inputs) if input_embeddings is None else input_embeddings
+            if cache is None:
+                cache_list = [None] * len(self.layers)
+            else:
+                cache_list = cache
+
+            for layer, c in zip(self.layers, cache_list):
+                h = layer(h, packed_attn_mask, cache=c)
+
+            # Clean up
+            for layer in self.layers:
+                layer.self_attn._packed_position_ids = None
+
+            return self.norm(h)
+        else:
+            return orig_model_fn(self, inputs, cache, input_embeddings)
+
+    inner_cls.__call__ = patched_model_call
+    print("Unsloth: Packing patches applied (per-token RoPE + block-diagonal attention)")
+
+
+def remove_packing_patches(model):
+    """Remove packing monkey-patches, restoring original model behavior."""
+    inner_model = model.model if hasattr(model, "model") else model
+    layers = getattr(inner_model, "layers", None)
+
+    if layers and len(layers) > 0:
+        attn_cls = type(layers[0].self_attn)
+        orig = getattr(attn_cls, "_orig_call_packing", None)
+        if orig is not None:
+            attn_cls.__call__ = orig
+            del attn_cls._orig_call_packing
+
+        # Clean up any leftover attributes
+        for layer in layers:
+            if hasattr(layer.self_attn, "_packed_position_ids"):
+                del layer.self_attn._packed_position_ids
+
+    inner_cls = type(inner_model)
+    orig = getattr(inner_cls, "_orig_call_packing", None)
+    if orig is not None:
+        inner_cls.__call__ = orig
+        del inner_cls._orig_call_packing
+
+
