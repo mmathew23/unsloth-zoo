@@ -2567,6 +2567,31 @@ def patch_lora_forwards(torch_compile_options):
                     "    return base_layer(x, *args, **kwargs)\n"
                 )
 
+            # Qwen3.5 4bit lora forwards have torch dynamo 
+            # maxiumum recursion depth errors, so we need to disable compile
+            if "4bit" in child.lower():
+                source = source.replace(
+                    "result = self.base_layer(x, *args, **kwargs)",
+                    "result = _call_4bit_base_layer(self.base_layer, x, *args, **kwargs)",
+                )
+                extra_prepend = (
+                    "\nimport torch._dynamo\n"
+                    "import os\n"
+                    "\n"
+                    "@torch._dynamo.disable\n"
+                    "def _call_4bit_base_layer_nodynamo(base_layer, x, *args, **kwargs):\n"
+                    "    return base_layer(x, *args, **kwargs)\n"
+                    "\n"
+                    "_UNSLOTH_DISABLE_4BIT_COMPILE = (\n"
+                    "    os.environ.get('UNSLOTH_DISABLE_4BIT_COMPILE', '0') == '1'\n"
+                    ")\n"
+                    "\n"
+                    "def _call_4bit_base_layer(base_layer, x, *args, **kwargs):\n"
+                    "    if _UNSLOTH_DISABLE_4BIT_COMPILE:\n"
+                    "        return _call_4bit_base_layer_nodynamo(base_layer, x, *args, **kwargs)\n"
+                    "    return base_layer(x, *args, **kwargs)\n"
+                )
+
             # Fix for fp16 + non-quantized base layers (e.g. SiGLIP vision encoder):
             # When autocast is disabled and base_layer has float32 weights,
             # cast x to match the weight dtype to prevent dtype mismatch.
