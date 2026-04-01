@@ -978,6 +978,8 @@ def grpo_accumulated_loss(
                         image_grid_thw = image_grid_thw_chunk,
                         pixel_attention_mask = pixel_attention_mask_chunk,
                         image_sizes = image_sizes_chunk,
+                        mm_token_type_ids = mm_token_type_ids_chunk,
+                        token_type_ids = token_type_ids_chunk,
                         logits_to_keep = logits_to_keep + 1,
                         **_extra_vision_kwargs,
                     ).logits
@@ -1025,7 +1027,7 @@ def grpo_accumulated_loss(
     # Must force not returning hidden states but logits otherwise gibberish
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
 
-    return loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1, completion_mask
+    return loss.squeeze(), completion_length, mean_kl, delta, flat_is_ratio, coef_1, completion_mask
     # Old non efficient code path
     new_logits = torch.matmul(new_hidden_states, lm_head.t())
     new_logits = new_logits[:, :-1, :] # exclude the last logit: it corresponds to the next token pred
