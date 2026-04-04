@@ -14,32 +14,16 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-"""Temporary patches for Qwen3-VL models.
-
-Bundles per-layer compiled functions into 2 chunks (prepare_attn + prepare_mlp)
-instead of 8-9 scattered @torch.compile decorators. This reduces compile memory
-overhead from ~9.7 GiB to ~0.7 GiB while improving speed by ~10%.
-
-The scattered decorators create redundant compiled autograd boundaries, each saving
-input tensors for backward. Bundling into 2 functions per layer eliminates the
-redundant boundaries and gives inductor larger graphs for better fusion.
-"""
-
-from typing import Optional
 import torch
-import torch.nn as nn
 from .common import TEMPORARY_PATCHES
 from .utils import raise_error
 
 
 def patch_Qwen3VLTextDecoderLayer():
-    """Replace Qwen3VLTextDecoderLayer.forward with 2-chunk compiled version."""
     try:
         import transformers.models.qwen3_vl.modeling_qwen3_vl as modeling
         from transformers.models.qwen3_vl.modeling_qwen3_vl import (
-            apply_rotary_pos_emb,
-            ALL_ATTENTION_FUNCTIONS,
-            eager_attention_forward,
+            apply_rotary_pos_emb, ALL_ATTENTION_FUNCTIONS, eager_attention_forward,
         )
     except Exception as e:
         return raise_error("Qwen3VLTextDecoderLayer", e)
@@ -47,7 +31,6 @@ def patch_Qwen3VLTextDecoderLayer():
     from functools import partial as _partial
     _compile = _partial(torch.compile, dynamic=True)
 
-    # ── Compiled chunk 1: input_norm + QKV projection + QKNorm + RoPE ──
     def prepare_attn(hidden_states, input_layernorm, q_proj, k_proj, v_proj,
                      q_norm, k_norm, head_dim, cos, sin):
         residual = hidden_states
@@ -62,20 +45,18 @@ def patch_Qwen3VLTextDecoderLayer():
         if value_states.dtype != query_states.dtype:
             value_states = value_states.to(query_states.dtype)
         return residual, query_states, key_states, value_states, input_shape
-
+    pass
     prepare_attn = _compile(prepare_attn, fullgraph=False)
 
-    # ── Compiled chunk 2: post_attention_norm + MLP ──
     def prepare_mlp(hidden_states, post_attention_layernorm, mlp):
         residual = hidden_states
         hidden_states = post_attention_layernorm(hidden_states)
         hidden_states = mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
-
+    pass
     prepare_mlp = _compile(prepare_mlp, fullgraph=False)
 
-    # ── Factory for the patched layer forward ──
     def _make_forward(compiled_prepare_attn, compiled_prepare_mlp,
                       attn_functions, default_attn):
         def forward(self, hidden_states, position_embeddings=None,
@@ -84,7 +65,6 @@ def patch_Qwen3VLTextDecoderLayer():
                     cache_position=None, **kwargs):
             cos, sin = position_embeddings
 
-            # Compiled chunk 1: norm + QKV + QKNorm + RoPE
             residual, query_states, key_states, value_states, input_shape = \
                 compiled_prepare_attn(
                     hidden_states, self.input_layernorm,
@@ -92,7 +72,6 @@ def patch_Qwen3VLTextDecoderLayer():
                     self.self_attn.q_norm, self.self_attn.k_norm,
                     self.self_attn.head_dim, cos, sin)
 
-            # Uncompiled: KV cache + attention + output proj
             if past_key_values is not None:
                 cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
                 key_states, value_states = past_key_values.update(
@@ -112,12 +91,12 @@ def patch_Qwen3VLTextDecoderLayer():
             attn_output = self.self_attn.o_proj(attn_output)
             hidden_states = residual + attn_output
 
-            # Compiled chunk 2: post_norm + MLP
             hidden_states = compiled_prepare_mlp(
                 hidden_states, self.post_attention_layernorm, self.mlp)
 
             return hidden_states
         return forward
+    pass
 
     modeling.Qwen3VLTextDecoderLayer.forward = _make_forward(
         prepare_attn, prepare_mlp, ALL_ATTENTION_FUNCTIONS, eager_attention_forward)
