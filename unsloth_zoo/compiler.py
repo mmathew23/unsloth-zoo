@@ -209,7 +209,7 @@ from unsloth_zoo.loss_utils import (
 )
 
 scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
-@torch.compiler.disable(recursive = False)
+#@torch.compiler.disable(recursive = False)
 def disable_compile_scaled_dot_product_attention(*args, **kwargs):
     return scaled_dot_product_attention(*args, **kwargs)
 pass
@@ -816,7 +816,7 @@ def create_new_function(
 
     if add_torch_compile:
         new_source = (
-            "@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)\n"
+            "#@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)\n"
             f"{new_source}"
         )
     pass
@@ -829,13 +829,10 @@ def create_new_function(
     pass
 
     # Import items to make the function executable
-    # Exclude __name__ to prevent overriding the compiled module's identity,
-    # which causes torch._dynamo guard resolution to look up functions in the
-    # wrong module (the original transformers module instead of the compiled one).
     items = [
         x
         for x in functions
-        if ((x in new_source) and (x != name) and (x != "__name__") and not (f"def {x}(" in new_source))
+        if ((x in new_source) and (x != name) and not (f"def {x}(" in new_source))
     ]
     # Patch for SiglipEncoder and others
     if "SiglipEncoder" in new_source:
@@ -1249,7 +1246,7 @@ def create_standalone_class(
 
     if disable is not None:
         compile = (
-            f"@torch.compile(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
+            f"#@torch.compile(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
             if not disable
             else "#@torch.compiler.disable(recursive = False)"
         )
@@ -4001,14 +3998,14 @@ def unsloth_compile_transformers(
             pass
             parameters = f"def {module}" + parameters + code_section
             print(f"Unsloth: Fixed up function {module}.")
-
+            
             if module in disable_compile_functions:
                 parameters = (
-                    "#@torch.compiler.disable(recursive = False)\n"
+                    "@torch.compiler.disable(recursive = False)\n"
                     + parameters
                 )
             elif not disable:
-                parameters = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
+                parameters = f"#@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
             all_standalone_classes[module] = parameters
         pass
 
@@ -4061,13 +4058,13 @@ def unsloth_compile_transformers(
                 if module in disable_compile_functions:
                     source = re.sub(
                         r"@torch.compile\([^\n]*\)\n",
-                        "#@torch.compiler.disable(recursive = False)\n",
+                        "@torch.compiler.disable(recursive = False)\n",
                         source,
                     )
-                    if "#@torch.compiler.disable(recursive = False)\n" not in source:
+                    if "@torch.compiler.disable(recursive = False)\n" not in source:
                         source = "#@torch.compiler.disable(recursive = False)\n" + source
                 elif not disable:
-                    source = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
+                    source = f"#@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(
