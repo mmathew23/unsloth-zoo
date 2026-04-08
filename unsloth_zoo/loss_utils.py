@@ -21,7 +21,10 @@ import math
 import functools
 from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
-from triton import __version__ as triton_version
+try:
+    from triton import __version__ as triton_version
+except ModuleNotFoundError:
+    triton_version = "0.0.0"
 from . import DEVICE_TYPE
 from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 import inspect

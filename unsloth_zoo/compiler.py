@@ -47,7 +47,10 @@ from .utils import (
     get_lock,
 )
 from .log import logger
-import triton
+try:
+    import triton
+except ModuleNotFoundError:
+    triton = None
 import regex
 from .peft_utils import get_lora_layer_modules
 from importlib.metadata import version as importlib_version
@@ -92,7 +95,7 @@ elif DEVICE_TYPE == "xpu":
     OLD_CUDA_ARCH_VERSION = False
 pass
 
-OLD_TRITON_VERSION = Version(triton.__version__) < Version("3.0.0")
+OLD_TRITON_VERSION = triton is None or Version(triton.__version__) < Version("3.0.0")
 
 # Check if Unsloth Studio is allowed
 import importlib.util
