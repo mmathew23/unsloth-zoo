@@ -37,6 +37,7 @@ __all__ = [
     "fix_zero_training_loss",
     "unsloth_train",
     "prepare_model_for_training",
+    "configure_activation_offloading_checkpointing",
 ]
 
 
@@ -89,6 +90,81 @@ def fix_zero_training_loss(model, tokenizer, train_dataset):
                 "If you used `train_on_responses_only`, confirm your user and assistant parts are correct!"
             )
     pass
+pass
+
+
+@torch.no_grad
+def _gradient_checkpointing_enable(model: Any, gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None) -> None:
+    gradient_checkpointing_kwargs = dict(gradient_checkpointing_kwargs or {})
+
+    if not hasattr(model, "gradient_checkpointing_enable"):
+        return
+
+    try:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs = gradient_checkpointing_kwargs)
+        return
+    except TypeError:
+        pass
+
+    try:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+        return
+    except TypeError:
+        pass
+
+    model.gradient_checkpointing_enable()
+pass
+
+
+@torch.no_grad
+def _set_gradient_checkpointing_use_reentrant(model: Any, use_reentrant: bool) -> None:
+    visited = set()
+    current_model = model
+
+    while current_model is not None and id(current_model) not in visited:
+        visited.add(id(current_model))
+        setattr(current_model, "_gradient_checkpointing_use_reentrant", use_reentrant)
+        current_model = getattr(current_model, "model", None)
+    pass
+pass
+
+
+@torch.no_grad
+def configure_activation_offloading_checkpointing(
+    model: Any,
+    gradient_checkpointing: bool = True,
+    gradient_checkpointing_kwargs: Optional[Dict[str, Any]] = None,
+) -> None:
+    """
+    Align model-side gradient checkpointing with TRL activation offloading.
+
+    TRL activation offloading is designed for native PyTorch checkpointing with
+    `use_reentrant=False`. Unsloth models may have been prepared earlier with
+    reentrant checkpointing or smart checkpoint monkey patches, so we need to
+    update the model-side checkpoint mode to match the final trainer args.
+    """
+    gradient_checkpointing_kwargs = dict(gradient_checkpointing_kwargs or {})
+    use_reentrant = gradient_checkpointing_kwargs.get("use_reentrant", True)
+
+    _set_gradient_checkpointing_use_reentrant(model, use_reentrant)
+
+    if not use_reentrant:
+        unpatch_unsloth_gradient_checkpointing()
+        unpatch_unsloth_smart_gradient_checkpointing()
+
+    if not gradient_checkpointing:
+        return
+
+    if hasattr(model, "gradient_checkpointing_disable"):
+        try:
+            model.gradient_checkpointing_disable()
+        except Exception:
+            pass
+
+    _gradient_checkpointing_enable(model, gradient_checkpointing_kwargs)
+
+    if hasattr(model, "_set_gradient_checkpointing"):
+        model._set_gradient_checkpointing()
 pass
 
 
@@ -196,6 +272,8 @@ def prepare_model_for_training(
     pass
 
     # Gradient checkpointing
+    _set_gradient_checkpointing_use_reentrant(model, use_reentrant)
+
     # If the user requested vanilla GC (True/False), ensure any prior Unsloth patch is undone.
     if use_gradient_checkpointing != "unsloth":
         unpatch_unsloth_gradient_checkpointing()
@@ -205,13 +283,13 @@ def prepare_model_for_training(
         if use_gradient_checkpointing == "unsloth":
             m._offloaded_gradient_checkpointing = True
         if use_gradient_checkpointing == True and hasattr(m, "gradient_checkpointing_enable"):
-            m.gradient_checkpointing_enable()
+            _gradient_checkpointing_enable(m, {"use_reentrant": use_reentrant})
         m = m.model
     pass
     if use_gradient_checkpointing == "unsloth":
         m._offloaded_gradient_checkpointing = True
     if use_gradient_checkpointing == True and hasattr(m, "gradient_checkpointing_enable"):
-        m.gradient_checkpointing_enable()
+        _gradient_checkpointing_enable(m, {"use_reentrant": use_reentrant})
 
     # Also set HF version manually to stop failures
     if hasattr(model, "_set_gradient_checkpointing"):

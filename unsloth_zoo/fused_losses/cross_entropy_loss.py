@@ -26,6 +26,7 @@ import inspect
 import functools
 import math
 import os
+import contextlib
 from ..temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 from ..device_type import DEVICE_TYPE
         
@@ -49,6 +50,7 @@ except Exception:
 # Module-level flag: None = untested, True = works, False = skip compile.
 _FUSED_CE_COMPILE_SUPPORTED = None if \
     os.environ.get("UNSLOTH_FUSED_CE_COMPILE_DISABLE", "0") != "1" else False
+_TRL_ACTIVATION_OFFLOAD_NOOP_MANAGER = None
 
 @functools.cache
 def _get_mapping(autograd):
@@ -64,6 +66,31 @@ def apply_autograd_function(autograd, mapping):
         mapping.get(old_key, default) \
         for old_key, default in zip(parameters, defaults)
     ))
+pass
+
+
+def _maybe_disable_trl_activation_offloading():
+    """
+    `unsloth_fused_ce_loss` uses `torch.func.grad_and_value` internally, which
+    does not support active saved tensor hooks. When TRL activation offloading is
+    enabled, temporarily install TRL's own `NoOpManager` so the fused loss can
+    run while keeping offloading active for the rest of the model.
+    """
+    global _TRL_ACTIVATION_OFFLOAD_NOOP_MANAGER
+
+    if _TRL_ACTIVATION_OFFLOAD_NOOP_MANAGER is False:
+        return contextlib.nullcontext()
+
+    if _TRL_ACTIVATION_OFFLOAD_NOOP_MANAGER is None:
+        try:
+            from trl.models.activation_offloading import NoOpManager
+            _TRL_ACTIVATION_OFFLOAD_NOOP_MANAGER = NoOpManager
+        except Exception:
+            _TRL_ACTIVATION_OFFLOAD_NOOP_MANAGER = False
+            return contextlib.nullcontext()
+    pass
+
+    return _TRL_ACTIVATION_OFFLOAD_NOOP_MANAGER()
 pass
 
 def compute_fused_ce_loss(
@@ -469,21 +496,22 @@ def unsloth_fused_ce_loss(
     if hidden_states.device != device:
         hidden_states = hidden_states.to(device = device)
 
-    return apply_autograd_function(UnslothFusedLoss, dict(
-        loss_function = compute_fused_ce_loss,
-        hidden_states = hidden_states,
-        lm_head_weight = lm_head_weight,
-        lm_head_bias = lm_head_bias,
-        labels = labels,
-        mask = mask,
-        n_items = n_items,
-        scaling = scaling,
-        shift_labels = True,
-        target_gb = target_gb,
-        torch_compile = torch_compile,
-        overwrite = overwrite,
-        extra_kwargs = kwargs,
-    ))
+    with _maybe_disable_trl_activation_offloading():
+        return apply_autograd_function(UnslothFusedLoss, dict(
+            loss_function = compute_fused_ce_loss,
+            hidden_states = hidden_states,
+            lm_head_weight = lm_head_weight,
+            lm_head_bias = lm_head_bias,
+            labels = labels,
+            mask = mask,
+            n_items = n_items,
+            scaling = scaling,
+            shift_labels = True,
+            target_gb = target_gb,
+            torch_compile = torch_compile,
+            overwrite = overwrite,
+            extra_kwargs = kwargs,
+        ))
 pass
 
 # Unsloth Zoo - Utilities for Unsloth
