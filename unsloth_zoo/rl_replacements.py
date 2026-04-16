@@ -25,6 +25,7 @@ import math
 import logging
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
+from .activation_offloading_utils import maybe_disable_trl_activation_offloading
 from .device_type import DEVICE_TYPE, device_synchronize
 from .temporary_patches.common import torch_compile_options
 RL_REPLACEMENTS = dict()
@@ -1009,20 +1010,21 @@ def grpo_accumulated_loss(
     new_logprobs = torch.cat(all_logprobs_list, dim=0)
 
     with autocaster:
-        loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
-            new_logprobs,
-            old_logps,
-            ref_logps,
-            sampling_per_token_logps,
-            lm_head,
-            completion_input_ids,
-            completion_mask,
-            advantages,
-            trainer.beta,
-            trainer.accelerator.scaler,
-            1,
-            kwargs
-        )
+        with maybe_disable_trl_activation_offloading(trainer):
+            loss, completion_length, mean_kl, delta, flat_is_ratio, coef_1 = UnslothEfficientGRPO.apply(
+                new_logprobs,
+                old_logps,
+                ref_logps,
+                sampling_per_token_logps,
+                lm_head,
+                completion_input_ids,
+                completion_mask,
+                advantages,
+                trainer.beta,
+                trainer.accelerator.scaler,
+                1,
+                kwargs
+            )
 
     # Must force not returning hidden states but logits otherwise gibberish
     os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"

@@ -38,6 +38,7 @@ __all__ = [
     "unsloth_train",
     "prepare_model_for_training",
     "configure_activation_offloading_checkpointing",
+    "maybe_enable_trl_activation_offloading",
 ]
 
 
@@ -165,6 +166,44 @@ def configure_activation_offloading_checkpointing(
 
     if hasattr(model, "_set_gradient_checkpointing"):
         model._set_gradient_checkpointing()
+pass
+
+
+@torch.no_grad
+def maybe_enable_trl_activation_offloading(trainer: Any) -> None:
+    """
+    Align trainer/model state with TRL activation offloading and install the
+    standard TRL activation-offloading context manager if it is not already set.
+    """
+    args = getattr(trainer, "args", None)
+    model = getattr(trainer, "model", None)
+    if args is None or model is None:
+        return
+    if not getattr(args, "activation_offloading", False):
+        return
+
+    gradient_checkpointing_kwargs = getattr(args, "gradient_checkpointing_kwargs", None) or {}
+    if getattr(args, "gradient_checkpointing", False):
+        gradient_checkpointing_kwargs.setdefault("use_reentrant", False)
+        args.gradient_checkpointing_kwargs = gradient_checkpointing_kwargs
+        configure_activation_offloading_checkpointing(
+            model,
+            gradient_checkpointing = True,
+            gradient_checkpointing_kwargs = gradient_checkpointing_kwargs,
+        )
+
+    if hasattr(trainer, "maybe_activation_offload_context"):
+        return
+
+    try:
+        from trl.models import get_act_offloading_ctx_manager
+    except Exception:
+        try:
+            from trl.models.activation_offloading import get_act_offloading_ctx_manager
+        except Exception:
+            return
+
+    trainer.maybe_activation_offload_context = get_act_offloading_ctx_manager(model = model)
 pass
 
 
