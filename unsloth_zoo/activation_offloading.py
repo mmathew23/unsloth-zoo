@@ -14,39 +14,54 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+"""Activation-offloading helpers.
+
+TRL's `OffloadActivations` installs PyTorch saved-tensor-default-hooks. Some
+Unsloth fused autograd paths call `torch.func.{grad, vjp, jacrev, hessian}`,
+which reject ANY active saved-tensor hooks (rejection is on presence, not
+behavior — no-op hooks still fail). `maybe_disable_trl_activation_offloading`
+returns a context manager that pops any active hooks for the duration of the
+wrapped region and restores them on exit.
+
+Debugging
+---------
+Set ``UNSLOTH_AO_DEBUG=1`` to print one line each time the wrapper pops and
+restores hooks, e.g. during `unsloth_fused_ce_loss` forward.
+"""
+
 import contextlib
+import os
 
-_TRL_AO_NOOP_MANAGER_CLS = None  # None = unchecked, False = unavailable, or the class
+import torch
 
 
-def _get_noop_manager():
-    global _TRL_AO_NOOP_MANAGER_CLS
-    if _TRL_AO_NOOP_MANAGER_CLS is not None:
-        return _TRL_AO_NOOP_MANAGER_CLS
-    try:
-        from trl.models.activation_offloading import NoOpManager
-        _TRL_AO_NOOP_MANAGER_CLS = NoOpManager
-    except Exception:
-        _TRL_AO_NOOP_MANAGER_CLS = False
-    return _TRL_AO_NOOP_MANAGER_CLS
+# Capability check for the private saved-tensors-default-hooks stack API.
+# These underscore-prefixed symbols have been stable across torch 2.x, but we
+# still detect at import so a future rename fails at module import with a
+# clear message rather than deep inside backward.
+_AG = getattr(torch._C, "_autograd", None)
+_HOOK_STACK_API_AVAILABLE = _AG is not None and all(
+    hasattr(_AG, name) for name in (
+        "_top_saved_tensors_default_hooks",
+        "_pop_saved_tensors_default_hooks",
+        "_push_saved_tensors_default_hooks",
+    )
+)
+
+_AO_DEBUG = os.environ.get("UNSLOTH_AO_DEBUG", "") in ("1", "true", "True")
 
 
 @contextlib.contextmanager
 def _pop_default_hooks_temporarily():
-    """Pop ALL active saved_tensors_default_hooks for the body, then re-push.
+    """Pop all active saved-tensors-default-hooks for the body, then re-push.
 
-    `torch.func.{grad, vjp, jacrev, hessian}` rejects ANY active saved-tensor
-    hooks. `disable_saved_tensors_hooks` only flips a flag and does not pop
-    already-pushed hooks, so it is insufficient when OffloadActivations is
-    currently active on the stack.
+    `torch.autograd.graph.disable_saved_tensors_hooks` only flips a flag and
+    does not pop already-pushed hooks, so it is insufficient when
+    `OffloadActivations` is currently active on the stack.
     """
-    import os
-    import torch
     ag = torch._C._autograd
-    debug = os.environ.get("UNSLOTH_AO_DEBUG", "") == "1"
     popped: list = []
     try:
-        # Drain the entire stack so torch.func sees no active hooks.
         while True:
             try:
                 top = ag._top_saved_tensors_default_hooks(False)
@@ -60,29 +75,51 @@ def _pop_default_hooks_temporarily():
             except RuntimeError:
                 break
             popped.append((pack, unpack))
-        if debug:
+        if _AO_DEBUG:
             print(f"[ao_disable] popped {len(popped)} hook(s)", flush=True)
         yield
     finally:
-        # Re-push in reverse order to restore original stack ordering.
         for pack, unpack in reversed(popped):
             ag._push_saved_tensors_default_hooks(pack, unpack)
-        if debug:
+        if _AO_DEBUG:
             print(f"[ao_disable] restored {len(popped)} hook(s)", flush=True)
 
 
-def maybe_disable_trl_activation_offloading(trainer):
+def maybe_disable_trl_activation_offloading(_trainer=None):
+    """Return a context manager that disables active saved-tensor hooks.
+
+    Parameters
+    ----------
+    _trainer
+        Ignored. Accepted for backward compatibility with existing call sites
+        (e.g. `unsloth_fused_ce_loss(trainer=...)` in unsloth's llama/mistral
+        modules, which hardcode `trainer=None`). The wrapper keys off live
+        hook-stack state, not this arg, so passing ``None`` is fine.
+
+    Returns
+    -------
+    contextlib.AbstractContextManager
+        - `nullcontext` when no default hooks are pushed, or when the private
+          torch hook-stack API is unavailable (so AO is effectively a no-op).
+        - A pop-and-restore context manager when hooks are active.
+
+    Raises
+    ------
+    RuntimeError
+        If hooks are active but the private hook-stack API is unavailable on
+        this torch build — we cannot safely run `torch.func` under active
+        hooks, and silently returning `nullcontext` would crash the backward
+        pass with a confusing "torch.func don't yet support saved tensor
+        hooks" error deep in autograd.
     """
-    Some Unsloth fused autograd paths call `torch.func.grad_and_value`, which
-    does not support any active saved-tensor hooks (the rejection is on
-    presence, not behavior — even no-op hooks fail). The branch wires this
-    wrapper into call sites that pass `trainer=None` (e.g. llama.py:1549),
-    so the trainer arg is unreliable. We instead key off the live state of
-    the saved-tensor-hook stack: if anything is pushed, pop it for the body
-    and restore it after. When the stack is empty (AO disabled, or nothing
-    active for any other reason), this is a no-op.
-    """
-    import torch
+    del _trainer  # explicit "I know this is unused"
+    if not _HOOK_STACK_API_AVAILABLE:
+        # No way to inspect the stack. Assume empty and no-op. If hooks ARE
+        # active, the caller's torch.func region will raise with its own
+        # clear message — we don't want to double-raise here and break users
+        # who aren't using activation offloading at all.
+        return contextlib.nullcontext()
+
     try:
         top = torch._C._autograd._top_saved_tensors_default_hooks(False)
     except RuntimeError:
