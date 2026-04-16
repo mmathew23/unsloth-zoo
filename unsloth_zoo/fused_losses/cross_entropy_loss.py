@@ -50,7 +50,7 @@ except Exception:
 # Module-level flag: None = untested, True = works, False = skip compile.
 _FUSED_CE_COMPILE_SUPPORTED = None if \
     os.environ.get("UNSLOTH_FUSED_CE_COMPILE_DISABLE", "0") != "1" else False
-_TRL_ACTIVATION_OFFLOAD_NOOP_MANAGER = None
+_TRL_AO_NOOP_MANAGER_CLS = None # None = unchecked, False = unavailable, or the class
 
 @functools.cache
 def _get_mapping(autograd):
@@ -69,29 +69,37 @@ def apply_autograd_function(autograd, mapping):
 pass
 
 
-def _maybe_disable_trl_activation_offloading():
+def _get_noop_manager():
+    global _TRL_AO_NOOP_MANAGER_CLS
+    if _TRL_AO_NOOP_MANAGER_CLS is not None:
+        return _TRL_AO_NOOP_MANAGER_CLS
+    try:
+        from trl.models.activation_offloading import NoOpManager
+        _TRL_AO_NOOP_MANAGER_CLS = NoOpManager
+    except Exception:
+        _TRL_AO_NOOP_MANAGER_CLS = False
+    return _TRL_AO_NOOP_MANAGER_CLS
+
+def _maybe_disable_trl_activation_offloading(trainer):
     """
     `unsloth_fused_ce_loss` uses `torch.func.grad_and_value` internally, which
-    does not support active saved tensor hooks. When TRL activation offloading is
-    enabled, temporarily install TRL's own `NoOpManager` so the fused loss can
-    run while keeping offloading active for the rest of the model.
+    does not support active saved tensor hooks. When TRL activation offloading
+    is enabled, temporarily install TRL's own `NoOpManager` so the fused loss
+    can run while keeping offloading active for the rest of the model.
     """
-    global _TRL_ACTIVATION_OFFLOAD_NOOP_MANAGER
-
-    if _TRL_ACTIVATION_OFFLOAD_NOOP_MANAGER is False:
+    if trainer is None:
         return contextlib.nullcontext()
 
-    if _TRL_ACTIVATION_OFFLOAD_NOOP_MANAGER is None:
-        try:
-            from trl.models.activation_offloading import NoOpManager
-            _TRL_ACTIVATION_OFFLOAD_NOOP_MANAGER = NoOpManager
-        except Exception:
-            _TRL_ACTIVATION_OFFLOAD_NOOP_MANAGER = False
-            return contextlib.nullcontext()
-    pass
+    args = getattr(trainer, "args", None)
+    if args is None or not getattr(args, "activation_offloading", False):
+        return contextlib.nullcontext()
 
-    return _TRL_ACTIVATION_OFFLOAD_NOOP_MANAGER()
+    cls = _get_noop_manager()
+    if cls is False:
+        return contextlib.nullcontext()
+    return cls()
 pass
+
 
 def compute_fused_ce_loss(
     hidden_states  : torch.Tensor,
@@ -496,7 +504,7 @@ def unsloth_fused_ce_loss(
     if hidden_states.device != device:
         hidden_states = hidden_states.to(device = device)
 
-    with _maybe_disable_trl_activation_offloading():
+    with _maybe_disable_trl_activation_offloading(trainer):
         return apply_autograd_function(UnslothFusedLoss, dict(
             loss_function = compute_fused_ce_loss,
             hidden_states = hidden_states,
