@@ -31,22 +31,62 @@ def _get_noop_manager():
     return _TRL_AO_NOOP_MANAGER_CLS
 
 
+@contextlib.contextmanager
+def _pop_default_hooks_temporarily():
+    """Pop ALL active saved_tensors_default_hooks for the body, then re-push.
+
+    `torch.func.{grad, vjp, jacrev, hessian}` rejects ANY active saved-tensor
+    hooks. `disable_saved_tensors_hooks` only flips a flag and does not pop
+    already-pushed hooks, so it is insufficient when OffloadActivations is
+    currently active on the stack.
+    """
+    import os
+    import torch
+    ag = torch._C._autograd
+    debug = os.environ.get("UNSLOTH_AO_DEBUG", "") == "1"
+    popped: list = []
+    try:
+        # Drain the entire stack so torch.func sees no active hooks.
+        while True:
+            try:
+                top = ag._top_saved_tensors_default_hooks(False)
+            except RuntimeError:
+                break
+            if top is None:
+                break
+            pack, unpack = top
+            try:
+                ag._pop_saved_tensors_default_hooks()
+            except RuntimeError:
+                break
+            popped.append((pack, unpack))
+        if debug:
+            print(f"[ao_disable] popped {len(popped)} hook(s)", flush=True)
+        yield
+    finally:
+        # Re-push in reverse order to restore original stack ordering.
+        for pack, unpack in reversed(popped):
+            ag._push_saved_tensors_default_hooks(pack, unpack)
+        if debug:
+            print(f"[ao_disable] restored {len(popped)} hook(s)", flush=True)
+
+
 def maybe_disable_trl_activation_offloading(trainer):
     """
     Some Unsloth fused autograd paths call `torch.func.grad_and_value`, which
-    does not support active saved tensor hooks. When TRL activation offloading
-    is enabled, temporarily install TRL's own `NoOpManager` so those regions
-    can run while leaving activation offloading active for the rest of the
-    model step.
+    does not support any active saved-tensor hooks (the rejection is on
+    presence, not behavior — even no-op hooks fail). The branch wires this
+    wrapper into call sites that pass `trainer=None` (e.g. llama.py:1549),
+    so the trainer arg is unreliable. We instead key off the live state of
+    the saved-tensor-hook stack: if anything is pushed, pop it for the body
+    and restore it after. When the stack is empty (AO disabled, or nothing
+    active for any other reason), this is a no-op.
     """
-    if trainer is None:
+    import torch
+    try:
+        top = torch._C._autograd._top_saved_tensors_default_hooks(False)
+    except RuntimeError:
+        top = None
+    if top is None:
         return contextlib.nullcontext()
-
-    args = getattr(trainer, "args", None)
-    if args is None or not getattr(args, "activation_offloading", False):
-        return contextlib.nullcontext()
-
-    cls = _get_noop_manager()
-    if cls is False:
-        return contextlib.nullcontext()
-    return cls()
+    return _pop_default_hooks_temporarily()

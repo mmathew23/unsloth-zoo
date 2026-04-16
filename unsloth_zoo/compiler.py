@@ -852,6 +852,11 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "KWARGS_TYPE" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import KWARGS_TYPE\n"
+    if "maybe_disable_trl_activation_offloading" in new_source:
+        imports += (
+            "from unsloth_zoo.activation_offloading import "
+            "maybe_disable_trl_activation_offloading\n"
+        )
     if (
         "forward_moe_backend" in new_source
         or "select_moe_backend" in new_source

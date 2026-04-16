@@ -25,7 +25,7 @@ import math
 import logging
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
-from .activation_offloading_utils import maybe_disable_trl_activation_offloading
+from .activation_offloading import maybe_disable_trl_activation_offloading
 from .device_type import DEVICE_TYPE, device_synchronize
 from .temporary_patches.common import torch_compile_options
 RL_REPLACEMENTS = dict()

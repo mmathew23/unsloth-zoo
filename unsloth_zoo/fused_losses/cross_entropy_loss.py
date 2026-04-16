@@ -26,7 +26,7 @@ import inspect
 import functools
 import math
 import os
-from ..activation_offloading_utils import maybe_disable_trl_activation_offloading
+from ..activation_offloading import maybe_disable_trl_activation_offloading
 from ..temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 from ..device_type import DEVICE_TYPE
         
