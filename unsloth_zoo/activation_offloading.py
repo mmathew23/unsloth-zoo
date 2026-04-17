@@ -31,8 +31,230 @@ restores hooks, e.g. during `unsloth_fused_ce_loss` forward.
 
 import contextlib
 import os
+from typing import Any, Optional
 
 import torch
+
+
+# ---------------------------------------------------------------------------
+# VL-specific AO defaults and env overrides
+# ---------------------------------------------------------------------------
+#
+# TRL's `OffloadActivations` defaults (use_streams=True, use_pin_memory=True,
+# min_offload_size=1024) are tuned for dense text decoder stacks. On
+# vision-language models (Qwen2.5-VL, Qwen3-VL, LLaVA, Gemma3, MLLaMA,
+# Idefics*) those defaults *inflate* CUDA reserved memory by 1–3 GiB because
+# the forward/backward stream stashes and `record_stream` leases keep vision
+# tower activations resident on the GPU across the forward→backward boundary,
+# fragmenting the caching allocator.
+#
+# The fix: detect VLMs at trainer build time and default `use_streams=False`
+# for them. This removes the stash paths entirely and makes the allocator
+# lifetime deterministic. Users can still force the TRL default on via
+# `UNSLOTH_AO_USE_STREAMS=1`. Text-path defaults are unchanged.
+
+_VL_MODEL_TYPES: frozenset[str] = frozenset({
+    "qwen2_vl",
+    "qwen2_5_vl",
+    "qwen3_vl",
+    "qwen3_vl_moe",
+    "llava",
+    "llava_next",
+    "llava_next_video",
+    "llava_onevision",
+    "gemma3",
+    "mllama",
+    "idefics",
+    "idefics2",
+    "idefics3",
+    "paligemma",
+})
+
+
+def _parse_bool_env(name: str) -> Optional[bool]:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return None
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return None
+
+
+def is_vlm_model(model: Any) -> bool:
+    """Return True when the model carries a vision encoder.
+
+    Checks the model's ``config.vision_config`` as well as ``config.model_type``
+    against a small list of known VL families. Handles PEFT wrappers and
+    Unsloth's ``model.model`` nesting by walking one level of attribute
+    indirection before giving up.
+    """
+    if model is None:
+        return False
+
+    seen_ids: set[int] = set()
+    current = model
+    for _ in range(5):
+        if current is None or id(current) in seen_ids:
+            break
+        seen_ids.add(id(current))
+        cfg = getattr(current, "config", None)
+        if cfg is not None:
+            if getattr(cfg, "vision_config", None) is not None:
+                return True
+            mt = getattr(cfg, "model_type", "")
+            if isinstance(mt, str) and mt in _VL_MODEL_TYPES:
+                return True
+        # Unwrap common wrappers: PEFT .base_model, Unsloth .model, etc.
+        nxt = getattr(current, "base_model", None)
+        if nxt is not None and nxt is not current:
+            current = nxt
+            continue
+        nxt = getattr(current, "module", None)
+        if nxt is not None and nxt is not current:
+            current = nxt
+            continue
+        nxt = getattr(current, "model", None)
+        if nxt is not None and nxt is not current:
+            current = nxt
+            continue
+        break
+    return False
+
+
+def is_grpo_trainer(trainer: Any) -> bool:
+    """Return True when the trainer is a TRL GRPO trainer or an Unsloth
+    subclass thereof.
+
+    TRL dynamically subclasses GRPOTrainer from multiple places and Unsloth's
+    monkey-patch wraps further subclasses (``UnslothGRPOTrainer``). A name
+    check is the cheapest low-coupling way to recognise the family without
+    importing TRL's internals.
+    """
+    if trainer is None:
+        return False
+    for cls in type(trainer).__mro__:
+        name = getattr(cls, "__name__", "")
+        if "GRPOTrainer" in name:
+            return True
+    return False
+
+
+def resolve_ao_kwargs(model: Any, trainer: Any = None) -> dict[str, Any]:
+    """Compute VL/GRPO-aware kwargs for ``get_act_offloading_ctx_manager``.
+
+    Precedence (highest wins): env override → VL/GRPO default → TRL default
+    (absent from returned dict). Returned keys pass straight through to
+    ``get_act_offloading_ctx_manager``; absent keys mean "use TRL's own
+    default" — we do not duplicate TRL's defaults here to keep future TRL
+    changes transparent.
+
+    The ``trainer`` argument is optional so older callers that only pass
+    ``model`` continue to work. When provided, GRPO trainers default to
+    ``use_streams=False`` for the same reason as VL models: TRL's stream-based
+    pack/unpack path keeps a forward stash of live GPU tensors across the
+    forward→backward boundary. On GRPO this costs ~0.25 GiB on text at
+    typical configs without producing any measurable saving (activations are
+    already small relative to the vLLM slab + weights + optimizer state).
+    """
+    kwargs: dict[str, Any] = {}
+
+    if is_vlm_model(model):
+        # Phase-3 measured win on Qwen3-VL-2B: turning streams off removes the
+        # bwd_tensor_stash (peaked at 70 tensors in profiling) and the
+        # record_stream leases that inflate reserved memory by ~1.3 GiB while
+        # delivering a 1.7 GiB saving vs ao=off.
+        kwargs["use_streams"] = False
+
+    if is_grpo_trainer(trainer):
+        # GRPO has a small activation surface (decoder-only forward inside
+        # _compute_loss, with GC already active) and the peak is dominated by
+        # the vLLM slab + weights + optimizer state. streams=on TRL default
+        # adds a forward-stash that costs reserved memory without any
+        # offsetting saving.
+        kwargs["use_streams"] = False
+
+    streams_override = _parse_bool_env("UNSLOTH_AO_USE_STREAMS")
+    if streams_override is not None:
+        kwargs["use_streams"] = streams_override
+
+    pin_override = _parse_bool_env("UNSLOTH_AO_USE_PIN_MEMORY")
+    if pin_override is not None:
+        kwargs["use_pin_memory"] = pin_override
+
+    min_size_raw = os.environ.get("UNSLOTH_AO_MIN_OFFLOAD_SIZE", "").strip()
+    if min_size_raw:
+        try:
+            kwargs["min_offload_size"] = int(min_size_raw)
+        except ValueError:
+            pass
+
+    max_fwd_raw = os.environ.get("UNSLOTH_AO_MAX_FWD_STASH_SIZE", "").strip()
+    if max_fwd_raw:
+        try:
+            kwargs["max_fwd_stash_size"] = int(max_fwd_raw)
+        except ValueError:
+            pass
+
+    return kwargs
+
+
+def install_ao_decoder_only_gate(model: Any) -> list:
+    """Gate AO to decoder layers only by installing TRL's ``NoOpManager``
+    around the model's vision tower and embed/merge region.
+
+    Returns a list of handles that can be removed to uninstall the gate. Does
+    nothing unless ``UNSLOTH_AO_DECODER_ONLY=1``. Phase-3 measurements show
+    this does not improve Qwen3-VL-2B peak memory on top of ``use_streams=False``,
+    so it is off by default and intentionally left as an opt-in tool for
+    models where the vision tower dominates.
+    """
+    if _parse_bool_env("UNSLOTH_AO_DECODER_ONLY") is not True:
+        return []
+    try:
+        from trl.models.activation_offloading import NoOpManager
+    except Exception:
+        return []
+
+    noop_ctx = NoOpManager()
+    handles: list = []
+
+    def _gate(module: Any) -> None:
+        def pre(_m, _inputs):
+            noop_ctx.__enter__()
+
+        def post(_m, _inputs, _outputs):
+            try:
+                noop_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+
+        h1 = module.register_forward_pre_hook(pre)
+        h2 = module.register_forward_hook(post)
+        handles.extend([h1, h2])
+
+    # Walk through PEFT + Unsloth wrappers to find the HF model root.
+    core = model
+    for _ in range(4):
+        nxt = getattr(core, "base_model", None)
+        if nxt is not None and nxt is not core and hasattr(nxt, "model"):
+            core = nxt
+            continue
+        break
+    core = getattr(core, "model", core)
+
+    visual = getattr(core, "visual", None)
+    if visual is not None:
+        _gate(visual)
+
+    text_core = getattr(core, "model", None)
+    if text_core is not None:
+        embed = getattr(text_core, "embed_tokens", None)
+        if embed is not None:
+            _gate(embed)
+
+    return handles
 
 
 # Capability check for the private saved-tensors-default-hooks stack API.

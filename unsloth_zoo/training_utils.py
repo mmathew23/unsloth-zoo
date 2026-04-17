@@ -201,18 +201,29 @@ def maybe_enable_trl_activation_offloading(trainer: Any) -> None:
     Align trainer/model state with TRL activation offloading and install the
     standard TRL activation-offloading context manager.
 
-    Flags
-    -----
-    ``UNSLOTH_AO_USE_STREAMS`` (env):
-        If unset, TRL's default ``use_streams=True`` is used and an
-        already-installed context manager is preserved.
-        If set to "0"/"false"/"no"/"off", disables pack/unpack stream
-        overlap (reduces GPU transient buffers at a small throughput cost;
-        sometimes a net memory + throughput win on vision stacks).
-        If set to "1"/"true"/"yes"/"on", forces ``use_streams=True``.
-        When explicitly set, this also REPLACES any context manager that
-        TRL's own trainer ``__init__`` may have pre-installed — otherwise
-        the toggle has no effect on SFT trainers.
+    This wrapper applies Unsloth-specific defaults on top of TRL's base
+    behaviour. In particular it auto-detects vision-language models and
+    disables the CUDA-stream offload path for them, because the default
+    `use_streams=True` keeps a stash of GPU tensors alive across the
+    forward→backward boundary and inflates reserved memory on SFT VL by
+    ~1.3 GiB. Text models keep TRL defaults.
+
+    Env overrides (precedence over auto-detect):
+
+    ``UNSLOTH_AO_USE_STREAMS``
+        ``"1"`` forces stream overlap on, ``"0"`` forces it off. Unset = use
+        the VL-aware default (off for VLMs, on for text).
+    ``UNSLOTH_AO_USE_PIN_MEMORY``
+        ``"1"`` / ``"0"`` to force pinned-CPU staging on or off.
+    ``UNSLOTH_AO_MIN_OFFLOAD_SIZE``
+        Integer bytes. Skip tensors smaller than this.
+    ``UNSLOTH_AO_MAX_FWD_STASH_SIZE``
+        Integer. Applies only when streams are on.
+    ``UNSLOTH_AO_DECODER_ONLY``
+        ``"1"`` to install ``NoOpManager`` around the vision tower and embed
+        tokens so only decoder-layer activations are offloaded. Off by
+        default; measured no additional benefit on Qwen3-VL-2B atop
+        ``use_streams=False`` but left as an opt-in for other VL stacks.
     """
     args = getattr(trainer, "args", None)
     model = getattr(trainer, "model", None)
@@ -239,19 +250,28 @@ def maybe_enable_trl_activation_offloading(trainer: Any) -> None:
         except Exception:
             return
 
-    use_streams_override = _read_ao_use_streams_env()
-    ao_kwargs = {"model": model}
-    if use_streams_override is not None:
-        import inspect
-        if "use_streams" in inspect.signature(get_act_offloading_ctx_manager).parameters:
-            ao_kwargs["use_streams"] = use_streams_override
+    from .activation_offloading import (
+        resolve_ao_kwargs,
+        install_ao_decoder_only_gate,
+    )
 
-    # Preserve an already-installed ctx manager unless the user explicitly
-    # asked for an override via the env flag.
-    if use_streams_override is None and hasattr(trainer, "maybe_activation_offload_context"):
+    overrides = resolve_ao_kwargs(model, trainer=trainer)
+    import inspect
+    sig_params = inspect.signature(get_act_offloading_ctx_manager).parameters
+    ao_kwargs = {"model": model}
+    for key, value in overrides.items():
+        if key in sig_params:
+            ao_kwargs[key] = value
+
+    pre_installed = hasattr(trainer, "maybe_activation_offload_context")
+    # Rebuild whenever we have any override (VL default or env override). If
+    # no overrides and TRL already built a ctx, keep it — matches prior behaviour.
+    if not overrides and pre_installed:
+        install_ao_decoder_only_gate(model)
         return
 
     trainer.maybe_activation_offload_context = get_act_offloading_ctx_manager(**ao_kwargs)
+    install_ao_decoder_only_gate(model)
 pass
 
 
