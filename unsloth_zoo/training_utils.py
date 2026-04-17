@@ -169,11 +169,50 @@ def configure_activation_offloading_checkpointing(
 pass
 
 
+_AO_USE_STREAMS_TRUE  = ("1", "true", "yes",  "on")
+_AO_USE_STREAMS_FALSE = ("0", "false", "no", "off")
+
+
+def _read_ao_use_streams_env():
+    """Read the `UNSLOTH_AO_USE_STREAMS` toggle.
+
+    Returns
+    -------
+    bool | None
+        ``True`` / ``False`` when the env var is set to a recognised value,
+        ``None`` when unset (meaning "use TRL's default of `use_streams=True`
+        and don't override an already-installed context manager").
+    """
+    import os
+    raw = os.environ.get("UNSLOTH_AO_USE_STREAMS")
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in _AO_USE_STREAMS_TRUE:
+        return True
+    if value in _AO_USE_STREAMS_FALSE:
+        return False
+    return None
+
+
 @torch.no_grad
 def maybe_enable_trl_activation_offloading(trainer: Any) -> None:
     """
     Align trainer/model state with TRL activation offloading and install the
-    standard TRL activation-offloading context manager if it is not already set.
+    standard TRL activation-offloading context manager.
+
+    Flags
+    -----
+    ``UNSLOTH_AO_USE_STREAMS`` (env):
+        If unset, TRL's default ``use_streams=True`` is used and an
+        already-installed context manager is preserved.
+        If set to "0"/"false"/"no"/"off", disables pack/unpack stream
+        overlap (reduces GPU transient buffers at a small throughput cost;
+        sometimes a net memory + throughput win on vision stacks).
+        If set to "1"/"true"/"yes"/"on", forces ``use_streams=True``.
+        When explicitly set, this also REPLACES any context manager that
+        TRL's own trainer ``__init__`` may have pre-installed — otherwise
+        the toggle has no effect on SFT trainers.
     """
     args = getattr(trainer, "args", None)
     model = getattr(trainer, "model", None)
@@ -192,9 +231,6 @@ def maybe_enable_trl_activation_offloading(trainer: Any) -> None:
             gradient_checkpointing_kwargs = gradient_checkpointing_kwargs,
         )
 
-    if hasattr(trainer, "maybe_activation_offload_context"):
-        return
-
     try:
         from trl.models import get_act_offloading_ctx_manager
     except Exception:
@@ -203,7 +239,19 @@ def maybe_enable_trl_activation_offloading(trainer: Any) -> None:
         except Exception:
             return
 
-    trainer.maybe_activation_offload_context = get_act_offloading_ctx_manager(model = model)
+    use_streams_override = _read_ao_use_streams_env()
+    ao_kwargs = {"model": model}
+    if use_streams_override is not None:
+        import inspect
+        if "use_streams" in inspect.signature(get_act_offloading_ctx_manager).parameters:
+            ao_kwargs["use_streams"] = use_streams_override
+
+    # Preserve an already-installed ctx manager unless the user explicitly
+    # asked for an override via the env flag.
+    if use_streams_override is None and hasattr(trainer, "maybe_activation_offload_context"):
+        return
+
+    trainer.maybe_activation_offload_context = get_act_offloading_ctx_manager(**ao_kwargs)
 pass
 
 
