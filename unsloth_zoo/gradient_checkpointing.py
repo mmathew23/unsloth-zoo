@@ -915,6 +915,26 @@ def _gc_disable_cpu_offload():
 pass
 
 
+def _gc_env_flag(name: str) -> bool:
+    value = os.environ.get(name, None)
+    if value is None:
+        return False
+    return str(value).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _gc_eager_prefetch() -> bool:
+    return _gc_env_flag("UNSLOTH_GC_EAGER_PREFETCH")
+
+
+def _gc_aux_stream() -> bool:
+    return _gc_env_flag("UNSLOTH_GC_AUX_STREAM")
+
+
+def _gc_narrow_wait() -> bool:
+    return _gc_env_flag("UNSLOTH_GC_NARROW_WAIT")
+pass
+
+
 _pinned_bytes_allocated: int = 0
 _cpu_ram_warned: bool = False
 
@@ -1018,6 +1038,7 @@ class UnslothGradientCheckpointer:
     _next_pack_idx: int = 0             # monotonic pack counter for ring-slot assignment
     _main_streams: dict = {}
     _extra_streams: dict = {}
+    _extra_streams_aux: dict = {}
     _initialized: bool = False
 
     _current_gc_index: int = 0
@@ -1087,9 +1108,13 @@ class UnslothGradientCheckpointer:
                 if DEVICE_TYPE in ("cuda", "hip"):
                     cls._main_streams[device_idx] = torch.cuda.default_stream(device)
                     cls._extra_streams[device_idx] = torch.cuda.Stream(device)
+                    if _gc_aux_stream():
+                        cls._extra_streams_aux[device_idx] = torch.cuda.Stream(device)
                 elif DEVICE_TYPE == "xpu":
                     cls._main_streams[device_idx] = torch.xpu.current_stream(device)
                     cls._extra_streams[device_idx] = torch.xpu.Stream(device)
+                    if _gc_aux_stream():
+                        cls._extra_streams_aux[device_idx] = torch.xpu.Stream(device)
         except Exception:
             print("="*10 + "\n")
             print("Unsloth: Your setup does not support `PYTORCH_CUDA_ALLOC_CONF`\n")
@@ -1160,6 +1185,7 @@ class UnslothGradientCheckpointer:
         cls._gpu_restore_persistent = {}
         cls._main_streams = {}
         cls._extra_streams = {}
+        cls._extra_streams_aux = {}
         cls._initialized = False
 
     def __init__(self, is_last_layer: bool = False):
@@ -1340,6 +1366,17 @@ class UnslothGradientCheckpointer:
         return buf
 
     @classmethod
+    def _resolve_extra_stream(cls, device_index: int, stream_idx: int):
+        """Pick the extra stream for a pack. stream_idx=0 always returns the
+        primary extra stream; stream_idx=1 returns the aux stream when
+        UNSLOTH_GC_AUX_STREAM is enabled, else falls back to primary."""
+        if stream_idx == 1:
+            aux = cls._extra_streams_aux.get(device_index)
+            if aux is not None:
+                return aux
+        return cls._extra_streams[device_index]
+
+    @classmethod
     def _issue_h2d_for_pack(cls, packed):
         """Start the H2D copy for ``packed`` on its ring slot, idempotent.
 
@@ -1366,8 +1403,17 @@ class UnslothGradientCheckpointer:
             main_stream = torch.xpu.current_stream(device)
         else:
             main_stream = cls._main_streams[device_index]
-        extra_stream = cls._extra_streams[device_index]
-        extra_stream.wait_stream(main_stream)
+        stream_idx = getattr(packed, "stream_idx", 0) or 0
+        extra_stream = cls._resolve_extra_stream(device_index, stream_idx)
+        # Variant C: narrow-wait. The D2H on the extra stream is a strict
+        # dependency; FIFO on a single stream already orders D2H-before-H2D,
+        # but under aux-stream (Variant B) the consumer stream may differ.
+        # Event-wait is sufficient in both cases.
+        pack_event = state.get("pack_event")
+        if _gc_narrow_wait() and pack_event is not None:
+            cls._wait_event(extra_stream, pack_event)
+        else:
+            extra_stream.wait_stream(main_stream)
         with torch_gpu_stream(extra_stream):
             gpu_buf[:numel].copy_(cpu_buffer[:numel], non_blocking=True)
             result = gpu_buf[:numel].view(shape)
@@ -1410,7 +1456,12 @@ class UnslothGradientCheckpointer:
             main_stream = torch.xpu.current_stream(device)
         else:
             main_stream = cls._main_streams[device_index]
-        extra_stream = cls._extra_streams[device_index]
+        # Variant B: round-robin across primary + aux extra streams by pack index.
+        pack_idx = cls._next_pack_idx
+        stream_idx = (pack_idx % 2) if _gc_aux_stream() else 0
+        extra_stream = cls._resolve_extra_stream(device_index, stream_idx)
+        # Correctness-critical: GPU source tensor must not be read before its
+        # main-stream producer compute completes. DO NOT remove this barrier.
         extra_stream.wait_stream(main_stream)
         module_name = _gc_profile_module_name()
         start_time = time.perf_counter() if _gc_profile_enabled() else 0.0
@@ -1420,6 +1471,7 @@ class UnslothGradientCheckpointer:
             except Exception:
                 pass
             cpu_buffer[:numel].view(shape).copy_(tensor, non_blocking=True)
+            pack_event = cls._record_stream_event(extra_stream)
         if _gc_profile_enabled():
             _gc_profile_record(
                 mode = "nonreentrant_hooks",
@@ -1445,10 +1497,12 @@ class UnslothGradientCheckpointer:
         )
         # Prefetch-mode bookkeeping: assign pack index and register as pending.
         # Noop for single-slot (non-prefetch) unpack path.
-        packed.pack_idx = cls._next_pack_idx
+        packed.pack_idx = pack_idx
+        packed.stream_idx = stream_idx
         cls._next_pack_idx += 1
         packed._state["h2d_issued"] = False
         packed._state["result_view"] = None
+        packed._state["pack_event"] = pack_event
         cls._pending_unpacks.append(packed)
         return packed
 
@@ -1499,7 +1553,8 @@ class UnslothGradientCheckpointer:
             main_stream = cls._main_streams[device_index]
         restore_event = packed._state["restore_event"]
         if not cls._wait_event(main_stream, restore_event):
-            extra_stream = cls._extra_streams[device_index]
+            stream_idx = getattr(packed, "stream_idx", 0) or 0
+            extra_stream = cls._resolve_extra_stream(device_index, stream_idx)
             main_stream.wait_stream(extra_stream)
 
         result = packed._state["result_view"]
@@ -1589,6 +1644,7 @@ class PackedCPUBuffer:
         "numel",
         "module_name",
         "pack_idx",
+        "stream_idx",
         "_state",
         "_finalizer",
         "__weakref__",
@@ -1618,9 +1674,11 @@ class PackedCPUBuffer:
             "dtype": dtype,
             "device_index": device_index,
             "restore_event": None,
+            "pack_event": None,
             "released": False,
             "owner_cls": owner_cls,
         }
+        self.stream_idx = 0
         self._finalizer = weakref.finalize(self, PackedCPUBuffer._finalize, self._state)
 
     @staticmethod
@@ -2107,6 +2165,66 @@ def _unsloth_checkpoint_reentrant(function, *args, preserve_rng_state=True):
     return UnslothCheckpointFunction.apply(function, preserve_rng_state, *args)
 
 
+def _find_first_grad_tensor(outputs):
+    """Walk an output pytree for the first tensor with requires_grad and a grad_fn.
+    Returns the tensor or None. Traverses tuples/lists/dicts; stops on first hit."""
+    if torch.is_tensor(outputs):
+        if outputs.requires_grad and outputs.grad_fn is not None:
+            return outputs
+        return None
+    if isinstance(outputs, (tuple, list)):
+        for item in outputs:
+            found = _find_first_grad_tensor(item)
+            if found is not None:
+                return found
+        return None
+    if isinstance(outputs, dict):
+        for item in outputs.values():
+            found = _find_first_grad_tensor(item)
+            if found is not None:
+                return found
+        return None
+    return None
+
+
+def _install_eager_prefetch_hook(outputs, cls):
+    """Variant A: on first backward gradient arriving at this checkpoint's
+    boundary, eagerly issue H2D copies for up to ring_size-1 pending packs
+    (tail of _pending_unpacks, i.e. reverse pack order = consume order).
+
+    Uses per-tensor register_hook (not register_multi_grad_hook) so the cb
+    fires as soon as one output's backward arrives; multi_grad_hook would
+    require ALL outputs to receive gradients which is fragile for models
+    with dropped return values."""
+    target = _find_first_grad_tensor(outputs)
+    if target is None:
+        return
+    fired = [False]
+
+    def _cb(grad):
+        if fired[0]:
+            return
+        fired[0] = True
+        try:
+            pending = cls._pending_unpacks
+            if not pending:
+                return
+            cap = max(0, _GC_PREFETCH_RING_SIZE - 1)
+            n = min(len(pending), cap)
+            # tail first -- matches LIFO backward consume order
+            for k in range(1, n + 1):
+                p = pending[-k]
+                if not p._state.get("h2d_issued"):
+                    cls._issue_h2d_for_pack(p)
+        except Exception:
+            pass
+
+    try:
+        target.register_hook(_cb)
+    except Exception:
+        pass
+
+
 def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
     """Non-reentrant checkpoint using native PyTorch checkpoint plus scoped input offload."""
     preserve = kwargs.pop("preserve_rng_state", True)
@@ -2132,6 +2250,7 @@ def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
         token = None
         is_hooks = offload_backend in ("hooks", "hooks_prefetch")
         use_prefetch = offload_backend == "hooks_prefetch"
+        eager = use_prefetch and _gc_eager_prefetch() and not _gc_disable_cpu_offload()
         if (not _gc_disable_cpu_offload()) and is_hooks:
             token = _hooks_offload_state.set({
                 "offloader": offloader,
@@ -2144,7 +2263,7 @@ def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
             # installation.
             if is_hooks and not _gc_disable_cpu_offload():
                 with UnslothOffloadActivations(dtype=dtype):
-                    return original_checkpoint(
+                    outputs = original_checkpoint(
                         function, *args,
                         use_reentrant=False,
                         preserve_rng_state=preserve,
@@ -2153,6 +2272,9 @@ def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
                         debug=debug,
                         **kwargs
                     )
+                if eager:
+                    _install_eager_prefetch_hook(outputs, cls)
+                return outputs
             return original_checkpoint(
                 function, *args,
                 use_reentrant=False,
