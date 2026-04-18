@@ -208,8 +208,11 @@ from unsloth_zoo.loss_utils import (
     unsloth_fused_ce_loss,
 )
 
+if UNSLOTH_STUDIO_ENABLED:
+    from unsloth_zoo.loss_utils import fast_linear_cross_entropy
+
 scaled_dot_product_attention = torch.nn.functional.scaled_dot_product_attention
-#@torch.compiler.disable(recursive = False)
+@torch.compiler.disable(recursive = False)
 def disable_compile_scaled_dot_product_attention(*args, **kwargs):
     return scaled_dot_product_attention(*args, **kwargs)
 pass
@@ -816,7 +819,7 @@ def create_new_function(
 
     if add_torch_compile:
         new_source = (
-            "#@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)\n"
+            "@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)\n"
             f"{new_source}"
         )
     pass
@@ -852,11 +855,6 @@ def create_new_function(
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "KWARGS_TYPE" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import KWARGS_TYPE\n"
-    if "maybe_disable_trl_activation_offloading" in new_source:
-        imports += (
-            "from unsloth_zoo.activation_offloading import "
-            "maybe_disable_trl_activation_offloading\n"
-        )
     if (
         "forward_moe_backend" in new_source
         or "select_moe_backend" in new_source
@@ -1143,8 +1141,6 @@ def create_standalone_class(
         "use_kernel_forward_from_hub",
         "use_kernelized_func",
         "auto_docstring",
-        "merge_with_config_defaults",
-        "capture_outputs",
         # add more here if needed
     }
 
@@ -1167,7 +1163,6 @@ def create_standalone_class(
 
             skipping = False
             paren_depth = 0
-            skip_base_name = None
 
             for line in lines:
                 if skipping:
@@ -1176,7 +1171,6 @@ def create_standalone_class(
                     if paren_depth <= 0:
                         skipping = False
                         paren_depth = 0
-                        skip_base_name = None
                     continue
 
                 stripped = line.strip()
@@ -1201,7 +1195,6 @@ def create_standalone_class(
                         paren_depth = line.count("(") - line.count(")")
                         if paren_depth > 0:
                             skipping = True
-                            skip_base_name = decorator_base
                         continue  # Strip this decorator line
 
                     # Unknown decorator -> keep it but warn
@@ -1251,36 +1244,26 @@ def create_standalone_class(
 
     if disable is not None:
         compile = (
-            f"#@torch.compile(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
+            f"@torch.compile(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
             if not disable
-            else "#@torch.compiler.disable(recursive = False)"
+            else "@torch.compiler.disable(recursive = False)"
         )
     else:
         compile = ""
 
     # Create new forward calling optimized function
     parameters = inspect.signature(f.forward).parameters
-    # Build the forwarding call using keyword arguments (name=name) for regular
-    # parameters so that decorators like @merge_with_config_defaults can find
-    # them in **kwargs.  When args are passed positionally, the decorator's
-    # func.__code__.co_varnames lookup fails (it sees the inner wrapper's
-    # varnames, not the original function's), and it injects the arg into kwargs
-    # again, causing "got multiple values for argument 'use_cache'".
+    # .parameters removes **kwargs and *args so we get it back!
     keys = list(parameters.keys())
     values = list(parameters.values())
-    forwarding_parts = []
-    for j, (key, value) in enumerate(zip(keys, values)):
-        value_str = str(value)
-        if value_str.startswith("**"):
-            forwarding_parts.append("**" + key)
-        elif value_str.startswith("*"):
-            forwarding_parts.append("*" + key)
-        elif key == "self":
-            forwarding_parts.append("self")
-        else:
-            forwarding_parts.append(f"{key}={key}")
+    for j, value in enumerate(values):
+        value = str(value)
+        if value.startswith("**"):
+            keys[j] = "**" + keys[j]
+        elif value.startswith("*"):
+            keys[j] = "*" + keys[j]
     pass
-    parameters = ", ".join(forwarding_parts)
+    parameters = ", ".join(keys)
 
     # Now create the forward function!
     # When forward is patched, use the original forward definition from class source
@@ -1288,9 +1271,8 @@ def create_standalone_class(
 
     # Pattern handles both simple signatures and those with return type annotations
     # e.g., "def forward(self, x):" AND "def forward(self, x) -> torch.Tensor:"
-    # Use \s+ after def to avoid matching decorator names that start with "def" (e.g. "default_...")
     definition_matches = re.findall(
-        r"[\s\n]{0,}def\s+[^\(]{1,}\([^)]*\)(?:\s*->\s*[^:]+)?\s*\:",
+        r"[\s\n]{0,}def[^\(]{1,}\([^)]*\)(?:\s*->\s*[^:]+)?\s*\:",
         definition_source,
         flags=re.MULTILINE | re.DOTALL,
     )
@@ -1341,9 +1323,6 @@ def create_standalone_class(
     source = re.sub(r"@auto_docstring[\s]{0,}(\([^\)]{0,}\))?", "", source)
     source = re.sub(r"@use_kernelized_func[\s]{0,}(\([^\)]{0,}\))?", "", source)
     source = re.sub(r"@check_model_inputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    # Transformers 5.x decorators on forward methods
-    source = re.sub(r"@merge_with_config_defaults[\s]{0,}(\([^\)]{0,}\))?", "", source)
-    source = re.sub(r"@capture_outputs[\s]{0,}(\([^\)]{0,}\))?", "", source)
     # source = source.replace("@auto_docstring", "")
 
     # Fix Gemma 3 ignore_index being not set!
@@ -1368,15 +1347,6 @@ def create_standalone_class(
 
     # Fix Q/K/V dtype consistency after RoPE (for 4-bit BNB mode)
     source = fix_attention_dtype_consistency(source)
-
-    # Fix inplace ops on module outputs that have backward hooks (e.g. Gemma 3N
-    # project_per_layer_inputs: per_layer_projection *= scale). Backward hooks
-    # make the output a view, and inplace modification of such views is forbidden.
-    source = re.sub(
-        r"(per_layer_projection) \*= (self\.per_layer_projection_scale\.to\()",
-        r"\1 = \1 * \2",
-        source,
-    )
 
     return source
 
@@ -1674,8 +1644,8 @@ cross_entropy_replacement_3 = """
 NOT_RETURN_LOGITS = os.environ.get('UNSLOTH_RETURN_LOGITS', '0') == '0'
 RETURN_HIDDEN_STATES = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES", "0") == "1"
 
-all_locals = locals()
 n_items = None
+all_locals = locals()
 if 'loss_kwargs' in all_locals:
     __kwargs = all_locals['loss_kwargs']
     if type(__kwargs) is dict:
@@ -1783,8 +1753,7 @@ def apply_fused_lm_head(forward, module=None):
                 r"self\.config\.vocab_size|"
                 r"self\.vocab_size|"
                 r"self\.config\.vocab_size|"
-                r"self\.config\.text_config\.vocab_size|"
-                r"self\.config\.get_text_config\(\)\.vocab_size"
+                r"self\.config\.text_config\.vocab_size"
                 ")",
             )
             .replace("$KWARGS$", r"(?:, \*\*(loss_kwargs|kwargs))?")
@@ -2503,15 +2472,7 @@ def patch_lora_forwards(torch_compile_options):
         if (old1 not in source and add not in source) and (old2 not in source):
             pass
         else:
-            # Linear/GPTQ/LoraParallel reassign result to float32 before the
-            # loop, so they save the original dtype in torch_result_dtype.
-            # Linear4bit/Linear8bitLt only cast x, leaving result untouched,
-            # so result.dtype is still the base-layer dtype at return time.
-            if re.search(r"\btorch_result_dtype\s*=\s*result\.dtype\b", source):
-                dtype_cast = "torch_result_dtype"
-            else:
-                dtype_cast = "result.dtype"
-            replace = f"return lora_forward(result, lora_A, lora_B, dropout, x, scaling).to({dtype_cast})"
+            replace = "return lora_forward(result, lora_A, lora_B, dropout, x, scaling)"
             source = source.replace(old1, replace)
             source = source.replace(old2, replace)
         pass
@@ -2774,24 +2735,6 @@ def fixup_fused_lm_head(source):
         "logits = logits * self.config.get_text_config().final_logit_softcapping",
     )
     # END Gemma 3N fixes
-
-    # Gemma 4: normalize flat_logits/flat_labels to shift_logits/shift_labels
-    # and split chained .view(-1).to(...) into separate lines so pattern 3 matches.
-    source = source.replace(
-        "flat_logits = shift_logits.view(-1,",
-        "shift_logits = shift_logits.view(-1,",
-    )
-    source = re.sub(
-        r"([ \t]+)flat_labels = shift_labels\.view\(-1\)\.to\(([^\)]+)\)",
-        r"\1shift_labels = shift_labels.view(-1)\n\1shift_labels = shift_labels.to(\2)",
-        source,
-    )
-    source = source.replace(
-        "loss = loss_fct(flat_logits, flat_labels)",
-        "loss = loss_fct(shift_logits, shift_labels)",
-    )
-    # END Gemma 4 fixes
-
     return source
 
 
@@ -2967,11 +2910,6 @@ def compile_fla_no_autotune(UNSLOTH_ENABLE_LOGGING=False):
     I noticed this on Qwen-3.5-MoE and potentially Qwen3-Next. 4-5x from initial tests.
     This function is to disable repetitive autotuning and use the first tuned kernel.
     In case one wants to override this, set UNSLOTH_DISABLE_FLA_NO_AUTOTUNE=1
-
-    The previous version only patched fused_norm_gate and l2norm (8 kernels).
-    Qwen3.5 GatedDeltaNet layers use 45+ autotuned kernels across fla.ops and
-    fla.modules (chunk_delta_h, chunk_o, wy_fast, conv, activations, etc).
-    We now walk all fla submodules to patch every Autotuner instance.
     '''
     if os.environ.get("UNSLOTH_DISABLE_FLA_NO_AUTOTUNE", "0") == "1":
         return False
@@ -3003,38 +2941,39 @@ def compile_fla_no_autotune(UNSLOTH_ENABLE_LOGGING=False):
             obj = obj.fn
         return None
 
+    modules_and_kernels = []
     try:
-        import fla
-        import pkgutil
-        import importlib
+        import fla.modules.fused_norm_gate as fused_norm_gate
+        modules_and_kernels.append((fused_norm_gate, [
+            "layer_norm_gated_fwd_kernel", "layer_norm_gated_fwd_kernel1",
+            "layer_norm_gated_bwd_kernel", "layer_norm_gated_bwd_kernel1",
+        ]))
     except ImportError:
-        return False
+        pass
+    try:
+        import fla.modules.l2norm as l2norm_module
+        modules_and_kernels.append((l2norm_module, [
+            "l2norm_fwd_kernel", "l2norm_fwd_kernel1",
+            "l2norm_bwd_kernel", "l2norm_bwd_kernel1",
+        ]))
+    except ImportError:
+        pass
 
     patched = []
-    for _importer, modname, _ispkg in pkgutil.walk_packages(
-        fla.__path__, prefix="fla.",
-    ):
-        try:
-            mod = importlib.import_module(modname)
-        except Exception:
-            continue
-        for name in dir(mod):
-            obj = getattr(mod, name, None)
-            if obj is None:
+    for module, kernel_names in modules_and_kernels:
+        for name in kernel_names:
+            kernel = getattr(module, name, None)
+            if kernel is None:
                 continue
-            autotuner = _unwrap_autotuner(obj)
+            autotuner = _unwrap_autotuner(kernel)
             if autotuner is None:
                 continue
             if not isinstance(autotuner.cache, _ReuseBestCache):
                 autotuner.cache = _ReuseBestCache(autotuner.cache)
-                patched.append(f"{modname}.{name}")
-    pass
+                patched.append(name)
 
     if UNSLOTH_ENABLE_LOGGING and len(patched) > 0:
-        logger.info(
-            f"Unsloth: Patched {len(patched)} FLA autotune caches: "
-            + ", ".join(patched)
-        )
+        logger.info("Unsloth: Patched FLA autotune caches for " + ", ".join(patched))
     return len(patched) > 0
 
 
@@ -3049,8 +2988,6 @@ DISABLE_COMPILE_MODULES = [
     "GptOssMLP",
     "GptOssExperts",
     "Gemma3nTextModel",
-    "Gemma4TextMoEBlock",  # Old transformers name
-    "Gemma4TextExperts",   # New transformers name (5.5+)
     "Glm4MoeLiteNaiveMoe",
     "Qwen3NextGatedDeltaNet",
     "GatedDeltaNet",
@@ -3669,7 +3606,7 @@ def unsloth_compile_transformers(
     # Remove causal masks
     do_not_remove = False
     for module in remove_causal_masks:
-        if module.endswith(("ForConditionalGeneration", "Gemma3Model", "Gemma4Model")):
+        if module.endswith(("ForConditionalGeneration", "Gemma3Model")):
             do_not_remove = True
             print(
                 f"Unsloth: Will not remove causal mask for {model_location} since it's a VLM!"
@@ -4003,14 +3940,14 @@ def unsloth_compile_transformers(
             pass
             parameters = f"def {module}" + parameters + code_section
             print(f"Unsloth: Fixed up function {module}.")
-            
+
             if module in disable_compile_functions:
                 parameters = (
                     "@torch.compiler.disable(recursive = False)\n"
                     + parameters
                 )
             elif not disable:
-                parameters = f"#@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
+                parameters = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
             all_standalone_classes[module] = parameters
         pass
 
@@ -4037,21 +3974,6 @@ def unsloth_compile_transformers(
             if sdpa_bool_masks:
                 source = convert_attention_masks_to_bool(module, source)
 
-            # Fix dict-based attention masks for gpt_oss (transformers 5.x).
-            # In v5, create_masks_for_generate returns a dict of masks keyed by
-            # layer pattern instead of a single tensor.
-            if "attn_weights = attn_weights + attention_mask" in source and "module" in source:
-                source = re.sub(
-                    r"(\s+)(if attention_mask is not None:\s*\n\s+attn_weights = attn_weights \+ attention_mask)",
-                    r"\1if attention_mask is not None:\n"
-                    r"\1    if isinstance(attention_mask, dict):\n"
-                    r"\1        attention_mask = attention_mask.get(getattr(module, 'layer_type', None), None)\n"
-                    r"\1    if attention_mask is not None:\n"
-                    r"\1        attn_weights = attn_weights + attention_mask",
-                    source,
-                    flags=re.MULTILINE,
-                )
-
             # Check erroring out
             bad = False
             for keyword in DISABLED_KEYWORDS:
@@ -4067,9 +3989,9 @@ def unsloth_compile_transformers(
                         source,
                     )
                     if "@torch.compiler.disable(recursive = False)\n" not in source:
-                        source = "#@torch.compiler.disable(recursive = False)\n" + source
+                        source = "@torch.compiler.disable(recursive = False)\n" + source
                 elif not disable:
-                    source = f"#@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
+                    source = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(
@@ -4136,10 +4058,6 @@ def unsloth_compile_transformers(
 
         patch_torch_functions()
 
-        _conv_modules = frozenset([
-            "Conv1d", "Conv2d", "Conv3d",
-            "ConvTranspose1d", "ConvTranspose2d", "ConvTranspose3d",
-        ])
         for module in _patch_functions:
             try:
                 source = eval(f"{model_location}.torch")
@@ -4156,30 +4074,6 @@ def unsloth_compile_transformers(
                 continue
 
             source = inspect.getsource(function.forward).rstrip()
-
-            if module in _conv_modules:
-                # Conv modules: cast input to weight dtype before the conv op,
-                # then cast output back to original input dtype. This prevents
-                # dtype mismatches under mixed-precision autocast (eg bf16
-                # weight + fp16 input crashes F.conv1d).
-                lines = source.split("\n")
-                def_line = lines[0]
-                body_lines = lines[1:]
-                first_body = next((l for l in body_lines if l.strip()), "")
-                body_indent = first_body[:len(first_body) - len(first_body.lstrip())]
-                prologue = [
-                    body_indent + "original_dtype = input.dtype",
-                    body_indent + "input = input.to(self.weight.dtype)",
-                ]
-                source = "\n".join([def_line] + prologue + body_lines)
-                append_str = ".to(original_dtype)\n"
-            else:
-                # Norm modules: detect the actual parameter name (input or x)
-                import re as _re
-                m = _re.search(r"def forward\(self,\s*(\w+)", source)
-                param_name = m.group(1) if m else "input"
-                append_str = f".to({param_name}.dtype)\n"
-
             forward = create_new_function(
                 module,
                 source,
@@ -4187,7 +4081,7 @@ def unsloth_compile_transformers(
                 functions,
                 prepend=_license_header
                 + f"\ntorch_compile_options = {torch_compile_options}\n",
-                append=append_str,
+                append=".to(input.dtype)\n",
                 overwrite=False,
                 add_torch_compile=False,
             ).forward

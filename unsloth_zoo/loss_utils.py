@@ -17,9 +17,6 @@
 import torch
 from .utils import Version
 import os
-import math
-import functools
-from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 from triton import __version__ as triton_version
 from . import DEVICE_TYPE
@@ -33,6 +30,11 @@ if importlib.util.find_spec("unsloth_studio") is None:
     UNSLOTH_STUDIO_ENABLED = False
 else:
     UNSLOTH_STUDIO_ENABLED = os.environ.get("UNSLOTH_STUDIO_DISABLED", "0") == "0"
+pass
+if UNSLOTH_STUDIO_ENABLED:
+    from unsloth_studio.losses import (
+        unsloth_efficient_ce_loss,
+    )
 pass
 
 if DEVICE_TYPE == "cuda":
@@ -203,14 +205,46 @@ def fused_linear_cross_entropy(
 pass
 
 
-def fast_linear_cross_entropy(*args, **kwargs):
-    raise RuntimeError(
-        "Unsloth: `fast_linear_cross_entropy` has been deprecated. "
-        "Please update Unsloth and Unsloth Zoo via:\n"
-        "pip install --upgrade --no-cache-dir --no-deps unsloth_zoo unsloth"
-    )
-pass
+def fast_linear_cross_entropy(
+    hidden_states        : torch.Tensor,
+    lm_head              : torch.nn.Linear,
+    labels               : torch.Tensor,
+    num_items_in_batch   : int = None,
+    ignore_index         : int = -100,
+    reduction            : str = "mean",
+    logit_softcapping    : float = 0,
+    logit_scale_multiply : float = 0,
+    logit_scale_divide   : float = 0,
+    attention_mask       : torch.Tensor = None,
+):
+    # All Unsloth Zoo code licensed under LGPLv3
+    if num_items_in_batch is not None and torch.is_tensor(num_items_in_batch):
+        num_items_in_batch = num_items_in_batch.to(hidden_states.device, non_blocking = True)
 
+    reduction = "sum" if num_items_in_batch is not None else "mean"
+    if logit_softcapping == 0: logit_softcapping = None
+    if logit_scale_multiply != 0:
+        logit_scale = logit_scale_multiply
+    elif logit_scale_divide != 0:
+        logit_scale = 1.0 / logit_scale_divide
+    else:
+        logit_scale = None
+
+    loss = unsloth_efficient_ce_loss(
+        hidden_states = hidden_states,
+        lm_head = lm_head,
+        labels = labels,
+        shift = True,
+        reduction = reduction,
+        logit_scale = logit_scale,
+        logit_softcapping = logit_softcapping,
+        ignore_index = ignore_index,
+        chunk_size = 512,
+        attention_mask = attention_mask,
+    )
+    if num_items_in_batch is not None: loss = loss / num_items_in_batch
+    return loss
+pass
 
 global ALLOWED_NUM_ITEMS_IN_BATCH
 ALLOWED_NUM_ITEMS_IN_BATCH = dict()
@@ -245,6 +279,9 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
 
     # Check if model allows **kwargs
     m = self.model
+    # Unwrap torch.compile's OptimizedModule to access the original model
+    if hasattr(m, "_orig_mod"):
+        m = m._orig_mod
     if hasattr(m, "get_base_model"):
         # Removes PeftModelForCausalLM and gets internal model
         m = m.get_base_model()
@@ -340,7 +377,7 @@ def _unsloth_get_batch_samples(self, epoch_iterator, num_batches, device = None,
     pass
     if UNSLOTH_ENABLE_LOGGING:
         logger.info(f"Unsloth: num_items_in_batch = {num_items_in_batch}")
-    
+
     # [TODO] Unfortunately skip_guard_eval_unsafe = True fails
     # Increment counter and set compiler stance
     # if not hasattr(self.model, "vllm_engine"):
