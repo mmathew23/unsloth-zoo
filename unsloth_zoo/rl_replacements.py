@@ -281,6 +281,123 @@ def autotune_batch_and_chunks(
 RL_REPLACEMENTS["grpo_autotune_batch_and_chunks"] = autotune_batch_and_chunks
 
 
+# -------------------------------------------------------------------------
+# GRPO apples-to-apples debug mode
+#
+# Controlled by env vars (see unsloth/models/rl.py _patch_grpo_debug_mode
+# for the trainer-level wiring):
+#   UNSLOTH_GRPO_DEBUG_FIXED_LENGTH  (int, activates mode)
+#   UNSLOTH_GRPO_DEBUG_FILL_TOKEN    (int, optional override)
+#   UNSLOTH_GRPO_DEBUG_QUIET         ("1" silences the banner)
+# -------------------------------------------------------------------------
+
+def _debug_env_length():
+    raw = os.environ.get("UNSLOTH_GRPO_DEBUG_FIXED_LENGTH", "")
+    if raw == "":
+        return None
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+pass
+RL_REPLACEMENTS["_debug_env_length"] = _debug_env_length
+
+
+def _debug_fill_token_id(tokenizer):
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    bos_id = getattr(tokenizer, "bos_token_id", None)
+    forbidden = {x for x in (pad_id, eos_id, bos_id) if x is not None}
+    vocab_size = getattr(tokenizer, "vocab_size", None)
+    if vocab_size is None:
+        try:
+            vocab_size = len(tokenizer)
+        except Exception:
+            vocab_size = None
+
+    raw = os.environ.get("UNSLOTH_GRPO_DEBUG_FILL_TOKEN", "")
+    if raw != "":
+        try:
+            tok_id = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"UNSLOTH_GRPO_DEBUG_FILL_TOKEN must be an integer, got {raw!r}"
+            )
+        if vocab_size is not None and not (0 <= tok_id < vocab_size):
+            raise ValueError(
+                f"UNSLOTH_GRPO_DEBUG_FILL_TOKEN={tok_id} is outside tokenizer vocab "
+                f"[0, {vocab_size})"
+            )
+        if tok_id in forbidden:
+            raise ValueError(
+                f"UNSLOTH_GRPO_DEBUG_FILL_TOKEN={tok_id} collides with a special token "
+                f"(pad={pad_id}, eos={eos_id}, bos={bos_id}). Pick a different id."
+            )
+        return tok_id
+
+    try:
+        ids = tokenizer.encode("A", add_special_tokens=False)
+    except Exception:
+        ids = []
+    if len(ids) == 1 and ids[0] not in forbidden:
+        return ids[0]
+
+    special_ids = set(forbidden)
+    extra_special = getattr(tokenizer, "all_special_ids", None)
+    if extra_special is not None:
+        try:
+            special_ids.update(int(x) for x in extra_special)
+        except Exception:
+            pass
+
+    if vocab_size is None:
+        vocab_size = 32000
+    start = vocab_size // 2
+    for tok_id in range(start, vocab_size):
+        if tok_id in special_ids:
+            continue
+        try:
+            decoded = tokenizer.decode([tok_id], skip_special_tokens=False)
+        except Exception:
+            continue
+        if decoded and decoded.strip():
+            return tok_id
+    for tok_id in range(0, start):
+        if tok_id in special_ids:
+            continue
+        try:
+            decoded = tokenizer.decode([tok_id], skip_special_tokens=False)
+        except Exception:
+            continue
+        if decoded and decoded.strip():
+            return tok_id
+    raise RuntimeError(
+        "Could not resolve a debug fill token id; set UNSLOTH_GRPO_DEBUG_FILL_TOKEN explicitly."
+    )
+pass
+RL_REPLACEMENTS["_debug_fill_token_id"] = _debug_fill_token_id
+
+
+def _apply_debug_completion_override(
+    completion_ids_list,
+    sampling_per_token_logps_list,
+    target_length,
+    fill_token_id,
+):
+    n = len(completion_ids_list) if completion_ids_list is not None else 0
+    new_completion_ids = [
+        [int(fill_token_id)] * int(target_length) for _ in range(n)
+    ]
+    new_logps = None
+    if sampling_per_token_logps_list is not None:
+        m = len(sampling_per_token_logps_list)
+        new_logps = [[0.0] * int(target_length) for _ in range(m)]
+    return new_completion_ids, new_logps
+pass
+RL_REPLACEMENTS["_apply_debug_completion_override"] = _apply_debug_completion_override
+
+
 def grpo_update_SamplingParams(SamplingParams, generation_kwargs, vllm_sampling_params = None):
     good_sampling_params_keys = inspect.signature(SamplingParams).parameters.keys()
 
@@ -297,6 +414,15 @@ def grpo_update_SamplingParams(SamplingParams, generation_kwargs, vllm_sampling_
                 overwrited_key = getattr(vllm_sampling_params, key)
                 if overwrited_key is not None and (type(overwrited_key) in (list, tuple,) and len(overwrited_key) != 0):
                     generation_kwargs[key] = overwrited_key
+
+    # GRPO debug mode: force a single real generated token regardless of the
+    # user-supplied sampling config. The real token is discarded and overwritten
+    # with fill_token_id × target_length by the trainer-level wrapper.
+    if _debug_env_length() is not None:
+        if "max_tokens" in good_sampling_params_keys:
+            generation_kwargs["max_tokens"] = 1
+        if "min_tokens" in good_sampling_params_keys:
+            generation_kwargs["min_tokens"] = 1
     return generation_kwargs
 pass
 RL_REPLACEMENTS["grpo_update_SamplingParams"] = grpo_update_SamplingParams
