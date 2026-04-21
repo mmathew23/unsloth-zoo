@@ -30,6 +30,7 @@ from .hf_utils import dtype_from_config
 from .gradient_checkpointing import (
     unpatch_unsloth_gradient_checkpointing,
     unpatch_unsloth_smart_gradient_checkpointing,
+    patch_unsloth_smart_gradient_checkpointing,
     _bind_gradient_checkpointing_func,
     UnslothOffloadActivations,
     resolve_gc_offload_backend,
@@ -302,8 +303,30 @@ def prepare_model_for_training(
                     module.gradient_checkpointing = False
 
     # HF caches checkpoint callables on modules; rebind to the active one so
-    # mode switches and monkey patches apply consistently.
-    if use_gradient_checkpointing in (True, "unsloth"):
+    # mode switches and monkey patches apply consistently. Only the "unsloth"
+    # path rewires the module-level `_gradient_checkpointing_func`; when
+    # `use_gradient_checkpointing == True` the caller has asked for vanilla
+    # PyTorch checkpointing via HF's `gradient_checkpointing_enable` above, so
+    # leave the per-module function alone and strip any prior unsloth offload
+    # wrapper / attribute so benchmarks isolate the native path.
+    if use_gradient_checkpointing == "unsloth":
+        # Activate the smart-checkpoint dispatcher so torch.utils.checkpoint.checkpoint
+        # routes through `_unsloth_checkpoint_nonreentrant`. Without this, HF Trainer's
+        # `_activate_gradient_checkpointing` rebinds module-level _gradient_checkpointing_func
+        # to vanilla `functools.partial(torch.utils.checkpoint.checkpoint, ...)` and the
+        # `_hooks_offload_state` ContextVar that gates `UnslothOffloadActivations._pack_hook`
+        # never gets set, so CPU offload silently no-ops. Historically only
+        # `FastLanguageModel.from_pretrained` activated this; consumers of
+        # `prepare_model_for_training` directly (custom AutoModelForCausalLM flows,
+        # the FSDP2 backend matrix benches) silently lost the offload mechanism.
+        try:
+            patch_unsloth_smart_gradient_checkpointing(
+                dtype=dtype,
+                use_reentrant=use_reentrant,
+            )
+        except Exception:
+            pass
+
         checkpoint_fn = torch.utils.checkpoint.checkpoint
         context_fn = getattr(model, "_unsloth_sac_context_fn", None)
         effective_reentrant = getattr(model, "_unsloth_use_reentrant", None)
@@ -316,19 +339,29 @@ def prepare_model_for_training(
             model, checkpoint_fn, effective_reentrant, context_fn, offload_backend,
         )
 
-        if (
-            use_gradient_checkpointing == "unsloth" and
-            (not effective_reentrant) and
-            offload_backend == "hooks"
-        ):
+        if (not effective_reentrant) and offload_backend == "hooks":
             _install_hook_based_offload_wrapper(model, dtype)
         else:
             _remove_hook_based_offload_wrapper(model)
     else:
         _remove_hook_based_offload_wrapper(model)
+        if use_gradient_checkpointing is True and hasattr(model, "_unsloth_gc_offload_backend"):
+            # Native path: drop the unsloth offload attribute so downstream
+            # fallbacks (e.g. `_default_offload_backend`, env-var lookup in
+            # `_unsloth_checkpoint_nonreentrant`) don't accidentally apply an
+            # unsloth offload backend to a user requesting vanilla GC.
+            try:
+                delattr(model, "_unsloth_gc_offload_backend")
+            except Exception:
+                model._unsloth_gc_offload_backend = None
 
-    # If use_reentrant = True which is the Pytorch default, we just make the input requires_grad.
-    if use_reentrant:
+    # Non-reentrant torch.utils.checkpoint.checkpoint needs the saved-tensor
+    # graph to anchor on a tensor with requires_grad=True to trigger its
+    # recompute path. With LoRA (frozen base weights) the embedding output has
+    # requires_grad=False, so without this call the checkpoint hooks don't
+    # activate and activations stay resident (silently disabling GC). This was
+    # only called for reentrant previously, matching historical assumptions.
+    if use_gradient_checkpointing in (True, "unsloth"):
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
         else:
