@@ -41,8 +41,7 @@ pass
 if DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
     if (Version(torch.__version__) >= Version("2.4.0")) and \
-        (not ((major <= 7) and (minor < 5))) and \
-        (not (Version(triton_version) < Version("3.0.0"))):
+        (not ((major <= 7) and (minor < 5))):
         try:
             from cut_cross_entropy import linear_cross_entropy
             HAS_CUT_CROSS_ENTROPY = True
