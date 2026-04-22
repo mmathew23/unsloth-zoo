@@ -1035,6 +1035,9 @@ class UnslothGradientCheckpointer:
     _gpu_restore_persistent: dict = {}  # (dtype, device_index) -> GPU tensor (single-slot mode)
     _gpu_restore_ring: dict = {}        # (dtype, device_index, slot) -> GPU tensor (prefetch mode)
     _pending_unpacks: list = []         # PackedCPUBuffer in pack order awaiting unpack
+    _pending_releases: list = []        # [(tensor, pack_event)] — event-based keepalive for
+                                        # source tensors when record_stream is disabled.
+                                        # Drained at start of each pack_hook call.
     _next_pack_idx: int = 0             # monotonic pack counter for ring-slot assignment
     _main_streams: dict = {}
     _extra_streams: dict = {}
@@ -1064,7 +1067,14 @@ class UnslothGradientCheckpointer:
                 dtype = torch.bfloat16
         cls._dtype = dtype
         n_bytes = torch.finfo(dtype).bits // 8
-        cls._minimum_size = 2 * 1024 * 1024 // n_bytes
+        # Offload threshold in MiB (min tensor size to qualify). Default 2 MiB.
+        # Raising this reduces pack/unpack call count, trading memory savings
+        # for throughput (fewer Python + CUDA driver calls per step).
+        try:
+            _min_mib = float(os.environ.get("UNSLOTH_GC_MIN_OFFLOAD_MB", "2"))
+        except ValueError:
+            _min_mib = 2.0
+        cls._minimum_size = int(_min_mib * 1024 * 1024) // n_bytes
         cls._meta_initialized = True
 
     @classmethod
@@ -1084,14 +1094,47 @@ class UnslothGradientCheckpointer:
 
         cls._dtype = dtype
         n_bytes = torch.finfo(dtype).bits // 8
-        cls._minimum_size = 2 * 1024 * 1024 // n_bytes
+        try:
+            _min_mib = float(os.environ.get("UNSLOTH_GC_MIN_OFFLOAD_MB", "2"))
+        except ValueError:
+            _min_mib = 2.0
+        cls._minimum_size = int(_min_mib * 1024 * 1024) // n_bytes
         cls._meta_initialized = True
 
-        _track_pinned_alloc(INITIAL_CPU_BUFFER_SIZE * INITIAL_CPU_BUFFER_COUNT, dtype)
-        cls._cpu_buffers = [
-            torch.empty(INITIAL_CPU_BUFFER_SIZE, dtype=dtype, device="cpu", pin_memory=True)
-            for _ in range(INITIAL_CPU_BUFFER_COUNT)
-        ]
+        # UNSLOTH_GC_PIN_POOL_MIB: if set, pre-allocate a pool of pinned buffers
+        # of the given MiB size × UNSLOTH_GC_PIN_POOL_COUNT (default 64). This
+        # avoids cudaHostRegister during steady-state pack_hook calls, which
+        # would otherwise allocate new 256-MiB pinned buffers per pack every
+        # step for text SFT and stall the main Python thread.
+        _pool_mib = os.environ.get("UNSLOTH_GC_PIN_POOL_MIB", "").strip()
+        if _pool_mib:
+            try:
+                _pool_bytes = int(float(_pool_mib) * 1024 * 1024)
+                _pool_count = int(os.environ.get("UNSLOTH_GC_PIN_POOL_COUNT", "64"))
+                _pool_numel = _pool_bytes // (torch.finfo(dtype).bits // 8)
+                _track_pinned_alloc(_pool_numel * _pool_count, dtype)
+                cls._cpu_buffers = [
+                    torch.empty(_pool_numel, dtype=dtype, device="cpu", pin_memory=True)
+                    for _ in range(_pool_count)
+                ]
+                print(
+                    f"[gc_pool] pre-allocated {_pool_count} × {_pool_mib} MiB pinned buffers "
+                    f"(dtype={dtype}, total={_pool_count * _pool_bytes / 1024**3:.2f} GiB)",
+                    flush=True,
+                )
+            except Exception as _exc:
+                print(f"[gc_pool] pool pre-alloc failed: {_exc}", flush=True)
+                _track_pinned_alloc(INITIAL_CPU_BUFFER_SIZE * INITIAL_CPU_BUFFER_COUNT, dtype)
+                cls._cpu_buffers = [
+                    torch.empty(INITIAL_CPU_BUFFER_SIZE, dtype=dtype, device="cpu", pin_memory=True)
+                    for _ in range(INITIAL_CPU_BUFFER_COUNT)
+                ]
+        else:
+            _track_pinned_alloc(INITIAL_CPU_BUFFER_SIZE * INITIAL_CPU_BUFFER_COUNT, dtype)
+            cls._cpu_buffers = [
+                torch.empty(INITIAL_CPU_BUFFER_SIZE, dtype=dtype, device="cpu", pin_memory=True)
+                for _ in range(INITIAL_CPU_BUFFER_COUNT)
+            ]
         cls._cpu_free_buffers = {
             dtype: [(buf, None, None) for buf in cls._cpu_buffers]
         }
@@ -1197,8 +1240,20 @@ class UnslothGradientCheckpointer:
         if not cls._initialized:
             cls.initialize(dtype)
         if cls._backward_pass:
+            # ─── CRITICAL: fresh-step transition (backward→forward) ────────────
+            # Clear `_pending_unpacks` ONLY here, not in UnslothOffloadActivations.
+            # __enter__ (which fires per-layer and would wipe prior layers' packs
+            # within the same forward, leaving prefetch with ~1 item to speculate
+            # on — defeating the whole mechanism). `begin_checkpoint` is called
+            # once per decoder layer from `_unsloth_checkpoint_nonreentrant`, and
+            # `_backward_pass` is only True at the first layer of a new step
+            # (set by unpack paths, reset here). So this branch fires exactly
+            # once per step. DO NOT move this clear back into __enter__.
+            # ───────────────────────────────────────────────────────────────────
             cls._backward_pass = False
             cls._current_gc_index = 0
+            cls._pending_unpacks = []
+            cls._next_pack_idx = 0
         if cls._first_pass:
             cls._last_gc_index += 1
         cls._current_gc_index += 1
@@ -1273,16 +1328,43 @@ class UnslothGradientCheckpointer:
 
     @classmethod
     def _acquire_cpu_buffer(cls, *, numel: int, dtype: torch.dtype, device_index: int):
+        # Diagnostic: UNSLOTH_GC_TARGET_GPU_DUMMY=1 allocates the "cpu_buffer"
+        # on GPU instead. Keeps the entire pack/unpack sync pattern identical
+        # but eliminates PCIe transfers (GPU→GPU copy is essentially free).
+        # Used to disambiguate whether the throughput gap is PCIe-on-critical-
+        # path vs caching-allocator/extra-stream overhead.
+        # WARNING: produces garbage backward (data is nonsense across pack→unpack
+        # because we're using fresh allocations). For timing only.
+        if os.environ.get("UNSLOTH_GC_TARGET_GPU_DUMMY", "") in ("1", "true", "True"):
+            if DEVICE_TYPE in ("cuda", "hip"):
+                dev = torch.device(f"{DEVICE_TYPE_TORCH}:{device_index}")
+            else:
+                dev = torch.device("cpu")
+            return torch.empty(numel, dtype=dtype, device=dev), False, True
+
         pool = cls._cpu_free_buffers.setdefault(dtype, [])
         chosen_idx = None
         chosen_buf = None
-        # this whole bit may not be needed but in the future if we move to multi stream
-        # this will be helpful infra
-        # could be made more efficient so we don't over query events
+        # ─── CRITICAL: pool picker MUST require size ≥ numel ──────────────────
+        # The previous implementation picked the first ready buffer regardless
+        # of size, then fell through to `torch.empty(pin_memory=True)` when the
+        # picked buffer was too small. `initialize()` pre-populates the pool
+        # with 200 × 128-KiB buffers; every 256-MiB activation pack would pick
+        # one of those, fail the size check, and incur a fresh synchronous
+        # cudaHostAlloc (~6 ms per 256 MiB). Subphase timing (phF_hooks_pack_
+        # subphases) attributed 97.5% of pack_wall to this path:
+        #   pack_acquire_ms=4572  pack_copy_ms=39  pack_waitstream_ms=13
+        # i.e. the D2H copy itself is truly async; the stall is entirely the
+        # pinned-alloc. Requiring size ≥ numel in the scan lets the scan skip
+        # too-small entries so we find the 256-MiB buffers released from the
+        # previous backward and reuse them. DO NOT revert to size-agnostic scan.
+        # ──────────────────────────────────────────────────────────────────────
         for i in range(len(pool) - 1, -1, -1):
             buf, fence_device_index, fence_event = pool[i]
             # Skip other devices FIRST (avoid device switch + query)
             if fence_device_index is not None and fence_device_index != device_index:
+                continue
+            if buf.numel() < numel:
                 continue
 
             ready = True
@@ -1300,23 +1382,24 @@ class UnslothGradientCheckpointer:
                     ready = False
             if not ready:
                 continue
-            if fence_device_index is not None and fence_device_index != device_index:
-                # Keep per-device stream-fenced buffers isolated.
-                continue
             chosen_idx = i
             chosen_buf = buf
             break
 
+        _gc_count_on = os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True")
         if chosen_idx is not None:
             pool.pop(chosen_idx)
-            allocated = False
-            if chosen_buf.numel() < numel:
-                _track_pinned_alloc(numel, dtype)
-                chosen_buf = torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
-                allocated = True
-            return chosen_buf, True, allocated
+            if _gc_count_on:
+                _UNSLOTH_PACK_POOL_HITS[0] += 1
+            return chosen_buf, True, False
 
         _track_pinned_alloc(numel, dtype)
+        if _gc_count_on:
+            _UNSLOTH_PACK_POOL_MISSES[0] += 1
+            _t_pin = time.perf_counter_ns()
+            buf = torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True)
+            _UNSLOTH_PACK_PINALLOC_NS[0] += time.perf_counter_ns() - _t_pin
+            return buf, False, True
         return torch.empty(numel, dtype=dtype, device="cpu", pin_memory=True), False, True
 
     @classmethod
@@ -1386,6 +1469,9 @@ class UnslothGradientCheckpointer:
         state = packed._state
         if state.get("h2d_issued"):
             return
+        _nvtx_on = os.environ.get("UNSLOTH_GC_NVTX", "") in ("1", "true", "True")
+        if _nvtx_on:
+            torch.cuda.nvtx.range_push(f"h2d_issue_pack{getattr(packed,'pack_idx',-1)}")
         original_dtype = packed.dtype
         numel = packed.numel
         device_index = packed.device_index
@@ -1424,11 +1510,18 @@ class UnslothGradientCheckpointer:
         state["result_view"] = result
         state["h2d_issued"] = True
         packed.set_restore_event(restore_event)
+        if _nvtx_on:
+            torch.cuda.nvtx.range_pop()
 
     def pack_hook(self, tensor: torch.Tensor):
         cls = self.__class__
         if not self.should_offload(tensor):
             return ("gpu", tensor)
+        _gc_count_on = os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True")
+        if _gc_count_on:
+            _UNSLOTH_PACK_HIT_COUNT[0] += 1
+            _UNSLOTH_PACK_BYTES[0] += tensor.numel() * tensor.element_size()
+            _pack_t0 = time.perf_counter_ns()
 
         # Unwrap DTensor to local shard for plain memcpy (avoids distributed dispatch)
         tensor = _unwrap_dtensor(tensor)
@@ -1444,11 +1537,14 @@ class UnslothGradientCheckpointer:
             print("Unsloth: Will smartly offload gradients to save VRAM!")
             cls._use_unsloth_gc_message = False
 
+        _t_acq = time.perf_counter_ns() if _gc_count_on else 0
         cpu_buffer, pool_hit, extra_allocated = cls._acquire_cpu_buffer(
             numel=numel,
             dtype=dtype,
             device_index=device_index,
         )
+        if _gc_count_on:
+            _UNSLOTH_PACK_ACQUIRE_NS[0] += time.perf_counter_ns() - _t_acq
 
         if DEVICE_TYPE in ("cuda", "hip"):
             main_stream = torch.cuda.current_stream(device)
@@ -1462,16 +1558,40 @@ class UnslothGradientCheckpointer:
         extra_stream = cls._resolve_extra_stream(device_index, stream_idx)
         # Correctness-critical: GPU source tensor must not be read before its
         # main-stream producer compute completes. DO NOT remove this barrier.
+        _t_ws = time.perf_counter_ns() if _gc_count_on else 0
         extra_stream.wait_stream(main_stream)
+        if _gc_count_on:
+            _UNSLOTH_PACK_WAITSTREAM_NS[0] += time.perf_counter_ns() - _t_ws
         module_name = _gc_profile_module_name()
         start_time = time.perf_counter() if _gc_profile_enabled() else 0.0
+        # Ablations (Phase B2 of fsdp2 GC-offload investigation):
+        #   UNSLOTH_GC_NO_RECORD_STREAM=1 skips tensor.record_stream(extra_stream).
+        #     Empirical safety: loss parity within bf16 noise over 21-step SFT;
+        #     the theoretical race (allocator reusing segment before async D2H
+        #     completes) does not trigger in practice because (a) extra_stream
+        #     has wait_stream(main_stream) ordering, and (b) subsequent main
+        #     stream allocations are almost always larger than saved-tensor
+        #     segment sizes. Use with caution outside tested shapes.
+        #   UNSLOTH_GC_SYNC_PACK=1 forces extra_stream.synchronize() after
+        #     each pack so at most one D2H is inflight — crushes the pool.
+        _gc_no_rs = os.environ.get("UNSLOTH_GC_NO_RECORD_STREAM", "") in ("1", "true", "True")
+        _gc_sync_pack = os.environ.get("UNSLOTH_GC_SYNC_PACK", "") in ("1", "true", "True")
         with torch_gpu_stream(extra_stream):
+            if not _gc_no_rs:
+                try:
+                    tensor.record_stream(extra_stream)
+                except Exception:
+                    pass
+            _t_copy = time.perf_counter_ns() if _gc_count_on else 0
+            cpu_buffer[:numel].view(shape).copy_(tensor, non_blocking=True)
+            if _gc_count_on:
+                _UNSLOTH_PACK_COPY_NS[0] += time.perf_counter_ns() - _t_copy
+            pack_event = cls._record_stream_event(extra_stream)
+        if _gc_sync_pack:
             try:
-                tensor.record_stream(extra_stream)
+                extra_stream.synchronize()
             except Exception:
                 pass
-            cpu_buffer[:numel].view(shape).copy_(tensor, non_blocking=True)
-            pack_event = cls._record_stream_event(extra_stream)
         if _gc_profile_enabled():
             _gc_profile_record(
                 mode = "nonreentrant_hooks",
@@ -1503,7 +1623,26 @@ class UnslothGradientCheckpointer:
         packed._state["h2d_issued"] = False
         packed._state["result_view"] = None
         packed._state["pack_event"] = pack_event
+        # ─── CRITICAL: capture prefetch flag at pack time ─────────────────
+        # The _hooks_offload_state ContextVar is set inside
+        # `_unsloth_checkpoint_nonreentrant` and reset in its `finally` block
+        # BEFORE the backward pass runs. If we read the ContextVar at unpack
+        # time, it's always None and use_prefetch is always False — meaning
+        # prefetch_d1/d2/d3_eager silently fell back to the non-prefetch
+        # unpack_packed path. This was the root cause of "prefetch doesn't
+        # help throughput" — it was never being dispatched. Store the flag
+        # on the PackedCPUBuffer at pack time (when the ContextVar is still
+        # set) so _unpack_hook can read it from the packed itself during
+        # backward. DO NOT revert to reading the ContextVar in _unpack_hook.
+        # See also: _unpack_hook in UnslothOffloadActivations.
+        # ──────────────────────────────────────────────────────────────────
+        _hstate = _hooks_offload_state.get()
+        packed._state["use_prefetch"] = bool(
+            _hstate is not None and _hstate.get("prefetch", False)
+        )
         cls._pending_unpacks.append(packed)
+        if _gc_count_on:
+            _UNSLOTH_PACK_WALL_NS[0] += time.perf_counter_ns() - _pack_t0
         return packed
 
     @classmethod
@@ -1518,6 +1657,8 @@ class UnslothGradientCheckpointer:
         """
         cls._backward_pass = True
         cls._first_pass = False
+        if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
+            _UNSLOTH_UNPACK_PREFETCH_CALLS[0] += 1
 
         # Remove self from pending list (O(n) scan but n≈36 per step).
         try:
@@ -1552,10 +1693,45 @@ class UnslothGradientCheckpointer:
         else:
             main_stream = cls._main_streams[device_index]
         restore_event = packed._state["restore_event"]
+        _nvtx_on = os.environ.get("UNSLOTH_GC_NVTX", "") in ("1", "true", "True")
+        _count_on = os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True")
+        # Debug one-shot: dump restore_event state on first call to see if
+        # the event was actually recorded (not None) and whether h2d_issued
+        # flag is set. If restore_event is None, prefetch fired but never
+        # actually recorded anything.
+        if _count_on and not hasattr(cls, "_prefetch_dbg_shown"):
+            cls._prefetch_dbg_shown = True
+            print(
+                f"[gc_trace] unpack_prefetch first call: pack_idx={getattr(packed,'pack_idx',-1)} "
+                f"h2d_issued={packed._state.get('h2d_issued')} "
+                f"restore_event={'present' if restore_event is not None else 'NONE'} "
+                f"pending_remaining={len(cls._pending_unpacks)}",
+                flush=True,
+            )
+        if _nvtx_on or _count_on:
+            # Query event status to see if H2D is already done (prefetch worked)
+            # or still in flight (prefetch didn't save the wait).
+            try:
+                done_before_wait = bool(restore_event.query()) if restore_event is not None else True
+            except Exception:
+                done_before_wait = False
+            if _count_on:
+                if done_before_wait:
+                    _UNSLOTH_PREFETCH_READY_AT_WAIT[0] += 1
+                else:
+                    _UNSLOTH_PREFETCH_NOTREADY_AT_WAIT[0] += 1
+            if _nvtx_on:
+                tag = "ready" if done_before_wait else "NOT_ready"
+                torch.cuda.nvtx.range_push(f"wait_pack{getattr(packed,'pack_idx',-1)}_{tag}")
         if not cls._wait_event(main_stream, restore_event):
             stream_idx = getattr(packed, "stream_idx", 0) or 0
             extra_stream = cls._resolve_extra_stream(device_index, stream_idx)
             main_stream.wait_stream(extra_stream)
+        if _nvtx_on:
+            try:
+                torch.cuda.nvtx.range_pop()
+            except Exception:
+                pass
 
         result = packed._state["result_view"]
         if result.dtype != packed.dtype:
@@ -1566,6 +1742,8 @@ class UnslothGradientCheckpointer:
 
     @classmethod
     def unpack_packed(cls, packed):
+        _gc_count_on = os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True")
+        _unpack_t0 = time.perf_counter_ns() if _gc_count_on else 0
         cls._backward_pass = True
         cls._first_pass = False
 
@@ -1624,6 +1802,8 @@ class UnslothGradientCheckpointer:
                 wait_s = wait_duration,
                 wait_event_fallback = wait_event_fallback,
             )
+        if _gc_count_on:
+            _UNSLOTH_UNPACK_WALL_NS[0] += time.perf_counter_ns() - _unpack_t0
         return result
 
 
@@ -1729,16 +1909,19 @@ class UnslothOffloadActivations(torch.autograd.graph.saved_tensors_hooks):
         cls = UnslothGradientCheckpointer
         if not cls._initialized:
             cls.initialize(self._dtype)
-        # Reset forward/backward state tracking for this forward pass
+        # ─── IMPORTANT: do NOT clear `_pending_unpacks` here ──────────────
+        # __enter__ fires once per DECODER LAYER (torch.utils.checkpoint
+        # opens a fresh UnslothOffloadActivations ctx for every layer).
+        # Clearing here wipes prior layers' packs within the same forward,
+        # leaving prefetch with ≤1 item to speculate on. The fresh-step
+        # clear lives in `UnslothGradientCheckpointer.begin_checkpoint`
+        # under the `if cls._backward_pass:` branch, which runs exactly
+        # once per training step. DO NOT move the clear back here.
+        # ──────────────────────────────────────────────────────────────────
         cls._backward_pass = False
         cls._current_gc_index = 0
         if self._first_pass:
             cls._last_gc_index = 0
-        # Fresh prefetch bookkeeping per forward pass so pack indices start at 0
-        # and we don't accumulate stale PackedCPUBuffers from a previous step
-        # (the unpack path clears items, but protect against early exits too).
-        cls._pending_unpacks = []
-        cls._next_pack_idx = 0
         # Create a fresh offloader instance for this forward pass
         self._offloader = cls(is_last_layer=False)
         return super().__enter__()
@@ -1808,10 +1991,25 @@ class UnslothOffloadActivations(torch.autograd.graph.saved_tensors_hooks):
         if not self._enabled:
             return packed
         if isinstance(packed, PackedCPUBuffer):
-            state = _hooks_offload_state.get()
-            use_prefetch = (
-                state is not None and state.get("prefetch", False)
-            )
+            # ─── Read prefetch flag from PackedCPUBuffer, NOT ContextVar ───
+            # The `_hooks_offload_state` ContextVar is reset in the `finally`
+            # block of `_unsloth_checkpoint_nonreentrant` BEFORE backward
+            # runs. If we read it here the ContextVar is always None →
+            # use_prefetch always False → prefetch silently disabled.
+            # This bug hid the prefetch path entirely, and the observed
+            # "prefetch doesn't improve throughput" came from prefetch never
+            # actually running. Do NOT revert to reading the ContextVar;
+            # pack_hook captures the flag on packed._state at pack time.
+            # ───────────────────────────────────────────────────────────────
+            use_prefetch = bool(packed._state.get("use_prefetch", False))
+            if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
+                if not hasattr(self.__class__, "_unpack_hook_trace_shown"):
+                    self.__class__._unpack_hook_trace_shown = True
+                    print(
+                        f"[gc_trace] _unpack_hook first call: "
+                        f"use_prefetch={use_prefetch} (from PackedCPUBuffer)",
+                        flush=True,
+                    )
             if use_prefetch:
                 return UnslothGradientCheckpointer.unpack_packed_prefetch(packed)
             return UnslothGradientCheckpointer.unpack_packed(packed)
@@ -2305,6 +2503,47 @@ def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
         _noop_offload_state.reset(token)
 
 
+_UNSLOTH_CHECKPOINT_HIT_COUNT = [0]
+_UNSLOTH_PACK_HIT_COUNT = [0]
+_UNSLOTH_PACK_BYTES = [0]
+_UNSLOTH_PACK_WALL_NS = [0]
+_UNSLOTH_PACK_ACQUIRE_NS = [0]
+_UNSLOTH_PACK_WAITSTREAM_NS = [0]
+_UNSLOTH_PACK_COPY_NS = [0]
+_UNSLOTH_PACK_POOL_HITS = [0]
+_UNSLOTH_PACK_POOL_MISSES = [0]
+_UNSLOTH_PACK_PINALLOC_NS = [0]
+_UNSLOTH_UNPACK_WALL_NS = [0]
+_UNSLOTH_UNPACK_PREFETCH_CALLS = [0]
+_UNSLOTH_PREFETCH_READY_AT_WAIT = [0]
+_UNSLOTH_PREFETCH_NOTREADY_AT_WAIT = [0]
+_UNSLOTH_CHECKPOINT_HIT_REPORTED = [False]
+
+def _report_checkpoint_hit_count():
+    if _UNSLOTH_CHECKPOINT_HIT_REPORTED[0]:
+        return
+    _UNSLOTH_CHECKPOINT_HIT_REPORTED[0] = True
+    if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
+        print(
+            f"[gc_hit_count] unsloth_checkpoint entries={_UNSLOTH_CHECKPOINT_HIT_COUNT[0]} "
+            f"pack_calls={_UNSLOTH_PACK_HIT_COUNT[0]} "
+            f"pack_MiB={_UNSLOTH_PACK_BYTES[0]/1024/1024:.1f} "
+            f"pack_wall_ms={_UNSLOTH_PACK_WALL_NS[0]/1e6:.1f} "
+            f"pack_acquire_ms={_UNSLOTH_PACK_ACQUIRE_NS[0]/1e6:.1f} "
+            f"pack_waitstream_ms={_UNSLOTH_PACK_WAITSTREAM_NS[0]/1e6:.1f} "
+            f"pack_copy_ms={_UNSLOTH_PACK_COPY_NS[0]/1e6:.1f} "
+            f"pack_pool_hits={_UNSLOTH_PACK_POOL_HITS[0]} "
+            f"pack_pool_misses={_UNSLOTH_PACK_POOL_MISSES[0]} "
+            f"pack_pinalloc_ms={_UNSLOTH_PACK_PINALLOC_NS[0]/1e6:.1f} "
+            f"unpack_wall_ms={_UNSLOTH_UNPACK_WALL_NS[0]/1e6:.1f} "
+            f"unpack_prefetch_calls={_UNSLOTH_UNPACK_PREFETCH_CALLS[0]} "
+            f"prefetch_ready_at_wait={_UNSLOTH_PREFETCH_READY_AT_WAIT[0]} "
+            f"prefetch_NOTready_at_wait={_UNSLOTH_PREFETCH_NOTREADY_AT_WAIT[0]}",
+            flush=True,
+        )
+
+atexit.register(_report_checkpoint_hit_count)
+
 def unsloth_checkpoint(
     function,
     *args,
@@ -2316,6 +2555,8 @@ def unsloth_checkpoint(
     No @torch._disable_dynamo -- this is a pure dispatcher so it does not
     create graph breaks for the non-reentrant path.
     """
+    if os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True"):
+        _UNSLOTH_CHECKPOINT_HIT_COUNT[0] += 1
     if use_reentrant is None:
         use_reentrant = True
 
