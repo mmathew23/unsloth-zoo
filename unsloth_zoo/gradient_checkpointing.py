@@ -1257,7 +1257,22 @@ class UnslothGradientCheckpointer:
         if cls._first_pass:
             cls._last_gc_index += 1
         cls._current_gc_index += 1
-        is_last_layer = (cls._current_gc_index == cls._last_gc_index) and not cls._first_pass
+        # `UNSLOTH_GC_SKIP_LAST_N` (default 1) — number of trailing layers whose
+        # activations are kept resident on GPU instead of offloaded. Skipping
+        # N=1 (default) keeps the *unchecked* final layer resident and is a
+        # no-op. Skipping N>=2 additionally keeps the last K-1 offloadable
+        # layers resident so their unpacks are no longer on the backward
+        # critical path. Closes the "first NOT-ready H2D per step" gap at the
+        # cost of ~activation_size × (N-1) extra peak GPU memory. For Qwen3-8B
+        # seq=8192 bsz=4, activation_size=256 MiB → N=2 adds 0.8% peak alloc.
+        try:
+            _skip_last_n = max(1, int(os.environ.get("UNSLOTH_GC_SKIP_LAST_N", "1")))
+        except ValueError:
+            _skip_last_n = 1
+        is_last_layer = (
+            (cls._current_gc_index > cls._last_gc_index - _skip_last_n)
+            and not cls._first_pass
+        )
         return cls(is_last_layer=is_last_layer)
 
     @classmethod
@@ -1909,19 +1924,20 @@ class UnslothOffloadActivations(torch.autograd.graph.saved_tensors_hooks):
         cls = UnslothGradientCheckpointer
         if not cls._initialized:
             cls.initialize(self._dtype)
-        # ─── IMPORTANT: do NOT clear `_pending_unpacks` here ──────────────
+        # ─── IMPORTANT: no state resets here ──────────────────────────────
         # __enter__ fires once per DECODER LAYER (torch.utils.checkpoint
         # opens a fresh UnslothOffloadActivations ctx for every layer).
-        # Clearing here wipes prior layers' packs within the same forward,
-        # leaving prefetch with ≤1 item to speculate on. The fresh-step
-        # clear lives in `UnslothGradientCheckpointer.begin_checkpoint`
-        # under the `if cls._backward_pass:` branch, which runs exactly
-        # once per training step. DO NOT move the clear back here.
+        # Resetting `_current_gc_index` / `_last_gc_index` / `_pending_unpacks`
+        # here wipes prior layers' state within the same forward. All those
+        # counters are managed by `UnslothGradientCheckpointer.begin_checkpoint`
+        # which also fires per-layer but knows the backward→forward transition
+        # (via `cls._backward_pass`) and only resets on a true fresh step. In
+        # particular: `_last_gc_index` is only valid once step 1 has learned
+        # it — resetting it to 0 on every layer (as the old code did via
+        # `self._first_pass`) makes `is_last_layer` fire on every layer from
+        # step 2 onwards when skip_last_n ≥ 2. DO NOT restore state resets
+        # here.
         # ──────────────────────────────────────────────────────────────────
-        cls._backward_pass = False
-        cls._current_gc_index = 0
-        if self._first_pass:
-            cls._last_gc_index = 0
         # Create a fresh offloader instance for this forward pass
         self._offloader = cls(is_last_layer=False)
         return super().__enter__()
