@@ -26,7 +26,6 @@ import inspect
 import functools
 import math
 import os
-from ..activation_offloading import maybe_disable_trl_activation_offloading
 from ..temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
 from ..device_type import DEVICE_TYPE
         
@@ -471,22 +470,21 @@ def unsloth_fused_ce_loss(
     if hidden_states.device != device:
         hidden_states = hidden_states.to(device = device)
 
-    with maybe_disable_trl_activation_offloading(trainer):
-        return apply_autograd_function(UnslothFusedLoss, dict(
-            loss_function = compute_fused_ce_loss,
-            hidden_states = hidden_states,
-            lm_head_weight = lm_head_weight,
-            lm_head_bias = lm_head_bias,
-            labels = labels,
-            mask = mask,
-            n_items = n_items,
-            scaling = scaling,
-            shift_labels = True,
-            target_gb = target_gb,
-            torch_compile = torch_compile,
-            overwrite = overwrite,
-            extra_kwargs = kwargs,
-        ))
+    return apply_autograd_function(UnslothFusedLoss, dict(
+        loss_function = compute_fused_ce_loss,
+        hidden_states = hidden_states,
+        lm_head_weight = lm_head_weight,
+        lm_head_bias = lm_head_bias,
+        labels = labels,
+        mask = mask,
+        n_items = n_items,
+        scaling = scaling,
+        shift_labels = True,
+        target_gb = target_gb,
+        torch_compile = torch_compile,
+        overwrite = overwrite,
+        extra_kwargs = kwargs,
+    ))
 pass
 
 # Unsloth Zoo - Utilities for Unsloth

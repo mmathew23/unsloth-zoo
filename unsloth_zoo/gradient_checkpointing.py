@@ -1034,6 +1034,8 @@ class UnslothGradientCheckpointer:
     # Avoids CUDA allocator fragmentation from repeated alloc/free during backward.
     _gpu_restore_persistent: dict = {}  # (dtype, device_index) -> GPU tensor (single-slot mode)
     _gpu_restore_ring: dict = {}        # (dtype, device_index, slot) -> GPU tensor (prefetch mode)
+    _gpu_pack_ring: dict = {}           # (dtype, device_index, slot) -> GPU tensor (bounce mode)
+    _gpu_pack_ring_last_event: dict = {} # (dtype, device_index, slot) -> last pack_event for that slot
     _pending_unpacks: list = []         # PackedCPUBuffer in pack order awaiting unpack
     _pending_releases: list = []        # [(tensor, pack_event)] — event-based keepalive for
                                         # source tensors when record_stream is disabled.
@@ -1464,6 +1466,25 @@ class UnslothGradientCheckpointer:
         return buf
 
     @classmethod
+    def _get_gpu_pack_ring_slot(cls, *, numel: int, dtype: torch.dtype,
+                                device_index: int, slot: int):
+        """One slot of a persistent GPU bounce ring used by the bounce-buffer
+        pack path (UNSLOTH_GC_BOUNCE=1). D2D copies land here on main stream;
+        extra_stream reads the bounce for D2H. The source tensor's memory is
+        free to be reused immediately after the D2D — no record_stream tag,
+        no deferred-free queue pinning.
+        """
+        key = (dtype, device_index, slot)
+        buf = cls._gpu_pack_ring.get(key)
+        if buf is None:
+            buf = torch.empty(numel, dtype=dtype,
+                device=f"{DEVICE_TYPE_TORCH}:{device_index}")
+            cls._gpu_pack_ring[key] = buf
+        elif buf.numel() < numel:
+            buf.resize_(numel)
+        return buf
+
+    @classmethod
     def _resolve_extra_stream(cls, device_index: int, stream_idx: int):
         """Pick the extra stream for a pack. stream_idx=0 always returns the
         primary extra stream; stream_idx=1 returns the aux stream when
@@ -1506,12 +1527,32 @@ class UnslothGradientCheckpointer:
             main_stream = cls._main_streams[device_index]
         stream_idx = getattr(packed, "stream_idx", 0) or 0
         extra_stream = cls._resolve_extra_stream(device_index, stream_idx)
-        # Variant C: narrow-wait. The D2H on the extra stream is a strict
-        # dependency; FIFO on a single stream already orders D2H-before-H2D,
-        # but under aux-stream (Variant B) the consumer stream may differ.
-        # Event-wait is sufficient in both cases.
+        # UNSLOTH_GC_NARROW_WAIT=1 is UNSAFE — do not enable.
+        # Rationale (Phase K3, SFT VL Qwen3-VL-8B, seq=4096, bsz=2):
+        # Narrow-wait replaces `extra_stream.wait_stream(main_stream)` with
+        # `extra_stream.wait_event(pack_event)` on the reasoning that the
+        # D2H-before-H2D ordering is the only dependency needed. That reasoning
+        # is wrong. `wait_stream(main_stream)` carries a second, silent
+        # dependency on main_stream that is NOT covered by pack_event alone.
+        # Removing it causes gradient corruption on SFT VL:
+        #   pd2_NW          → loss[2]=1.656, loss[-1]=1.887 (diverges)
+        #   pd2_NW, ring=128→ loss[2]=NaN (reads unwritten torch.empty slots)
+        #   pd2_NB (wait_event + wait_stream) → loss[2]=1.451 (correct)
+        # GPU_DUMMY (PCIe-free, GPU→GPU memcpy) still diverges with NW, so the
+        # missing dep is NOT D2H completion timing — it is some main_stream-
+        # side scheduling invariant (candidates: FSDP2 comm stream, torch.compile
+        # cudaGraph boundary, GPU scheduler order). The "win" of NW was ~2% on
+        # SFT text and zero on SFT VL; not worth the correctness hazard.
+        # UNSLOTH_GC_NARROW_BOTH=1 is the safe probe (keeps both waits). The
+        # default path below is correct; do not re-introduce event-only waits.
+        # NARROW_BOTH exists only as a diagnostic tool; prefer the default.
         pack_event = state.get("pack_event")
-        if _gc_narrow_wait() and pack_event is not None:
+        _gc_narrow_both = os.environ.get("UNSLOTH_GC_NARROW_BOTH", "") in ("1", "true", "True")
+        if _gc_narrow_both and pack_event is not None:
+            cls._wait_event(extra_stream, pack_event)
+            extra_stream.wait_stream(main_stream)
+        elif _gc_narrow_wait() and pack_event is not None:
+            # UNSAFE — kept only for reproduction / diagnostics. See block comment above.
             cls._wait_event(extra_stream, pack_event)
         else:
             extra_stream.wait_stream(main_stream)
@@ -1591,17 +1632,63 @@ class UnslothGradientCheckpointer:
         #     each pack so at most one D2H is inflight — crushes the pool.
         _gc_no_rs = os.environ.get("UNSLOTH_GC_NO_RECORD_STREAM", "") in ("1", "true", "True")
         _gc_sync_pack = os.environ.get("UNSLOTH_GC_SYNC_PACK", "") in ("1", "true", "True")
-        with torch_gpu_stream(extra_stream):
-            if not _gc_no_rs:
+        # Phase I T2: UNSLOTH_GC_PACK_WAIT_EVENT=1 replaces record_stream with an
+        # explicit main-stream wait_event on pack_event. Prevents both the
+        # fragmentation caused by record_stream's delayed-free accounting
+        # AND the theoretical race exposed by UNSLOTH_GC_NO_RECORD_STREAM=1,
+        # at the cost of serializing D2H with the next main-stream kernel.
+        _gc_pack_wait_event = os.environ.get("UNSLOTH_GC_PACK_WAIT_EVENT", "") in ("1", "true", "True")
+        # Bounce path: persistent GPU ring; main-stream D2D into bounce,
+        # extra_stream D2H from bounce. Source tensor freed immediately by
+        # main stream — no record_stream tag, no deferred-free, no leaking
+        # saved-activation blocks into CE-sized segments.
+        _gc_bounce = os.environ.get("UNSLOTH_GC_BOUNCE", "") in ("1", "true", "True")
+        if _gc_bounce:
+            slot = pack_idx % _GC_PREFETCH_RING_SIZE
+            bounce = cls._get_gpu_pack_ring_slot(
+                numel=numel, dtype=dtype, device_index=device_index, slot=slot,
+            )
+            slot_key = (dtype, device_index, slot)
+            prev_event = cls._gpu_pack_ring_last_event.get(slot_key)
+            # Main stream must wait for the prior D2H from this bounce slot
+            # so we don't overwrite data extra_stream is still reading.
+            if prev_event is not None:
                 try:
-                    tensor.record_stream(extra_stream)
+                    main_stream.wait_event(prev_event)
                 except Exception:
                     pass
             _t_copy = time.perf_counter_ns() if _gc_count_on else 0
-            cpu_buffer[:numel].view(shape).copy_(tensor, non_blocking=True)
+            # D2D on main stream: bounce[:numel].view(shape).copy_(tensor)
+            bounce[:numel].view(shape).copy_(tensor, non_blocking=True)
             if _gc_count_on:
                 _UNSLOTH_PACK_COPY_NS[0] += time.perf_counter_ns() - _t_copy
-            pack_event = cls._record_stream_event(extra_stream)
+            # Event on main_stream after the D2D completes
+            d2d_event = cls._record_stream_event(main_stream)
+            # extra_stream waits for D2D before starting D2H
+            cls._wait_event(extra_stream, d2d_event)
+            with torch_gpu_stream(extra_stream):
+                cpu_buffer[:numel].view(shape).copy_(
+                    bounce[:numel].view(shape), non_blocking=True,
+                )
+                pack_event = cls._record_stream_event(extra_stream)
+            cls._gpu_pack_ring_last_event[slot_key] = pack_event
+        else:
+            with torch_gpu_stream(extra_stream):
+                if not (_gc_no_rs or _gc_pack_wait_event):
+                    try:
+                        tensor.record_stream(extra_stream)
+                    except Exception:
+                        pass
+                _t_copy = time.perf_counter_ns() if _gc_count_on else 0
+                cpu_buffer[:numel].view(shape).copy_(tensor, non_blocking=True)
+                if _gc_count_on:
+                    _UNSLOTH_PACK_COPY_NS[0] += time.perf_counter_ns() - _t_copy
+                pack_event = cls._record_stream_event(extra_stream)
+            if _gc_pack_wait_event:
+                try:
+                    main_stream.wait_event(pack_event)
+                except Exception:
+                    pass
         if _gc_sync_pack:
             try:
                 extra_stream.synchronize()
