@@ -1105,8 +1105,6 @@ def grpo_accumulated_loss(
                         image_grid_thw = image_grid_thw_chunk,
                         pixel_attention_mask = pixel_attention_mask_chunk,
                         image_sizes = image_sizes_chunk,
-                        mm_token_type_ids = mm_token_type_ids_chunk,
-                        token_type_ids = token_type_ids_chunk,
                         logits_to_keep = logits_to_keep + 1,
                         **_extra_vision_kwargs,
                     ).logits
