@@ -97,7 +97,11 @@ except ImportError:
 # Op sets are resolved lazily on first SAC use, not at import time.
 _SAC_ATTENTION_OPS = None
 _SAC_MATMUL_OPS = None
-_GC_OFFLOAD_BACKENDS = {"noop", "hooks", "hooks_prefetch"}
+_GC_OFFLOAD_BACKENDS = {"noop", "boundary", "hooks", "hooks_prefetch"}
+# `boundary` is an alias for `noop`: both route via _NoopSaveInputs.setup_context
+# so only the checkpoint-region's input tensors get offloaded (skipping the
+# broad saved_tensors_hooks pack of every internal tensor). `boundary` is the
+# documented production-facing alias; `noop` is preserved for back-compat.
 # Ring slot count for prefetch-capable unpack. Must be strictly greater than
 # the max prefetch depth you intend to use; with depth D the prefetch of K+D
 # runs while main_stream is still consuming slot K, so we need at least D+1
@@ -324,6 +328,9 @@ def resolve_gc_offload_backend(backend = None):
             f"Unsloth: Unknown GC offload backend {backend!r}. "
             f"Available: {sorted(_GC_OFFLOAD_BACKENDS)}"
         )
+    # `boundary` is the documented alias; internal dispatch still uses `noop`.
+    if backend == "boundary":
+        backend = "noop"
     return backend
 
 
