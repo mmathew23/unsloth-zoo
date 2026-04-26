@@ -86,35 +86,40 @@ memory/throughput axis without correctness concern.
 | `UNSLOTH_GC_PREFETCH_RING_EAGER_FREE` | `0` | Last-resort | Drops persistent ring reference after restore_event. Memory savings only on fragmented allocator state; not reproducible on clean baselines. |
 | `UNSLOTH_GC_FSDP2_CLEAR_FORWARD_PREFETCH` | `0` | **Diagnostic only** | Clears FSDP2 forward-prefetch lists. PFU_A confirmed no memory benefit on its own; pairing with `UNSHARD_ASYNC_OP=1` regresses throughput further than `UNSHARD_ASYNC_OP=1` alone. **Do not enable in production defaults.** |
 
-## Optional VL extras (research patches, not in any branch)
+## Optional VL extras (committed in `feat/nonreentrantgc`, opt-in)
 
 The PT_C investigation pinpointed the throughput cost of
 `UNSHARD_ASYNC_OP=1` to a specific FSDP2 internal: a
 `current_stream().wait_event(all_gather_event)` fence at
 `torch/distributed/fsdp/_fully_shard/_fsdp_collectives.py:447`. Two
-research patches were prototyped against this fence:
+patches against this fence are now committed in `unsloth_fsdp2` as
+opt-in knobs (default OFF):
 
 - **`UNSLOTH_GC_FSDP2_WAIT_LAZY=1`** — replaces
   `FSDPParamGroup.wait_for_unshard()` with a method that defers the
   actual wait + `foreach_all_gather_copy_out()` until the consuming
-  forward boundary, so the fence is no longer a pre-forward cliff.
-- **`UNSLOTH_GC_FSDP2_AVOID_WAIT=1`** — adds an earlier explicit
-  prefetch + all-gather-stream routing so that by the time the
-  fence is reached the data is already present (effectively making
-  the fence a no-op in expectation).
+  forward boundary (a `forward_pre_hook` installed after
+  `fully_shard()` runs the deferred work just before the module's
+  own forward), so the fence is no longer a pre-forward cliff.
+  Falls back to the native path for `world_size==1`, non-async
+  unshard, and non-FORWARD training states.
+- **`UNSLOTH_GC_FSDP2_AVOID_WAIT=1`** — routes async unshard
+  collectives onto FSDP2's high-priority all-gather stream while
+  keeping copy-in/all-gather-output allocation on the caller stream,
+  and wires singleton forward/backward prefetch chains so the next
+  module's unshard is issued one module earlier from the CPU.
 
 VAL_FINAL measured both alone and combined. They make essentially
 no difference on text (all 4 pref_d0 variants land within 0.16% of
 each other). On VL, `WAIT_LAZY + AVOID_WAIT` recovered ~1.9%
 throughput vs plain `pref_d0_async` while keeping the memory win.
-The patches pass CPU parity (zero loss + grad drift).
+The patches pass CPU parity (max loss diff 0.0027, max grad-norm
+diff 0.0263).
 
-These patches are NOT committed. The merged implementation lives
-in `temp/research_v3_VAL_FINAL/patched_fsdp2/unsloth_dist/accelerate_fsdp2_trainer.py`.
 They're a small VL throughput improvement, not a universal Pareto
-winner — neither stack clears the 0.99x text gate. Apply them only
-if you specifically need the extra ~1-2% VL throughput on the
-prefetch path.
+winner — neither stack clears the 0.99x text gate. Apply only if
+you specifically need the extra ~1-2% VL throughput on the prefetch
+path. Recommended pairing: `pref_d0_unshard` + both knobs on VL.
 
 ## Backend reference
 
