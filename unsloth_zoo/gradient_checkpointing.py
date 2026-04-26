@@ -14,11 +14,25 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import os
+# UNSLOTH_GC_EXPANDABLE_SEGMENTS=1 prepends `expandable_segments:True` to
+# PYTORCH_CUDA_ALLOC_CONF before torch imports. Reduces FSDP2 unshard /
+# prefetch-ring fragmentation overhead (~6-7 GiB reserved on torch 2.11+ VL
+# in measurements). Effective only if CUDA is not yet initialized at this
+# import; set in launch env for guaranteed effect.
+if os.environ.get("UNSLOTH_GC_EXPANDABLE_SEGMENTS", "") in ("1", "true", "True"):
+    _cur_alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    if "expandable_segments" not in _cur_alloc_conf:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+            "expandable_segments:True"
+            if not _cur_alloc_conf
+            else f"{_cur_alloc_conf},expandable_segments:True"
+        )
+
 import torch
 import numpy as np
 import functools
 from typing import Union, Optional, List, Any, Callable, Tuple
-import os
 import warnings
 import gc
 import weakref
@@ -1515,6 +1529,7 @@ class UnslothGradientCheckpointer:
         original_stride = packed.stride
         cpu_buffer = state["cpu_buffer"]
         slot = packed.pack_idx % _GC_PREFETCH_RING_SIZE
+        ring_key = (original_dtype, device_index, slot)
         gpu_buf = cls._get_gpu_restore_ring_slot(
             numel=numel, dtype=original_dtype, device_index=device_index, slot=slot,
         )
@@ -1565,6 +1580,13 @@ class UnslothGradientCheckpointer:
         state["restore_event"] = restore_event
         state["result_view"] = result
         state["h2d_issued"] = True
+        # UNSLOTH_GC_PREFETCH_RING_EAGER_FREE=1 drops the persistent ring
+        # reference once `result_view` owns the tensor, letting the allocator
+        # reclaim the slot when the unpack consumer releases its handle.
+        # Reduces fragmentation overlap with FSDP2 unshard buffers on VL
+        # (~6-8 GiB reserved on torch 2.11+ in measurements), no throughput cost.
+        if _gc_env_flag("UNSLOTH_GC_PREFETCH_RING_EAGER_FREE"):
+            cls._gpu_restore_ring.pop(ring_key, None)
         packed.set_restore_event(restore_event)
         if _nvtx_on:
             torch.cuda.nvtx.range_pop()
