@@ -2550,7 +2550,22 @@ def _unsloth_checkpoint_nonreentrant(function, *args, **kwargs):
     if _gc_disable_cpu_offload() or offload_backend in ("hooks", "hooks_prefetch"):
         token = None
         is_hooks = offload_backend in ("hooks", "hooks_prefetch")
-        use_prefetch = offload_backend == "hooks_prefetch"
+        # Opt-in: when UNSLOTH_GC_BOUNCE=1 is set on the `hooks` backend AND
+        # prefetch is explicitly requested via UNSLOTH_GC_PREFETCH_DEPTH>0 or
+        # UNSLOTH_GC_EAGER_PREFETCH=1, route bounce through the prefetch
+        # restore scheduler. Bounce pack semantics are unchanged; only the
+        # consumer-side unpack switches to overlap-friendly dispatch. This
+        # path is not engaged by default; users who want it must set both
+        # env vars. See research_v2_B1_bounce_text.md for the analysis.
+        bounce_prefetch = (
+            offload_backend == "hooks"
+            and os.environ.get("UNSLOTH_GC_BOUNCE", "") in ("1", "true", "True")
+            and (
+                _gc_eager_prefetch()
+                or int(os.environ.get("UNSLOTH_GC_PREFETCH_DEPTH", "0") or "0") > 0
+            )
+        )
+        use_prefetch = offload_backend == "hooks_prefetch" or bounce_prefetch
         eager = use_prefetch and _gc_eager_prefetch() and not _gc_disable_cpu_offload()
         if (not _gc_disable_cpu_offload()) and is_hooks:
             token = _hooks_offload_state.set({
