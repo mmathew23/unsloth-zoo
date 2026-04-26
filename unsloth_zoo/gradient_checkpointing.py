@@ -29,18 +29,6 @@ if os.environ.get("UNSLOTH_GC_EXPANDABLE_SEGMENTS", "") in ("1", "true", "True")
             else f"{_cur_alloc_conf},expandable_segments:True"
         )
 
-# UNSLOTH_GC_PREFETCH_RING_EAGER_FREE=1 only yields measurable peak-reserved
-# savings at UNSLOTH_GC_PREFETCH_DEPTH=0. With depth>=1, slot N+1 is already
-# allocated by the time slot N is popped, so the allocator cannot reclaim.
-# When the user opts into eager-free without an explicit depth, default
-# depth to 0 so the knob is actually effective. Power users can still
-# override by setting UNSLOTH_GC_PREFETCH_DEPTH explicitly.
-if (
-    os.environ.get("UNSLOTH_GC_PREFETCH_RING_EAGER_FREE", "") in ("1", "true", "True")
-    and "UNSLOTH_GC_PREFETCH_DEPTH" not in os.environ
-):
-    os.environ["UNSLOTH_GC_PREFETCH_DEPTH"] = "0"
-
 import torch
 import numpy as np
 import functools
