@@ -109,17 +109,42 @@ opt-in knobs (default OFF):
   and wires singleton forward/backward prefetch chains so the next
   module's unshard is issued one module earlier from the CPU.
 
-VAL_FINAL measured both alone and combined. They make essentially
-no difference on text (all 4 pref_d0 variants land within 0.16% of
-each other). On VL, `WAIT_LAZY + AVOID_WAIT` recovered ~1.9%
-throughput vs plain `pref_d0_async` while keeping the memory win.
-The patches pass CPU parity (max loss diff 0.0027, max grad-norm
-diff 0.0263).
+VAL_FINAL measured both alone and combined at the production-scale
+operating point (bs=4, seq=4096). They make essentially no difference
+on text there (all 4 pref_d0 variants land within 0.16% of each other).
+On VL, `WAIT_LAZY + AVOID_WAIT` recovered ~1.9% throughput vs plain
+`pref_d0_async` while keeping the memory win. The patches pass CPU
+parity (max loss diff 0.0027, max grad-norm diff 0.0263).
 
-They're a small VL throughput improvement, not a universal Pareto
-winner — neither stack clears the 0.99x text gate. Apply only if
-you specifically need the extra ~1-2% VL throughput on the prefetch
-path. Recommended pairing: `pref_d0_unshard` + both knobs on VL.
+### Open: AVOID_WAIT is regime-dependent on text
+
+At small batch / short sequence (bs=2, seq=2048 — bench-script
+defaults) PTC_FIX_B measured `AVOID_WAIT=1` recovering **67% of the
+text throughput gap** between native and `pref_d0_async`
+(26204 → 26642 tok/s vs 26855 native). At production scale
+(bs=4, seq=4096) VAL_FINAL measured the same patch recovering only
+~0.08%. Same code, same script, same hardware — only the bs/seq
+operating point changed.
+
+Mechanism (hypothesis, not yet verified): the `wait_event(all_gather_event)`
+fence is a fixed-size cliff per FSDP unshard. Per-step compute scales
+with bs×seq, so the fence's fraction of step time shrinks as the
+operating point grows. Below some threshold the fence dominates and
+AVOID_WAIT pays; above it the fence is hidden behind compute.
+
+This is open. A small bs/seq sweep would locate the crossover and
+turn this into a concrete enable rule. Until that's done, treat
+AVOID_WAIT as "meaningful at small batch/short seq, ~0 at production
+scale."
+
+### Recommendation
+
+For the production VAL_FINAL operating point, both knobs are a small
+VL throughput improvement and not a universal Pareto winner. Apply
+only if you specifically need the extra ~1-2% VL throughput on the
+prefetch path; recommended pairing is `pref_d0_unshard` + both knobs
+on VL. For smaller-scale workloads (low bs/seq), AVOID_WAIT alone may
+be worth measuring on text — see "Open" above.
 
 ## Backend reference
 
