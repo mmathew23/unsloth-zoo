@@ -308,7 +308,71 @@ dir that has been cleaned. The committed code on `feat/nonreentrantgc`
 (`accelerate_fsdp2_trainer.py`, commit `ddb71ea`) is the canonical
 implementation.
 
-## 11. How to add a new knob
+## 11. Upstream tracking (PTC_FIX_D, April 2026)
+
+The `UNSLOTH_GC_FSDP2_*` patches monkey-patch internal FSDP2 surfaces:
+`FSDPParamGroup.wait_for_unshard()` and
+`FSDPCommContext.get_all_gather_streams()`. PTC_FIX_D surveyed
+upstream in April 2026 to answer "do we still need these, or has
+PyTorch fixed the underlying issue?"
+
+**What upstream fixed (don't monkey-patch for these):**
+
+- The `record_stream` / allocator-lifetime problem. PR
+  [#150398](https://github.com/pytorch/pytorch/pull/150398) (reland of
+  #148467 + #148590) removed `record_stream` from
+  `ProcessGroupNCCL` entirely, switched to CPU-side stashing for
+  allocator safety, and added watchdog/main-thread unstashing.
+  `TORCH_NCCL_AVOID_RECORD_STREAMS` is now the default and the env
+  var is deprecated. Resolved
+  [#147168](https://github.com/pytorch/pytorch/issues/147168).
+  Present in `release/2.10+` (we're on 2.11.0+cu128).
+
+**What upstream has NOT fixed (this is why we monkey-patch):**
+
+- The `current_stream().wait_event(all_gather_event)` fence inside
+  `foreach_all_gather_copy_out` at
+  `torch/distributed/fsdp/_fully_shard/_fsdp_collectives.py:447`.
+  Materially identical in `release/2.10`, `2.11`, `2.12`, and `main`.
+  No public API to defer/replace the wait. No public
+  `set_unshard_stream()`, no custom `wait_for_unshard` callback.
+  `_set_unshard_async_op(True)` exists but is private and only
+  toggles `async_op`, it does not change the wait policy.
+
+**One PR to watch:**
+
+- [#177147](https://github.com/pytorch/pytorch/pull/177147), open
+  since March 11, 2026. Removes one redundant
+  `all_gather_stream.wait_event(copy_out_event)` in
+  `_wait_all_gather_streams_on_event()`. Helps implicit-prefetch
+  scheduling slightly but does **not** touch the core fence.
+  Watch it — if upstream starts refactoring this area we may need to
+  revalidate the patches.
+
+**Maintenance implications:**
+
+- Don't expect a torch upgrade to remove the need for
+  `WAIT_LAZY` / `AVOID_WAIT`. Same fence on 2.10–main.
+- The patches sit on internal, not stability-promised APIs. Risk
+  scales with how often you bump torch:
+  - Pin one torch minor + own rollout → low maintenance.
+  - Track release branches → medium.
+  - Track nightly → high (revalidate per bump; signature/line
+    numbers have shifted before).
+- If a future torch version exposes a public knob (e.g.
+  `set_unshard_stream()` or a `wait_for_unshard` callback), retire
+  the monkey-patch in favor of it. Until then, the patches are the
+  realistic option.
+
+**Reproducing the survey:**
+
+Full report at
+`/home/mathew/fsdptesting/workspace_0/async_task_outputs/research_v3_PTC_FIX_D_upstream_check.md`.
+The check is GitHub API + `git ls-remote` only, no GPU needed; rerun
+when you bump torch or roughly every 6 months to catch new upstream
+work.
+
+## 12. How to add a new knob
 
 1. Read the env var with `_env_enabled()` (in
    `accelerate_fsdp2_trainer.py`) or
