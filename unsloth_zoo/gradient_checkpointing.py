@@ -115,7 +115,10 @@ _gc_profile_state = {
     "totals": defaultdict(float),
     "module_stats": defaultdict(lambda: defaultdict(float)),
     "shape_stats": defaultdict(lambda: defaultdict(float)),
+    "bucket_stats": defaultdict(lambda: defaultdict(float)),
     "skip_reasons": defaultdict(int),
+    "cuda_wait_events": [],
+    "cuda_wait_events_finalized": False,
 }
 
 
@@ -159,6 +162,24 @@ def _gc_profile_shape_key(shape, dtype) -> str:
     return f"{dims}:{dtype}"
 
 
+def _gc_profile_size_bucket(numel: int, dtype) -> str:
+    n_bytes = int(numel) * torch.tensor([], dtype=dtype).element_size()
+    mib = n_bytes / (1024 * 1024)
+    try:
+        medium_max_mib = float(os.environ.get("UNSLOTH_GC_PROFILE_MEDIUM_MAX_MB", "64"))
+    except ValueError:
+        medium_max_mib = 64.0
+    try:
+        large_min_mib = float(os.environ.get("UNSLOTH_GC_PROFILE_LARGE_MIN_MB", "128"))
+    except ValueError:
+        large_min_mib = 128.0
+    if mib < medium_max_mib:
+        return "medium"
+    if mib >= large_min_mib:
+        return "large"
+    return "midlarge"
+
+
 def _gc_profile_ensure(mode: str) -> bool:
     global _gc_profile_registered
     if not _gc_profile_enabled():
@@ -191,6 +212,8 @@ def _gc_profile_record(
     extra_allocated: bool = False,
     pool_hit: bool = False,
     wait_event_fallback: bool = False,
+    ready_at_wait: Optional[bool] = None,
+    cuda_wait_s: float = 0.0,
 ) -> None:
     if not _gc_profile_ensure(mode):
         return
@@ -201,18 +224,28 @@ def _gc_profile_record(
     totals[f"{kind}_bytes"] += n_bytes
     totals[f"{kind}_cpu_s"] += duration_s
     totals[f"{kind}_wait_s"] += wait_s
+    totals[f"{kind}_cuda_wait_s"] += cuda_wait_s
     if extra_allocated:
         totals["cpu_buffer_allocs"] += 1
     if pool_hit:
         totals["cpu_buffer_pool_hits"] += 1
     if wait_event_fallback:
         totals["wait_stream_fallbacks"] += 1
+    if ready_at_wait is True:
+        totals[f"{kind}_ready_count"] += 1
+    elif ready_at_wait is False:
+        totals[f"{kind}_not_ready_count"] += 1
 
     module_stats = _gc_profile_state["module_stats"][module_name]
     module_stats[f"{kind}_count"] += count
     module_stats[f"{kind}_bytes"] += n_bytes
     module_stats[f"{kind}_cpu_s"] += duration_s
     module_stats[f"{kind}_wait_s"] += wait_s
+    module_stats[f"{kind}_cuda_wait_s"] += cuda_wait_s
+    if ready_at_wait is True:
+        module_stats[f"{kind}_ready_count"] += 1
+    elif ready_at_wait is False:
+        module_stats[f"{kind}_not_ready_count"] += 1
 
     shape_key = _gc_profile_shape_key(shape, dtype)
     shape_stats = _gc_profile_state["shape_stats"][shape_key]
@@ -220,6 +253,77 @@ def _gc_profile_record(
     shape_stats[f"{kind}_bytes"] += n_bytes
     shape_stats[f"{kind}_cpu_s"] += duration_s
     shape_stats[f"{kind}_wait_s"] += wait_s
+    shape_stats[f"{kind}_cuda_wait_s"] += cuda_wait_s
+    shape_stats[f"{kind}_item_bytes"] = max(shape_stats.get(f"{kind}_item_bytes", 0), n_bytes)
+    if ready_at_wait is True:
+        shape_stats[f"{kind}_ready_count"] += 1
+    elif ready_at_wait is False:
+        shape_stats[f"{kind}_not_ready_count"] += 1
+
+    bucket_key = _gc_profile_size_bucket(numel, dtype)
+    bucket_stats = _gc_profile_state["bucket_stats"][bucket_key]
+    bucket_stats[f"{kind}_count"] += count
+    bucket_stats[f"{kind}_bytes"] += n_bytes
+    bucket_stats[f"{kind}_cpu_s"] += duration_s
+    bucket_stats[f"{kind}_wait_s"] += wait_s
+    bucket_stats[f"{kind}_cuda_wait_s"] += cuda_wait_s
+    if ready_at_wait is True:
+        bucket_stats[f"{kind}_ready_count"] += 1
+    elif ready_at_wait is False:
+        bucket_stats[f"{kind}_not_ready_count"] += 1
+
+
+def _gc_profile_record_cuda_wait(
+    *,
+    mode: str,
+    module_name: str,
+    shape,
+    dtype,
+    numel: int,
+    kind: str,
+    start_event,
+    end_event,
+    ready_at_wait: Optional[bool],
+) -> None:
+    if not _gc_profile_ensure(mode):
+        return
+    _gc_profile_state["cuda_wait_events"].append({
+        "mode": mode,
+        "module_name": module_name,
+        "shape": tuple(shape),
+        "dtype": dtype,
+        "numel": int(numel),
+        "kind": kind,
+        "start_event": start_event,
+        "end_event": end_event,
+        "ready_at_wait": ready_at_wait,
+    })
+
+
+def _gc_profile_finalize_cuda_waits() -> None:
+    if _gc_profile_state["cuda_wait_events_finalized"]:
+        return
+    _gc_profile_state["cuda_wait_events_finalized"] = True
+    for item in _gc_profile_state["cuda_wait_events"]:
+        start_event = item.get("start_event")
+        end_event = item.get("end_event")
+        if start_event is None or end_event is None:
+            continue
+        try:
+            end_event.synchronize()
+            cuda_wait_s = float(start_event.elapsed_time(end_event)) / 1000.0
+        except Exception:
+            continue
+        _gc_profile_record(
+            mode = item.get("mode") or _gc_profile_state["mode"] or "unknown",
+            module_name = item["module_name"],
+            shape = item["shape"],
+            dtype = item["dtype"],
+            numel = item["numel"],
+            kind = item["kind"],
+            cuda_wait_s = cuda_wait_s,
+            ready_at_wait = item.get("ready_at_wait"),
+        )
 
 
 def _gc_profile_top_lines(stats_dict, primary_key: str, extra_keys: Tuple[str, ...], limit: int = 10):
@@ -242,9 +346,45 @@ def _gc_profile_top_lines(stats_dict, primary_key: str, extra_keys: Tuple[str, .
     return lines
 
 
+def _gc_profile_medium_shape_lines(primary_key: str, extra_keys: Tuple[str, ...], limit: int = 10):
+    items = []
+    try:
+        medium_max_mib = float(os.environ.get("UNSLOTH_GC_PROFILE_MEDIUM_MAX_MB", "64"))
+    except ValueError:
+        medium_max_mib = 64.0
+    for name, values in _gc_profile_state["shape_stats"].items():
+        item_bytes = values.get("pack_item_bytes", values.get("unpack_item_bytes", 0.0))
+        if item_bytes <= 0:
+            continue
+        item_mib = float(item_bytes) / (1024 * 1024)
+        if item_mib >= medium_max_mib:
+            continue
+        if values.get(primary_key, 0.0) <= 0:
+            continue
+        items.append((name, values, item_mib))
+    items.sort(key = lambda item: item[1].get(primary_key, 0.0), reverse = True)
+    lines = []
+    for name, values, item_mib in items[:limit]:
+        parts = [f"item_MiB={item_mib:.3f}"]
+        value = values.get(primary_key, 0.0)
+        if "bytes" in primary_key or "count" in primary_key:
+            parts.append(f"{primary_key}={value:.0f}")
+        else:
+            parts.append(f"{primary_key}={value:.6f}s")
+        for key in extra_keys:
+            value = values.get(key, 0.0)
+            if "bytes" in key or "count" in key:
+                parts.append(f"{key}={value:.0f}")
+            else:
+                parts.append(f"{key}={value:.6f}s")
+        lines.append(f"  - {name}: " + ", ".join(parts))
+    return lines
+
+
 def _gc_profile_dump_summary() -> None:
     if not _gc_profile_enabled():
         return
+    _gc_profile_finalize_cuda_waits()
     totals = _gc_profile_state["totals"]
     mode = _gc_profile_state["mode"] or "unknown"
     print(f"Unsloth GC profile summary ({mode}):")
@@ -257,6 +397,9 @@ def _gc_profile_dump_summary() -> None:
         f"unpack_bytes={totals.get('unpack_bytes', 0):.0f}, "
         f"unpack_cpu_s={totals.get('unpack_cpu_s', 0.0):.6f}, "
         f"unpack_wait_s={totals.get('unpack_wait_s', 0.0):.6f}, "
+        f"unpack_cuda_wait_s={totals.get('unpack_cuda_wait_s', 0.0):.6f}, "
+        f"unpack_ready_count={totals.get('unpack_ready_count', 0):.0f}, "
+        f"unpack_not_ready_count={totals.get('unpack_not_ready_count', 0):.0f}, "
         f"cpu_buffer_pool_hits={totals.get('cpu_buffer_pool_hits', 0):.0f}, "
         f"cpu_buffer_allocs={totals.get('cpu_buffer_allocs', 0):.0f}, "
         f"wait_stream_fallbacks={totals.get('wait_stream_fallbacks', 0):.0f}"
@@ -267,6 +410,36 @@ def _gc_profile_dump_summary() -> None:
             for reason, count in sorted(_gc_profile_state["skip_reasons"].items())
         )
         print(f"  skips: {reasons}")
+
+    bucket_lines = _gc_profile_top_lines(
+        _gc_profile_state["bucket_stats"],
+        "pack_count",
+        ("pack_bytes", "unpack_count", "unpack_not_ready_count", "unpack_cuda_wait_s"),
+    )
+    if bucket_lines:
+        print("  size buckets:")
+        for line in bucket_lines:
+            print(line)
+
+    module_lines = _gc_profile_top_lines(
+        _gc_profile_state["module_stats"],
+        "unpack_not_ready_count",
+        ("unpack_ready_count", "unpack_cuda_wait_s", "unpack_bytes"),
+    )
+    if module_lines:
+        print("  top modules by unpack_not_ready_count:")
+        for line in module_lines:
+            print(line)
+
+    module_lines = _gc_profile_top_lines(
+        _gc_profile_state["module_stats"],
+        "unpack_cuda_wait_s",
+        ("unpack_not_ready_count", "unpack_bytes", "unpack_count"),
+    )
+    if module_lines:
+        print("  top modules by unpack_cuda_wait_s:")
+        for line in module_lines:
+            print(line)
 
     module_lines = _gc_profile_top_lines(
         _gc_profile_state["module_stats"],
@@ -315,6 +488,35 @@ def _gc_profile_dump_summary() -> None:
     )
     if shape_lines:
         print("  top tensor shapes by unpack_cpu_s:")
+        for line in shape_lines:
+            print(line)
+
+    shape_lines = _gc_profile_top_lines(
+        _gc_profile_state["shape_stats"],
+        "unpack_not_ready_count",
+        ("unpack_ready_count", "unpack_cuda_wait_s", "unpack_bytes"),
+    )
+    if shape_lines:
+        print("  top tensor shapes by unpack_not_ready_count:")
+        for line in shape_lines:
+            print(line)
+
+    shape_lines = _gc_profile_top_lines(
+        _gc_profile_state["shape_stats"],
+        "unpack_cuda_wait_s",
+        ("unpack_not_ready_count", "unpack_bytes", "unpack_count"),
+    )
+    if shape_lines:
+        print("  top tensor shapes by unpack_cuda_wait_s:")
+        for line in shape_lines:
+            print(line)
+
+    shape_lines = _gc_profile_medium_shape_lines(
+        "pack_count",
+        ("pack_bytes", "unpack_not_ready_count", "unpack_cuda_wait_s"),
+    )
+    if shape_lines:
+        print("  medium tensor shapes by pack_count:")
         for line in shape_lines:
             print(line)
 
@@ -1254,8 +1456,9 @@ class UnslothGradientCheckpointer:
         cls._extra_streams_aux = {}
         cls._initialized = False
 
-    def __init__(self, is_last_layer: bool = False):
+    def __init__(self, is_last_layer: bool = False, checkpoint_index: Optional[int] = None):
         self.is_last_layer = is_last_layer
+        self.checkpoint_index = checkpoint_index
 
     @classmethod
     def begin_checkpoint(cls, dtype=None):
@@ -1296,7 +1499,7 @@ class UnslothGradientCheckpointer:
             (cls._current_gc_index > cls._last_gc_index - _skip_last_n)
             and not cls._first_pass
         )
-        return cls(is_last_layer=is_last_layer)
+        return cls(is_last_layer=is_last_layer, checkpoint_index=cls._current_gc_index)
 
     @classmethod
     def _record_stream_event(cls, stream):
@@ -1648,6 +1851,8 @@ class UnslothGradientCheckpointer:
         if _gc_count_on:
             _UNSLOTH_PACK_WAITSTREAM_NS[0] += time.perf_counter_ns() - _t_ws
         module_name = _gc_profile_module_name()
+        if module_name == "<unknown>" and self.checkpoint_index is not None:
+            module_name = f"checkpoint_{self.checkpoint_index:03d}"
         start_time = time.perf_counter() if _gc_profile_enabled() else 0.0
         # Ablations (Phase B2 of fsdp2 GC-offload investigation):
         #   UNSLOTH_GC_NO_RECORD_STREAM=1 skips tensor.record_stream(extra_stream).
@@ -1826,6 +2031,8 @@ class UnslothGradientCheckpointer:
         restore_event = packed._state["restore_event"]
         _nvtx_on = os.environ.get("UNSLOTH_GC_NVTX", "") in ("1", "true", "True")
         _count_on = os.environ.get("UNSLOTH_GC_CHECKPOINT_HIT_COUNT", "") in ("1", "true", "True")
+        _profile_on = _gc_profile_enabled()
+        done_before_wait = None
         # Debug one-shot: dump restore_event state on first call to see if
         # the event was actually recorded (not None) and whether h2d_issued
         # flag is set. If restore_event is None, prefetch fired but never
@@ -1839,7 +2046,7 @@ class UnslothGradientCheckpointer:
                 f"pending_remaining={len(cls._pending_unpacks)}",
                 flush=True,
             )
-        if _nvtx_on or _count_on:
+        if _nvtx_on or _count_on or _profile_on:
             # Query event status to see if H2D is already done (prefetch worked)
             # or still in flight (prefetch didn't save the wait).
             try:
@@ -1854,10 +2061,48 @@ class UnslothGradientCheckpointer:
             if _nvtx_on:
                 tag = "ready" if done_before_wait else "NOT_ready"
                 torch.cuda.nvtx.range_push(f"wait_pack{getattr(packed,'pack_idx',-1)}_{tag}")
-        if not cls._wait_event(main_stream, restore_event):
+        profile_start_event = None
+        profile_end_event = None
+        if _profile_on and DEVICE_TYPE in ("cuda", "hip"):
+            try:
+                profile_start_event = torch.cuda.Event(enable_timing=True)
+                profile_end_event = torch.cuda.Event(enable_timing=True)
+                profile_start_event.record(main_stream)
+            except Exception:
+                profile_start_event = None
+                profile_end_event = None
+        wait_event_fallback = not cls._wait_event(main_stream, restore_event)
+        if wait_event_fallback:
             stream_idx = getattr(packed, "stream_idx", 0) or 0
             extra_stream = cls._resolve_extra_stream(device_index, stream_idx)
             main_stream.wait_stream(extra_stream)
+        if profile_end_event is not None:
+            try:
+                profile_end_event.record(main_stream)
+                _gc_profile_record_cuda_wait(
+                    mode = "nonreentrant_hooks",
+                    module_name = packed.module_name,
+                    shape = packed.shape,
+                    dtype = packed.dtype,
+                    numel = packed.numel,
+                    kind = "unpack",
+                    start_event = profile_start_event,
+                    end_event = profile_end_event,
+                    ready_at_wait = done_before_wait,
+                )
+            except Exception:
+                pass
+        elif _profile_on:
+            _gc_profile_record(
+                mode = "nonreentrant_hooks",
+                module_name = packed.module_name,
+                shape = packed.shape,
+                dtype = packed.dtype,
+                numel = packed.numel,
+                kind = "unpack",
+                ready_at_wait = done_before_wait,
+                wait_event_fallback = wait_event_fallback,
+            )
         if _nvtx_on:
             try:
                 torch.cuda.nvtx.range_pop()
