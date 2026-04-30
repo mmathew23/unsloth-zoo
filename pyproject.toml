@@ -89,7 +89,9 @@ triton = [
 ]
 cutile = [
     "unsloth_zoo[core]",
-    "cuda-tile[tileiras] ; ('linux' in sys_platform)",
+    # cuda-tile is pre-stable; cap at next major to avoid silently pulling
+    # a breaking release. Bump when a tested 2.x lands.
+    "cuda-tile[tileiras]>=1.3.0,<2.0 ; ('linux' in sys_platform)",
 ]
 base = [
     "unsloth_zoo[huggingface]",
