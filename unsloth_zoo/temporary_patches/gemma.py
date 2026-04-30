@@ -37,6 +37,10 @@ from .utils import (
 import inspect
 
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
+try:
+    from ..flex_attention.utils import flex_attention as _flex_attention_fn
+except Exception:
+    _flex_attention_fn = None
 
 
 def _make_gemma3_attn_forwards(forward_function, has_cache_position):
@@ -516,6 +520,8 @@ def patch_Gemma3Attention():
         attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
         if _UNSLOTH_FLEX_ATTENTION_DISABLED:
             attn_impl = "sdpa"
+        if _flex_attention_fn is None:
+            attn_impl = "sdpa"  # cutile-only fallback
         if attn_impl == "flex_attention":
             attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
             attn_output_fp32, attn_weights = attention_interface(
@@ -752,6 +758,8 @@ def patch_Gemma3Attention_generic():
         attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
         if _UNSLOTH_FLEX_ATTENTION_DISABLED:
             attn_impl = "sdpa"
+        if _flex_attention_fn is None:
+            attn_impl = "sdpa"  # cutile-only fallback
         if attn_impl == "flex_attention":
             attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
             attn_output_fp32, attn_weights = attention_interface(

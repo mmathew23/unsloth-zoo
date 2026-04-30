@@ -26,7 +26,7 @@ import inspect
 import functools
 import math
 import os
-from ..temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from ..temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, torch_compile, logger
 from ..device_type import DEVICE_TYPE
         
 
@@ -323,11 +323,10 @@ class UnslothFusedLoss(torch.autograd.Function):
 
         if torch_compile and _FUSED_CE_COMPILE_SUPPORTED is not False:
             try:
-                accumulate_chunk = torch.compile(
+                accumulate_chunk = torch_compile(
                     accumulate_chunk,
                     dynamic = True,
                     fullgraph = True,
-                    options = torch_compile_options,
                 )
             except Exception:
                 _FUSED_CE_COMPILE_SUPPORTED = False

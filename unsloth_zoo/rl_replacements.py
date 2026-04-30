@@ -26,7 +26,7 @@ import logging
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
 from .device_type import DEVICE_TYPE, device_synchronize
-from .temporary_patches.common import torch_compile_options
+from .temporary_patches.common import torch_compile_options, torch_compile
 RL_REPLACEMENTS = dict()
 
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
@@ -555,12 +555,11 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             grad_inputs_j[:] = chunk_grad_input
         pass
 
-        accumulate_chunk = torch.compile(
+        accumulate_chunk = torch_compile(
             accumulate_chunk,
             fullgraph = True,
             # [TODO] Dynamic marking causes torch.compile errors if sequence length is long
             dynamic = True,
-            options = torch_compile_options,
         )
 
         grad_inputs_chunks = torch.chunk(grad_inputs,        chunks = n_chunks, dim = 0)

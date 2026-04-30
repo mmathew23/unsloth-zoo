@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 __all__ = [
-    "TEMPORARY_PATCHES", 
+    "TEMPORARY_PATCHES",
     "torch_compile_options",
     "UNSLOTH_ENABLE_LOGGING",
     "UNSLOTH_COMPILE_DISABLE",
@@ -23,11 +23,15 @@ __all__ = [
     "logger",
     "torch_compile",
     "_torch_compile",
+    "UNSLOTH_COMPILE_BACKEND",
+    "_detect_compile_backend",
+    "_make_torch_compile",
 ]
 
 import os
 import sys
 import logging
+import importlib.util
 from ..log import logger
 import functools
 UNSLOTH_ENABLE_LOGGING  = os.environ.get("UNSLOTH_ENABLE_LOGGING",  "0") == "1"
@@ -158,20 +162,48 @@ def noop(*args: Any, **kwargs: Any):
     return _decorator
 pass
 
-if UNSLOTH_COMPILE_DISABLE:
-    torch_compile = noop
-else:
-    torch_compile = functools.partial(
-        torch.compile,
-        options = torch_compile_options,
-    )
+def _detect_compile_backend() -> str:
+    explicit = os.environ.get("UNSLOTH_TORCH_COMPILE_BACKEND", "").strip()
+    if explicit:
+        return explicit
+    if importlib.util.find_spec("triton") is not None:
+        return "inductor"
+    return "aot_eager"
+
+UNSLOTH_COMPILE_BACKEND: str = _detect_compile_backend()
+
+def _make_torch_compile(default_options):
+    def _compile(fn=None, **kwargs):
+        backend = UNSLOTH_COMPILE_BACKEND
+        if backend == "inductor":
+            if default_options is not None and "options" not in kwargs:
+                kwargs["options"] = default_options
+        else:
+            kwargs.pop("options", None)
+            kwargs.pop("mode", None)
+        try:
+            if fn is None or not callable(fn):
+                return functools.partial(torch.compile, backend=backend, **kwargs)
+            return torch.compile(fn, backend=backend, **kwargs)
+        except Exception as e:
+            # Fallback to eager (uncompiled) if backend tracing fails
+            import warnings
+            warnings.warn(
+                f"Unsloth: torch.compile backend '{backend}' failed ({e!r}); "
+                f"falling back to eager.", stacklevel=2)
+            if fn is None or not callable(fn):
+                def _identity_decorator(f):
+                    return f
+                return _identity_decorator
+            return fn
+    return _compile
 
 if UNSLOTH_COMPILE_DISABLE:
+    torch_compile = noop
     _torch_compile = noop
 else:
-    _torch_compile = functools.partial(
-        torch.compile,
-    )
+    torch_compile = _make_torch_compile(torch_compile_options)
+    _torch_compile = _make_torch_compile(default_options=None)
 
 global TEMPORARY_PATCHES
 TEMPORARY_PATCHES = []

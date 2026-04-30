@@ -35,7 +35,7 @@ __all__ = [
 
 import torch
 import functools
-from ..temporary_patches.common import torch_compile, _torch_compile
+from ..temporary_patches.common import torch_compile, _torch_compile, UNSLOTH_COMPILE_BACKEND
 FLEX_ATTENTION_KV_INCREMENT = 512
 
 try:
@@ -74,7 +74,14 @@ try:
         }
         _flex_attention = functools.partial(_flex_attention, kernel_options = kernel_options)
     pass
-    flex_attention = _torch_compile(_flex_attention)
+    if UNSLOTH_COMPILE_BACKEND == "inductor":
+        flex_attention = _torch_compile(_flex_attention)
+    else:
+        import warnings
+        warnings.warn(
+            "flex_attention disabled: requires inductor (Triton) backend. Falling back to SDPA.",
+            stacklevel=2)
+        flex_attention = None
 
     @functools.lru_cache
     def create_block_mask_cached(mask_mod, M, N, device = "cuda"):

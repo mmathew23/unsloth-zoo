@@ -57,7 +57,7 @@ from importlib.metadata import version as importlib_version
 import functools
 from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
-from .temporary_patches.common import get_torch_compile_options
+from .temporary_patches.common import get_torch_compile_options, torch_compile as _unsloth_torch_compile, UNSLOTH_COMPILE_BACKEND
 from .hf_utils import get_transformers_model_type
 
 try:
@@ -819,7 +819,7 @@ def create_new_function(
 
     if add_torch_compile:
         new_source = (
-            "@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)\n"
+            "@_unsloth_torch_compile(fullgraph = True, dynamic = True)\n"
             f"{new_source}"
         )
     pass
@@ -851,7 +851,9 @@ def create_new_function(
     imports += "import torch\n"
     imports += "import torch.nn as nn\n"
     imports += "from torch.nn import functional as F\n"
-    if "torch_compile" in new_source:
+    if "_unsloth_torch_compile" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.common import torch_compile as _unsloth_torch_compile\n"
+    elif "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "KWARGS_TYPE" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import KWARGS_TYPE\n"
@@ -917,7 +919,8 @@ def create_new_function(
         '"""\n' + f"{unsloth_zoo_version}\n"
         f"{unsloth_version}\n"
         f"{transformers_version}\n"
-        f"{trl_version}\n__UNSLOTH_VERSIONING__\n" + '"""\n'
+        f"{trl_version}\n"
+        f"{UNSLOTH_COMPILE_BACKEND}\n__UNSLOTH_VERSIONING__\n" + '"""\n'
     )
 
     if _full_license_header not in new_source:
@@ -1249,7 +1252,7 @@ def create_standalone_class(
 
     if disable is not None:
         compile = (
-            f"@torch.compile(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
+            f"@_unsloth_torch_compile(fullgraph = {fullgraph}, dynamic = True)"
             if not disable
             else "@torch.compiler.disable(recursive = False)"
         )
@@ -1384,8 +1387,9 @@ pass
 
 _cross_entropy_code = """
 from torch.nn import CrossEntropyLoss
+from unsloth_zoo.temporary_patches.common import torch_compile as _unsloth_torch_compile
 
-@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)
+@_unsloth_torch_compile(fullgraph = True, dynamic = True)
 def normal_cross_entropy_loss(self, hidden_states, labels):
     logits = self.lm_head(hidden_states)
     logits = logits.float()
@@ -2852,8 +2856,8 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
             forward = eval(norm).forward
             if hasattr(forward, "get_compiler_config"):
                 continue
-            forward = torch.compile(
-                forward, fullgraph=True, dynamic=None, options=torch_compile_options
+            forward = _unsloth_torch_compile(
+                forward, fullgraph=True, dynamic=None,
             )
             exec(f"timm.layers.norm_act.{norm}.forward = forward")
             if UNSLOTH_ENABLE_LOGGING:
@@ -2883,8 +2887,8 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
             forward = eval(block).forward
             if hasattr(forward, "get_compiler_config"):
                 continue
-            forward = torch.compile(
-                forward, fullgraph=True, dynamic=None, options=torch_compile_options
+            forward = _unsloth_torch_compile(
+                forward, fullgraph=True, dynamic=None,
             )
             exec(f"timm.models._efficientnet_blocks.{block}.forward = forward")
             if UNSLOTH_ENABLE_LOGGING:
@@ -4008,7 +4012,7 @@ def unsloth_compile_transformers(
                     + parameters
                 )
             elif not disable:
-                parameters = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
+                parameters = f"@_unsloth_torch_compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True)\n{parameters}"
             all_standalone_classes[module] = parameters
         pass
 
@@ -4060,14 +4064,14 @@ def unsloth_compile_transformers(
             if not bad:
                 if module in disable_compile_functions:
                     source = re.sub(
-                        r"@torch.compile\([^\n]*\)\n",
+                        r"@(?:torch\.compile|_unsloth_torch_compile)\([^\n]*\)\n",
                         "@torch.compiler.disable(recursive = False)\n",
                         source,
                     )
                     if "@torch.compiler.disable(recursive = False)\n" not in source:
                         source = "@torch.compiler.disable(recursive = False)\n" + source
                 elif not disable:
-                    source = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
+                    source = f"@_unsloth_torch_compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True)\n{source}"
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(
