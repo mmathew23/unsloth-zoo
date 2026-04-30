@@ -39,6 +39,7 @@ dependencies = [
     "protobuf",
     "huggingface_hub>=0.34.0",
     "hf_transfer",
+    "cut_cross_entropy ; python_version >= '3.10'",
     "pillow",
     "regex",
     "msgspec",
@@ -72,6 +73,7 @@ core = [
     "protobuf",
     "huggingface_hub>=0.34.0",
     "hf_transfer",
+    "cut_cross_entropy ; python_version >= '3.10'",
     "pillow",
     "regex",
     "msgspec",
@@ -88,7 +90,6 @@ triton = [
 cutile = [
     "unsloth_zoo[core]",
     "cuda-tile[tileiras] ; ('linux' in sys_platform)",
-    "cut_cross_entropy ; python_version >= '3.10'",
 ]
 base = [
     "unsloth_zoo[huggingface]",
