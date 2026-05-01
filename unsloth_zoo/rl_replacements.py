@@ -30,7 +30,7 @@ from .temporary_patches.common import torch_compile_options, torch_compile
 RL_REPLACEMENTS = dict()
 
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@torch_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def selective_log_softmax(logits, index):
     logits = logits.to(torch.float32)
     selected_logits = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
@@ -43,7 +43,7 @@ pass
 
 # More memory efficient by chunking on (bsz+qlen) dimension
 # Exactly equivalent to the above
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@torch_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_selective_log_softmax(logits, index, temperature: float = 1.0):
     # Split into 4 chunks only
     chunked_logits = torch.chunk(logits.reshape(-1, logits.shape[-1]), chunks = 4, dim = 0)
@@ -66,7 +66,7 @@ pass
 
 RL_REPLACEMENTS["selective_log_softmax"] = chunked_selective_log_softmax
 
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@torch_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_hidden_states_selective_log_softmax(
     hidden_states: torch.Tensor,
     lm_head: torch.Tensor,
@@ -487,7 +487,7 @@ def grpo_compute_loss(
 pass
 RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
-    f"@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\
+    f"@torch_compile(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\
     f"{inspect.getsource(grpo_compute_loss)}"
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
     RL_REPLACEMENTS["grpo_compute_loss_slow"].replace(
@@ -958,17 +958,27 @@ def grpo_accumulated_loss(
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, -(logits_to_keep + max_left_pad + 1): , :]
                     new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
-                    logprobs_chunk = efficient_log_softmax(
-                        new_hidden_states_chunk,
-                        lm_head,
-                        completion_ids,
-                        chunks=input_ids_chunk.shape[0]*multiplier,
-                        logit_scale_multiply=logit_scale_multiply,
-                        logit_scale_divide=logit_scale_divide,
-                        logit_softcapping=logit_softcapping,
-                        temperature=temperature,
-                        batch_size = B
-                    )
+                    # Some eager/generic model paths return logits even when
+                    # UNSLOTH_RETURN_HIDDEN_STATES=1. Avoid projecting vocab logits
+                    # through lm_head a second time.
+                    if new_hidden_states_chunk.shape[-1] == lm_head.shape[1]:
+                        logprobs_chunk = efficient_log_softmax(
+                            new_hidden_states_chunk,
+                            lm_head,
+                            completion_ids,
+                            chunks=input_ids_chunk.shape[0]*multiplier,
+                            logit_scale_multiply=logit_scale_multiply,
+                            logit_scale_divide=logit_scale_divide,
+                            logit_softcapping=logit_softcapping,
+                            temperature=temperature,
+                            batch_size = B
+                        )
+                    else:
+                        logprobs_chunk = chunked_selective_log_softmax(
+                            new_hidden_states_chunk,
+                            completion_ids,
+                            temperature=temperature,
+                        )
                 else:
                     new_hidden_states_chunk = unwrapped_model(
                         input_ids = input_ids_chunk,
