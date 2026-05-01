@@ -2143,6 +2143,26 @@ def convert_attention_masks_to_bool(module, old_source):
     return new_source
 
 
+def patch_gpt_oss_dict_attention_mask(source):
+    if "attn_weights = attn_weights + attention_mask" not in source or "module" not in source:
+        return source
+    if "key_states" not in source:
+        return source
+    # Transformers 5.x can pass GPT-OSS generation masks as a dict keyed by layer
+    # type; the selected mask still needs slicing to the current KV-cache length.
+    return re.sub(
+        r"(\s+)(if attention_mask is not None:\s*\n\s+attn_weights = attn_weights \+ attention_mask)",
+        r"\1if attention_mask is not None:\n"
+        r"\1    if isinstance(attention_mask, dict):\n"
+        r"\1        attention_mask = attention_mask.get(getattr(module, 'layer_type', None), None)\n"
+        r"\1    if attention_mask is not None:\n"
+        r"\1        attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]\n"
+        r"\1        attn_weights = attn_weights + attention_mask",
+        source,
+        flags=re.MULTILINE,
+    )
+
+
 pass
 
 
@@ -4039,20 +4059,7 @@ def unsloth_compile_transformers(
             if sdpa_bool_masks:
                 source = convert_attention_masks_to_bool(module, source)
 
-            # Fix dict-based attention masks for gpt_oss (transformers 5.x).
-            # In v5, create_masks_for_generate returns a dict of masks keyed by
-            # layer pattern instead of a single tensor.
-            if "attn_weights = attn_weights + attention_mask" in source and "module" in source:
-                source = re.sub(
-                    r"(\s+)(if attention_mask is not None:\s*\n\s+attn_weights = attn_weights \+ attention_mask)",
-                    r"\1if attention_mask is not None:\n"
-                    r"\1    if isinstance(attention_mask, dict):\n"
-                    r"\1        attention_mask = attention_mask.get(getattr(module, 'layer_type', None), None)\n"
-                    r"\1    if attention_mask is not None:\n"
-                    r"\1        attn_weights = attn_weights + attention_mask",
-                    source,
-                    flags=re.MULTILINE,
-                )
+            source = patch_gpt_oss_dict_attention_mask(source)
 
             # Check erroring out
             bad = False

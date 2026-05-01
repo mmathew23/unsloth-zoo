@@ -2396,10 +2396,16 @@ def patch_GptOssModel():
             torch.compiler.cudagraph_mark_step_begin()
             # Initialize for common return path
             all_hidden_states = None
-            for decoder_layer in self.layers:
-                _attn_type = getattr(decoder_layer, "attention_type", None)
+            for i, decoder_layer in enumerate(self.layers):
+                _attn_type = getattr(getattr(decoder_layer, "self_attn", None), "layer_type", None)
+                if _attn_type is None and hasattr(self.config, "layer_types"):
+                    _attn_type = self.config.layer_types[i]
                 if isinstance(attention_mask, dict):
-                    mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
+                    # NVIDIA_REVIEW: GPT-OSS mixes full and sliding attention; keep
+                    # the mask keyed to the exact layer type during generation.
+                    mask = attention_mask.get(_attn_type, None)
+                    if mask is None:
+                        mask = next(iter(attention_mask.values()))
                 else:
                     mask = attention_mask
                 hidden_states, residual = inference_forward(
@@ -2443,13 +2449,19 @@ def patch_GptOssModel():
             )
             all_hidden_states = () if output_hidden_states else None
 
-            for decoder_layer in self.layers:
+            for i, decoder_layer in enumerate(self.layers):
                 if output_hidden_states:
                     all_hidden_states += (hidden_states,)
 
-                _attn_type = getattr(decoder_layer, "attention_type", None)
+                _attn_type = getattr(getattr(decoder_layer, "self_attn", None), "layer_type", None)
+                if _attn_type is None and hasattr(self.config, "layer_types"):
+                    _attn_type = self.config.layer_types[i]
                 if isinstance(attention_mask, dict):
-                    mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
+                    # NVIDIA_REVIEW: GPT-OSS mixes full and sliding attention; keep
+                    # the mask keyed to the exact layer type during generation.
+                    mask = attention_mask.get(_attn_type, None)
+                    if mask is None:
+                        mask = next(iter(attention_mask.values()))
                 else:
                     mask = attention_mask
                 hidden_states = decoder_layer(

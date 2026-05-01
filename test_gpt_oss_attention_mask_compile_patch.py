@@ -1,0 +1,61 @@
+import textwrap
+import unittest
+import os
+from pathlib import Path
+
+os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
+
+from unsloth_zoo.compiler import patch_gpt_oss_dict_attention_mask
+
+
+class TestGptOssAttentionMaskCompilePatch(unittest.TestCase):
+    def test_dict_mask_patch_slices_to_kv_length(self):
+        source = textwrap.dedent(
+            """
+            def eager_attention_forward(module, query, key, value, attention_mask, scaling):
+                key_states = repeat_kv(key, module.num_key_value_groups)
+                attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+                if attention_mask is not None:
+                    attn_weights = attn_weights + attention_mask
+                return attn_weights
+            """
+        )
+
+        patched = patch_gpt_oss_dict_attention_mask(source)
+
+        self.assertIn("if isinstance(attention_mask, dict):", patched)
+        self.assertIn(
+            "attention_mask = attention_mask.get(getattr(module, 'layer_type', None), None)",
+            patched,
+        )
+        self.assertIn(
+            "attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]",
+            patched,
+        )
+        self.assertIn("attn_weights = attn_weights + attention_mask", patched)
+
+    def test_patch_requires_kv_length_variable(self):
+        source = textwrap.dedent(
+            """
+            def eager_attention_forward(module, query, key, value, attention_mask, scaling):
+                attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
+                if attention_mask is not None:
+                    attn_weights = attn_weights + attention_mask
+                return attn_weights
+            """
+        )
+
+        self.assertEqual(patch_gpt_oss_dict_attention_mask(source), source)
+
+
+class TestGptOssTemporaryPatchSource(unittest.TestCase):
+    def test_model_forward_selects_attention_mask_by_layer_type(self):
+        source = (Path(__file__).parent / "unsloth_zoo/temporary_patches/gpt_oss.py").read_text()
+
+        self.assertNotIn('getattr(decoder_layer, "attention_type", None)', source)
+        self.assertIn('getattr(getattr(decoder_layer, "self_attn", None), "layer_type", None)', source)
+        self.assertIn("self.config.layer_types[i]", source)
+
+
+if __name__ == "__main__":
+    unittest.main()
