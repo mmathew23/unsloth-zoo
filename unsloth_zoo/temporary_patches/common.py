@@ -41,7 +41,31 @@ UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1"
 # Get only allowed options
 import inspect
 import torch
-inductor_config_source = inspect.getsource(torch._inductor.config)
+
+
+def _is_triton_importable() -> bool:
+    try:
+        importlib.import_module("triton")
+    except Exception:
+        return False
+    return True
+
+
+if not _is_triton_importable():
+    try:
+        import torch.utils._triton as _torch_triton_utils
+        _torch_triton_utils.has_triton_package = lambda: False
+    except Exception:
+        pass
+
+
+try:
+    inductor_config_source = inspect.getsource(torch._inductor.config)
+except Exception:
+    # Broken or absent Triton can make torch._inductor fail during lazy import.
+    # No-Triton installs route torch.compile through aot_eager below, where
+    # inductor options are stripped before calling torch.compile.
+    inductor_config_source = ""
 
 @functools.lru_cache(1)
 def determine_compile_threads():
@@ -163,14 +187,6 @@ def noop(*args: Any, **kwargs: Any):
     return _decorator
 pass
 
-def _is_triton_importable() -> bool:
-    try:
-        importlib.import_module("triton")
-    except Exception:
-        return False
-    return True
-
-
 def _detect_compile_backend() -> str:
     explicit = os.environ.get("UNSLOTH_TORCH_COMPILE_BACKEND", "").strip()
     if explicit:
@@ -182,6 +198,12 @@ def _detect_compile_backend() -> str:
 UNSLOTH_COMPILE_BACKEND: str = _detect_compile_backend()
 
 def _make_torch_compile(default_options):
+    def _warn_compile_fallback(backend, exc):
+        import warnings
+        warnings.warn(
+            f"Unsloth: torch.compile backend '{backend}' failed ({exc!r}); "
+            f"falling back to eager.", stacklevel=2)
+
     def _compile(fn=None, **kwargs):
         backend = UNSLOTH_COMPILE_BACKEND
         # When the resolved backend is the torch.compile default ("inductor"),
@@ -199,20 +221,19 @@ def _make_torch_compile(default_options):
             kwargs.pop("options", None)
             kwargs.pop("mode", None)
             compile_kwargs = {**kwargs, "backend": backend}
+        if fn is None or not callable(fn):
+            def _decorator(f):
+                try:
+                    return torch.compile(f, **compile_kwargs)
+                except Exception as e:
+                    _warn_compile_fallback(backend, e)
+                    return f
+            return _decorator
         try:
-            if fn is None or not callable(fn):
-                return functools.partial(torch.compile, **compile_kwargs)
             return torch.compile(fn, **compile_kwargs)
         except Exception as e:
             # Fallback to eager (uncompiled) if backend tracing fails
-            import warnings
-            warnings.warn(
-                f"Unsloth: torch.compile backend '{backend}' failed ({e!r}); "
-                f"falling back to eager.", stacklevel=2)
-            if fn is None or not callable(fn):
-                def _identity_decorator(f):
-                    return f
-                return _identity_decorator
+            _warn_compile_fallback(backend, e)
             return fn
     return _compile
 

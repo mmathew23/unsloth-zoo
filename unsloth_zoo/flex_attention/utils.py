@@ -81,6 +81,7 @@ try:
         warnings.warn(
             "flex_attention disabled: requires inductor (Triton) backend. Falling back to SDPA.",
             stacklevel=2)
+        HAS_FLEX_ATTENTION = False
         flex_attention = None
 
     @functools.lru_cache
