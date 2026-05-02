@@ -141,6 +141,38 @@ class CompileBackendCommonTests(unittest.TestCase):
         ):
             self.assertTrue(compiler.should_skip_fused_lm_head_patch())
 
+    def test_generated_cache_uses_direct_torch_compile_on_inductor(self):
+        from unsloth_zoo import compiler
+
+        with patch.object(compiler, "UNSLOTH_COMPILE_BACKEND", "inductor"):
+            decorator = compiler._generated_torch_compile_decorator(
+                fullgraph = True,
+                dynamic = True,
+            )
+            compile_import = compiler._generated_torch_compile_import()
+
+        self.assertEqual(
+            decorator,
+            "@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)",
+        )
+        self.assertEqual(compile_import, "")
+
+    def test_generated_cache_uses_wrapper_on_non_inductor(self):
+        from unsloth_zoo import compiler
+
+        with patch.object(compiler, "UNSLOTH_COMPILE_BACKEND", "aot_eager"):
+            decorator = compiler._generated_torch_compile_decorator(
+                fullgraph = False,
+                dynamic = True,
+            )
+            compile_import = compiler._generated_torch_compile_import()
+
+        self.assertEqual(
+            decorator,
+            "@_unsloth_torch_compile(fullgraph = False, dynamic = True)",
+        )
+        self.assertIn("torch_compile as _unsloth_torch_compile", compile_import)
+
 
 if __name__ == "__main__":
     unittest.main()

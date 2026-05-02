@@ -110,6 +110,21 @@ def should_skip_fused_lm_head_patch():
     )
 pass
 
+def _generated_torch_compile_decorator(fullgraph = True, dynamic = True):
+    if UNSLOTH_COMPILE_BACKEND == "inductor":
+        return (
+            f"@torch.compile(fullgraph = {fullgraph}, dynamic = {dynamic}, "
+            "options = torch_compile_options)"
+        )
+    return f"@_unsloth_torch_compile(fullgraph = {fullgraph}, dynamic = {dynamic})"
+pass
+
+def _generated_torch_compile_import():
+    if UNSLOTH_COMPILE_BACKEND == "inductor":
+        return ""
+    return "from unsloth_zoo.temporary_patches.common import torch_compile as _unsloth_torch_compile\n"
+pass
+
 # Check if Unsloth Studio is allowed
 import importlib.util
 
@@ -831,10 +846,7 @@ def create_new_function(
     pass
 
     if add_torch_compile:
-        new_source = (
-            "@_unsloth_torch_compile(fullgraph = True, dynamic = True)\n"
-            f"{new_source}"
-        )
+        new_source = f"{_generated_torch_compile_decorator(fullgraph = True, dynamic = True)}\n{new_source}"
     pass
 
     # Fix invalid signatures like: def fn(..., kwargs, **kwargs): -> rename param + alias
@@ -1268,7 +1280,7 @@ def create_standalone_class(
 
     if disable is not None:
         compile = (
-            f"@_unsloth_torch_compile(fullgraph = {fullgraph}, dynamic = True)"
+            _generated_torch_compile_decorator(fullgraph = fullgraph, dynamic = True)
             if not disable
             else "@torch.compiler.disable(recursive = False)"
         )
@@ -1403,9 +1415,9 @@ pass
 
 _cross_entropy_code = """
 from torch.nn import CrossEntropyLoss
-from unsloth_zoo.temporary_patches.common import torch_compile as _unsloth_torch_compile
+__UNSLOTH_COMPILE_IMPORT__
 
-@_unsloth_torch_compile(fullgraph = True, dynamic = True)
+__UNSLOTH_COMPILE_DECORATOR__
 def normal_cross_entropy_loss(self, hidden_states, labels):
     logits = self.lm_head(hidden_states)
     logits = logits.float()
@@ -1460,6 +1472,13 @@ def mask_attention_mask_out(labels = None, attention_mask = None):
 pass
 
 """
+_cross_entropy_code = _cross_entropy_code.replace(
+    "__UNSLOTH_COMPILE_IMPORT__",
+    _generated_torch_compile_import(),
+).replace(
+    "__UNSLOTH_COMPILE_DECORATOR__",
+    _generated_torch_compile_decorator(fullgraph = True, dynamic = True),
+)
 
 __DYNAMO__RECOMPILING__ = """
 
@@ -4049,7 +4068,10 @@ def unsloth_compile_transformers(
                     + parameters
                 )
             elif not disable:
-                parameters = f"@_unsloth_torch_compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True)\n{parameters}"
+                parameters = (
+                    f"{_generated_torch_compile_decorator(fullgraph = UNSLOTH_FULLGRAPH, dynamic = True)}\n"
+                    f"{parameters}"
+                )
             all_standalone_classes[module] = parameters
         pass
 
@@ -4095,7 +4117,10 @@ def unsloth_compile_transformers(
                     if "@torch.compiler.disable(recursive = False)\n" not in source:
                         source = "@torch.compiler.disable(recursive = False)\n" + source
                 elif not disable:
-                    source = f"@_unsloth_torch_compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True)\n{source}"
+                    source = (
+                        f"{_generated_torch_compile_decorator(fullgraph = UNSLOTH_FULLGRAPH, dynamic = True)}\n"
+                        f"{source}"
+                    )
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(
