@@ -1,5 +1,6 @@
 import os
 import importlib
+import inspect
 import sys
 import unittest
 from unittest.mock import patch
@@ -12,6 +13,13 @@ class CompileBackendCommonTests(unittest.TestCase):
     def test_detect_compile_backend_prefers_explicit_env(self):
         with patch.dict(os.environ, {"UNSLOTH_TORCH_COMPILE_BACKEND": "aot_eager"}):
             self.assertEqual(compile_policy._detect_compile_backend(), "aot_eager")
+
+    def test_detect_compile_backend_normalizes_explicit_env(self):
+        with patch.dict(os.environ, {"UNSLOTH_TORCH_COMPILE_BACKEND": " AOT-EAGER "}):
+            self.assertEqual(compile_policy._detect_compile_backend(), "aot_eager")
+
+        with patch.dict(os.environ, {"UNSLOTH_TORCH_COMPILE_BACKEND": "INDUCTOR"}):
+            self.assertEqual(compile_policy._detect_compile_backend(), "inductor")
 
     def test_detect_compile_backend_uses_aot_eager_without_triton(self):
         with patch.dict(os.environ, {}, clear=True):
@@ -178,6 +186,15 @@ class CompileBackendCommonTests(unittest.TestCase):
         compile_policy.torch_compile_uses_direct_source()
 
         self.assertEqual(tuple(common.TEMPORARY_PATCHES), before)
+
+    def test_loss_patch_compile_helper_is_not_shadowed_by_bool_parameter(self):
+        import unsloth_zoo.loss_utils as loss_utils
+
+        source = inspect.getsource(loss_utils.patch_loss_functions)
+
+        self.assertIn("torch_compile = True", source)
+        self.assertIn("_module_torch_compile(", source)
+        self.assertNotIn("UnslothForCausalLMLoss = torch_compile(", source)
 
 
 if __name__ == "__main__":

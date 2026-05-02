@@ -2171,7 +2171,9 @@ def convert_attention_masks_to_bool(module, old_source):
     return new_source
 
 
-def patch_gpt_oss_dict_attention_mask(source):
+def patch_gpt_oss_dict_attention_mask(source, *, model_type = None):
+    if model_type != "gpt_oss":
+        return source
     if "attn_weights = attn_weights + attention_mask" not in source or "module" not in source:
         return source
     if "key_states" not in source:
@@ -4091,7 +4093,7 @@ def unsloth_compile_transformers(
             if sdpa_bool_masks:
                 source = convert_attention_masks_to_bool(module, source)
 
-            source = patch_gpt_oss_dict_attention_mask(source)
+            source = patch_gpt_oss_dict_attention_mask(source, model_type = model_type)
 
             # Check erroring out
             bad = False

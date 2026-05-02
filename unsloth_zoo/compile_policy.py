@@ -10,6 +10,7 @@ __all__ = [
     "UNSLOTH_COMPILE_BACKEND",
     "DIRECT_TORCH_COMPILE_SOURCE_BACKENDS",
     "_is_triton_importable",
+    "_normalize_compile_backend",
     "_detect_compile_backend",
     "torch_compile_uses_direct_source",
     "get_torch_compile_decorator_source",
@@ -28,8 +29,16 @@ def _is_triton_importable() -> bool:
     return True
 
 
+def _normalize_compile_backend(backend: str | None) -> str:
+    if backend is None:
+        return ""
+    return str(backend).strip().lower().replace("-", "_")
+
+
 def _detect_compile_backend() -> str:
-    explicit = os.environ.get("UNSLOTH_TORCH_COMPILE_BACKEND", "").strip()
+    explicit = _normalize_compile_backend(
+        os.environ.get("UNSLOTH_TORCH_COMPILE_BACKEND", "")
+    )
     if explicit:
         return explicit
     if _is_triton_importable():

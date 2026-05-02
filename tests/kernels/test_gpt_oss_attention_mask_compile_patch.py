@@ -21,7 +21,7 @@ class TestGptOssAttentionMaskCompilePatch(unittest.TestCase):
             """
         )
 
-        patched = patch_gpt_oss_dict_attention_mask(source)
+        patched = patch_gpt_oss_dict_attention_mask(source, model_type = "gpt_oss")
 
         self.assertIn("if isinstance(attention_mask, dict):", patched)
         self.assertIn(
@@ -45,7 +45,27 @@ class TestGptOssAttentionMaskCompilePatch(unittest.TestCase):
             """
         )
 
-        self.assertEqual(patch_gpt_oss_dict_attention_mask(source), source)
+        self.assertEqual(
+            patch_gpt_oss_dict_attention_mask(source, model_type = "gpt_oss"),
+            source,
+        )
+
+    def test_patch_is_scoped_to_gpt_oss(self):
+        source = textwrap.dedent(
+            """
+            def eager_attention_forward(module, query, key, value, attention_mask, scaling):
+                key_states = repeat_kv(key, module.num_key_value_groups)
+                attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+                if attention_mask is not None:
+                    attn_weights = attn_weights + attention_mask
+                return attn_weights
+            """
+        )
+
+        self.assertEqual(
+            patch_gpt_oss_dict_attention_mask(source, model_type = "biogpt"),
+            source,
+        )
 
 
 class TestGptOssTemporaryPatchSource(unittest.TestCase):

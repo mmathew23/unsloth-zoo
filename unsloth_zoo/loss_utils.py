@@ -26,7 +26,12 @@ try:
 except Exception:
     triton_version = "0.0.0"
 from . import DEVICE_TYPE
-from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, torch_compile, logger
+from .temporary_patches.common import (
+    UNSLOTH_ENABLE_LOGGING,
+    torch_compile_options,
+    torch_compile as _module_torch_compile,
+    logger,
+)
 import inspect
 
 global HAS_CUT_CROSS_ENTROPY
@@ -128,7 +133,7 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
         UnslothForCausalLMLoss = torch._disable_dynamo(UnslothForCausalLMLoss)
     
     elif torch_compile:
-        UnslothForCausalLMLoss = torch_compile(
+        UnslothForCausalLMLoss = _module_torch_compile(
             UnslothForCausalLMLoss,
             dynamic = True,
             fullgraph = False,
