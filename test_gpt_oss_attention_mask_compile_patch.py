@@ -56,6 +56,13 @@ class TestGptOssTemporaryPatchSource(unittest.TestCase):
         self.assertIn('getattr(getattr(decoder_layer, "self_attn", None), "layer_type", None)', source)
         self.assertIn("self.config.layer_types[i]", source)
 
+    def test_gpt_oss_flex_attention_patch_is_disabled_by_default(self):
+        source = (Path(__file__).parent / "unsloth_zoo/temporary_patches/gpt_oss.py").read_text()
+
+        self.assertIn("GPT-OSS Flex Attention patch is disabled", source)
+        self.assertIn('UNSLOTH_ENABLE_GPT_OSS_FLEX_ATTENTION", "0"', source)
+        self.assertIn("_print_gpt_oss_flex_attention_disabled_once()", source)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1863,14 +1863,30 @@ pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 
+_GPT_OSS_FLEX_ATTENTION_DISABLED_PRINTED = False
+
+
+def _print_gpt_oss_flex_attention_disabled_once() -> None:
+    global _GPT_OSS_FLEX_ATTENTION_DISABLED_PRINTED
+    if _GPT_OSS_FLEX_ATTENTION_DISABLED_PRINTED:
+        return
+    print(
+        "Unsloth: GPT-OSS Flex Attention patch is disabled; using stock attention for attention sinks."
+    )
+    _GPT_OSS_FLEX_ATTENTION_DISABLED_PRINTED = True
+
+
 def patch_GptOssAttention():
+    if "gpt_oss" not in _normalized_unsloth_model_name(): return
+    if os.environ.get("UNSLOTH_ENABLE_GPT_OSS_FLEX_ATTENTION", "0") != "1":
+        _print_gpt_oss_flex_attention_disabled_once()
+        return
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
     # Uncompiled flex_attention backward has a dtype bug in PyTorch
     # (sdpa_dense_backward: expected Float got BFloat16). The inplace eager
     # fallback also uses out= matmul which is incompatible with autograd.
     # Skip the patch and let stock transformers eager attention handle sinks.
     if UNSLOTH_COMPILE_DISABLE: return
-    if "gpt_oss" not in _normalized_unsloth_model_name(): return
     try:
         from ..flex_attention import (
             flex_attention_with_sink,
