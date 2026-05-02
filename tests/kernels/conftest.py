@@ -1,6 +1,4 @@
-import sys
 import warnings
-from pathlib import Path
 
 
 warnings.filterwarnings("error")
@@ -22,6 +20,22 @@ warnings.filterwarnings(
     category = FutureWarning,
     module = r"transformers\.utils\.hub",
 )
+warnings.filterwarnings(
+    "ignore",
+    message = r"Unsloth: Triton (?:could not be imported .*|is not installed\.) Triton-backed kernels are unavailable; use CuTile or other non-Triton backends\.",
+    category = UserWarning,
+    module = r"unsloth",
+)
+warnings.filterwarnings(
+    "ignore",
+    message = r"numpy\.core is deprecated and has been renamed to numpy\._core\..*",
+    category = DeprecationWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message = r"builtin type swigvarlink has no __module__ attribute",
+    category = DeprecationWarning,
+)
 
 
 def pytest_configure(config):
@@ -38,11 +52,18 @@ def pytest_configure(config):
         "filterwarnings",
         r"ignore:Using `TRANSFORMERS_CACHE` is deprecated and will be removed in v5 of Transformers\..*:FutureWarning:transformers\.utils\.hub",
     )
-
-WORKSPACE = Path(__file__).resolve().parents[3]
-UNSLOTH_ROOT = WORKSPACE / "unsloth"
-if str(UNSLOTH_ROOT) not in sys.path:
-    sys.path.insert(0, str(UNSLOTH_ROOT))
+    config.addinivalue_line(
+        "filterwarnings",
+        r"ignore:.*Triton.*Triton-backed kernels are unavailable.*CuTile.*:UserWarning:unsloth",
+    )
+    config.addinivalue_line(
+        "filterwarnings",
+        r"ignore:numpy\.core is deprecated and has been renamed to numpy\._core\..*:DeprecationWarning",
+    )
+    config.addinivalue_line(
+        "filterwarnings",
+        r"ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
+    )
 
 # Import Unsloth through its normal package entrypoint before importing
 # unsloth_zoo modules; unsloth_zoo intentionally rejects standalone imports.
