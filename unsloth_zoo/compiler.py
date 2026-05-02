@@ -39,6 +39,7 @@ import tempfile
 import sys
 import textwrap
 import tokenize
+import itertools
 from .utils import (
     Version,
     is_main_process,
@@ -87,6 +88,8 @@ if "UNSLOTH_COMPILE_LOCATION" not in globals():
 
 global UNSLOTH_COMPILE_USE_TEMP
 UNSLOTH_COMPILE_USE_TEMP = False
+
+_RUNTIME_MODULE_COUNTER = itertools.count()
 
 # Disable some compilations if old versions are seen
 OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
@@ -824,6 +827,8 @@ def create_new_function(
     append="",
     overwrite=True,
     add_torch_compile=False,
+    isolated_runtime_module=False,
+    bind_kernel_runtime_globals=False,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     old_new_source = new_source
@@ -1046,9 +1051,53 @@ def create_new_function(
     old_path = None
     new_module = None
 
+    def _load_runtime_module_instance(compile_folder, name, runtime_module_name = None):
+        file_location = os.path.join(compile_folder, name) + ".py"
+        runtime_module_name = runtime_module_name or (
+            f"unsloth_runtime_cache_{name}_{os.getpid()}_"
+            f"{next(_RUNTIME_MODULE_COUNTER)}"
+        )
+        lock = get_lock(file_location)
+        old_path = None
+        if compile_folder not in sys.path:
+            old_path = list(sys.path)
+            sys.path.insert(0, compile_folder)
+        try:
+            with lock:
+                spec = importlib.util.spec_from_file_location(
+                    runtime_module_name,
+                    file_location,
+                )
+                new_module = importlib.util.module_from_spec(spec)
+                sys.modules[runtime_module_name] = new_module
+                spec.loader.exec_module(new_module)
+                return new_module, old_path
+        except Exception:
+            sys.modules.pop(runtime_module_name, None)
+            raise
+
+    def _bind_kernel_globals(new_module):
+        if not bind_kernel_runtime_globals:
+            return
+        try:
+            from unsloth.kernels.runtime_bindings import (
+                bind_kernel_runtime_globals as _bind_kernel_runtime_globals,
+            )
+            _bind_kernel_runtime_globals(new_module)
+        except Exception as e:
+            if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
+                logger.error(
+                    f"Unsloth: Failed to bind kernel runtime globals for {name} "
+                    f"because {str(e)}"
+                )
+
     def import_module(compile_folder, name):
         target_name = os.path.join(compile_folder, f"{name}.py")
         lock = get_lock(target_name)
+        if isolated_runtime_module:
+            new_module, old_path = _load_runtime_module_instance(compile_folder, name)
+            _bind_kernel_globals(new_module)
+            return new_module, old_path
         # Add directory to sys.path temporarily if it's not already there
         if compile_folder not in sys.path:
             old_path = list(sys.path)
@@ -1060,6 +1109,7 @@ def create_new_function(
             with lock:
                 # Try standard import
                 new_module = importlib.import_module(name)
+                _bind_kernel_globals(new_module)
                 return new_module, old_path
         except Exception as e:
             if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
@@ -1097,16 +1147,14 @@ def create_new_function(
         # Fallback to direct module loading
         if new_module is None:
             try:
-                module_name = f"unsloth_cache_{name}"
-                file_location = os.path.join(compile_folder, name) + ".py"
-                lock = get_lock(file_location)
-                with lock:
-                    spec = importlib.util.spec_from_file_location(
-                        module_name, file_location
-                    )
-                    new_module = importlib.util.module_from_spec(spec)
-                    sys.modules[module_name] = new_module
-                    spec.loader.exec_module(new_module)
+                new_module, fallback_old_path = _load_runtime_module_instance(
+                    compile_folder,
+                    name,
+                    runtime_module_name = f"unsloth_cache_{name}",
+                )
+                if old_path is None:
+                    old_path = fallback_old_path
+                _bind_kernel_globals(new_module)
             except Exception as e:
                 raise RuntimeError(f"Direct module loading failed for {name}: {e}")
         pass
@@ -4168,6 +4216,8 @@ def unsloth_compile_transformers(
             + f"\ntorch_compile_options = {torch_compile_options}\n"
             + _cross_entropy_code
             + "\n",
+            isolated_runtime_module=True,
+            bind_kernel_runtime_globals=True,
         )
     except Exception as exception:
         if not disable:
