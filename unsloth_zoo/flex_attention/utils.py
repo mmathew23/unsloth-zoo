@@ -35,7 +35,8 @@ __all__ = [
 
 import torch
 import functools
-from ..temporary_patches.common import torch_compile, _torch_compile, UNSLOTH_COMPILE_BACKEND
+from ..compile_policy import UNSLOTH_COMPILE_BACKEND
+from ..temporary_patches.common import torch_compile, _torch_compile
 FLEX_ATTENTION_KV_INCREMENT = 512
 
 try:

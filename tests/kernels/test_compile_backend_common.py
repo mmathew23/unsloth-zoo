@@ -41,14 +41,10 @@ class CompileBackendCommonTests(unittest.TestCase):
             captured.update(kwargs)
             return fn if fn is not None else (lambda f: f)
 
-        previous_backend = common.UNSLOTH_COMPILE_BACKEND
-        try:
-            common.UNSLOTH_COMPILE_BACKEND = "inductor"
+        with patch.object(compile_policy, "UNSLOTH_COMPILE_BACKEND", "inductor"):
             with patch.object(common.torch, "compile", fake_compile):
                 decorator = common._make_torch_compile({"trace.enabled": False})
                 decorator(lambda x: x)
-        finally:
-            common.UNSLOTH_COMPILE_BACKEND = previous_backend
 
         self.assertNotIn("backend", captured)
         self.assertEqual(captured["options"], {"trace.enabled": False})
@@ -60,14 +56,10 @@ class CompileBackendCommonTests(unittest.TestCase):
             captured.update(kwargs)
             return fn if fn is not None else (lambda f: f)
 
-        previous_backend = common.UNSLOTH_COMPILE_BACKEND
-        try:
-            common.UNSLOTH_COMPILE_BACKEND = "aot_eager"
+        with patch.object(compile_policy, "UNSLOTH_COMPILE_BACKEND", "aot_eager"):
             with patch.object(common.torch, "compile", fake_compile):
                 decorator = common._make_torch_compile({"trace.enabled": False})
                 decorator(lambda x: x, mode = "max-autotune")
-        finally:
-            common.UNSLOTH_COMPILE_BACKEND = previous_backend
 
         self.assertEqual(captured["backend"], "aot_eager")
         self.assertNotIn("options", captured)
@@ -80,19 +72,14 @@ class CompileBackendCommonTests(unittest.TestCase):
         def fn(x):
             return x
 
-        previous_backend = common.UNSLOTH_COMPILE_BACKEND
-        try:
-            common.UNSLOTH_COMPILE_BACKEND = "aot_eager"
+        with patch.object(compile_policy, "UNSLOTH_COMPILE_BACKEND", "aot_eager"):
             with patch.object(common.torch, "compile", boom_compile):
                 decorator = common._make_torch_compile({"trace.enabled": False})
                 compiled = decorator(dynamic = True)(fn)
-        finally:
-            common.UNSLOTH_COMPILE_BACKEND = previous_backend
 
         self.assertIs(compiled, fn)
 
     def test_flex_attention_reports_disabled_on_non_inductor_backend(self):
-        previous_backend = common.UNSLOTH_COMPILE_BACKEND
         module_names = [
             "unsloth_zoo.flex_attention",
             "unsloth_zoo.flex_attention.utils",
@@ -103,17 +90,16 @@ class CompileBackendCommonTests(unittest.TestCase):
             if name in sys.modules
         }
         try:
-            common.UNSLOTH_COMPILE_BACKEND = "aot_eager"
-            with patch("torch.cuda.device_count", return_value = 1):
-                with patch(
-                    "torch.cuda.memory.mem_get_info",
-                    return_value = (0, 16 * 1024 * 1024 * 1024),
-                ):
-                    flex_utils = importlib.import_module("unsloth_zoo.flex_attention.utils")
+            with patch.object(compile_policy, "UNSLOTH_COMPILE_BACKEND", "aot_eager"):
+                with patch("torch.cuda.device_count", return_value = 1):
+                    with patch(
+                        "torch.cuda.memory.mem_get_info",
+                        return_value = (0, 16 * 1024 * 1024 * 1024),
+                    ):
+                        flex_utils = importlib.import_module("unsloth_zoo.flex_attention.utils")
             self.assertFalse(flex_utils.HAS_FLEX_ATTENTION)
             self.assertIsNone(flex_utils.flex_attention)
         finally:
-            common.UNSLOTH_COMPILE_BACKEND = previous_backend
             for name in module_names:
                 sys.modules.pop(name, None)
             sys.modules.update(previous_modules)

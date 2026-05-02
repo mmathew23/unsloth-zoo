@@ -23,14 +23,7 @@ __all__ = [
     "logger",
     "torch_compile",
     "_torch_compile",
-    "UNSLOTH_COMPILE_BACKEND",
-    "_is_triton_importable",
-    "_detect_compile_backend",
     "_make_torch_compile",
-    "DIRECT_TORCH_COMPILE_SOURCE_BACKENDS",
-    "torch_compile_uses_direct_source",
-    "get_torch_compile_decorator_source",
-    "get_torch_compile_import_source",
 ]
 
 import os
@@ -38,15 +31,7 @@ import sys
 import logging
 from ..log import logger
 import functools
-from ..compile_policy import (
-    UNSLOTH_COMPILE_BACKEND,
-    DIRECT_TORCH_COMPILE_SOURCE_BACKENDS,
-    _is_triton_importable,
-    _detect_compile_backend,
-    torch_compile_uses_direct_source,
-    get_torch_compile_decorator_source,
-    get_torch_compile_import_source,
-)
+from .. import compile_policy
 UNSLOTH_ENABLE_LOGGING  = os.environ.get("UNSLOTH_ENABLE_LOGGING",  "0") == "1"
 UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1"
 
@@ -55,7 +40,7 @@ import inspect
 import torch
 
 
-if not _is_triton_importable():
+if not compile_policy._is_triton_importable():
     try:
         import torch.utils._triton as _torch_triton_utils
         _torch_triton_utils.has_triton_package = lambda: False
@@ -199,7 +184,7 @@ def _make_torch_compile(default_options):
             f"falling back to eager.", stacklevel=2)
 
     def _compile(fn=None, **kwargs):
-        backend = UNSLOTH_COMPILE_BACKEND
+        backend = compile_policy.UNSLOTH_COMPILE_BACKEND
         # When the resolved backend is the torch.compile default ("inductor"),
         # do NOT pass `backend=` explicitly. Match `functools.partial(
         # torch.compile, options=...)` byte-for-byte so torch's compile cache
@@ -234,7 +219,7 @@ def _make_torch_compile(default_options):
 if UNSLOTH_COMPILE_DISABLE:
     torch_compile = noop
     _torch_compile = noop
-elif UNSLOTH_COMPILE_BACKEND == "inductor":
+elif compile_policy.UNSLOTH_COMPILE_BACKEND == "inductor":
     # Match PyPI byte-for-byte when running on the default backend. The
     # `_make_torch_compile` wrapper produces an indistinguishable compiled
     # result on paper, but its `_compile` closure has different identity

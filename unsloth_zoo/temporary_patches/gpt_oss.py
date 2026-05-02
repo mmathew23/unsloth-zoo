@@ -28,8 +28,8 @@ from .common import (
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
     UNSLOTH_COMPILE_DISABLE,
-    UNSLOTH_COMPILE_BACKEND,
 )
+from ..compile_policy import UNSLOTH_COMPILE_BACKEND
 from importlib.metadata import version as importlib_version
 from ..utils import Version
 transformers_version = Version(importlib_version("transformers"))
