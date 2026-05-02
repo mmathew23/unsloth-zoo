@@ -56,6 +56,30 @@ class CompileBackendCommonTests(unittest.TestCase):
         self.assertNotIn("options", captured)
         self.assertNotIn("mode", captured)
 
+    def test_fused_lm_head_patch_allows_missing_triton_on_aot_eager(self):
+        from unsloth_zoo import compiler
+
+        with patch.multiple(
+            compiler,
+            OLD_CUDA_ARCH_VERSION = False,
+            OLD_TORCH_VERSION = False,
+            OLD_TRITON_VERSION = True,
+            UNSLOTH_COMPILE_BACKEND = "aot_eager",
+        ):
+            self.assertFalse(compiler.should_skip_fused_lm_head_patch())
+
+    def test_fused_lm_head_patch_skips_missing_triton_on_inductor(self):
+        from unsloth_zoo import compiler
+
+        with patch.multiple(
+            compiler,
+            OLD_CUDA_ARCH_VERSION = False,
+            OLD_TORCH_VERSION = False,
+            OLD_TRITON_VERSION = True,
+            UNSLOTH_COMPILE_BACKEND = "inductor",
+        ):
+            self.assertTrue(compiler.should_skip_fused_lm_head_patch())
+
 
 if __name__ == "__main__":
     unittest.main()

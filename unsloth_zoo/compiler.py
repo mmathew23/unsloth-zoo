@@ -97,6 +97,19 @@ pass
 
 OLD_TRITON_VERSION = triton is None or Version(triton.__version__) < Version("3.0.0")
 
+def should_skip_fused_lm_head_patch():
+    # NVIDIA_REVIEW: Missing Triton only blocks the fused LM-head patch when
+    # torch.compile is using inductor. Cutile-only installs intentionally route
+    # generated cache code through aot_eager, so they should still get this
+    # compiler-disabled fused CE forward instead of silently falling back to the
+    # slower higher-VRAM Transformers loss path.
+    return (
+        OLD_CUDA_ARCH_VERSION or
+        OLD_TORCH_VERSION or
+        (OLD_TRITON_VERSION and UNSLOTH_COMPILE_BACKEND == "inductor")
+    )
+pass
+
 # Check if Unsloth Studio is allowed
 import importlib.util
 
@@ -3727,8 +3740,9 @@ def unsloth_compile_transformers(
         modules = dir(modeling_file)
 
         for module in modules:
-            # Disable if torch < 2.5 or V100s 7.0 (Tesla T4 7.5 works) or old Triton < 3
-            if OLD_CUDA_ARCH_VERSION or OLD_TORCH_VERSION or OLD_TRITON_VERSION:
+            # Disable if torch < 2.5, V100s 7.0 (Tesla T4 7.5 works), or if
+            # inductor would need unavailable/old Triton support.
+            if should_skip_fused_lm_head_patch():
                 continue
 
             module_class = getattr(modeling_file, module)
