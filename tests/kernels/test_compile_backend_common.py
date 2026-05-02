@@ -4,8 +4,6 @@ import sys
 import unittest
 from unittest.mock import patch
 
-os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
-
 from unsloth_zoo.temporary_patches import common
 
 

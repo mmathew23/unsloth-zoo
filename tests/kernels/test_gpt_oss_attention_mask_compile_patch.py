@@ -1,11 +1,11 @@
 import textwrap
 import unittest
-import os
 from pathlib import Path
 
-os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
-
 from unsloth_zoo.compiler import patch_gpt_oss_dict_attention_mask
+
+
+ROOT = Path(__file__).resolve().parents[2]
 
 
 class TestGptOssAttentionMaskCompilePatch(unittest.TestCase):
@@ -50,14 +50,14 @@ class TestGptOssAttentionMaskCompilePatch(unittest.TestCase):
 
 class TestGptOssTemporaryPatchSource(unittest.TestCase):
     def test_model_forward_selects_attention_mask_by_layer_type(self):
-        source = (Path(__file__).parent / "unsloth_zoo/temporary_patches/gpt_oss.py").read_text()
+        source = (ROOT / "unsloth_zoo/temporary_patches/gpt_oss.py").read_text()
 
         self.assertNotIn('getattr(decoder_layer, "attention_type", None)', source)
         self.assertIn('getattr(getattr(decoder_layer, "self_attn", None), "layer_type", None)', source)
         self.assertIn("self.config.layer_types[i]", source)
 
     def test_gpt_oss_flex_attention_patch_is_disabled_only_off_inductor_by_default(self):
-        source = (Path(__file__).parent / "unsloth_zoo/temporary_patches/gpt_oss.py").read_text()
+        source = (ROOT / "unsloth_zoo/temporary_patches/gpt_oss.py").read_text()
 
         self.assertIn("GPT-OSS Flex Attention patch is disabled", source)
         self.assertIn('return UNSLOTH_COMPILE_BACKEND == "inductor"', source)
