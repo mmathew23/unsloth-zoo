@@ -17,6 +17,17 @@ class CompileBackendCommonTests(unittest.TestCase):
             with patch("importlib.util.find_spec", return_value = None):
                 self.assertEqual(common._detect_compile_backend(), "aot_eager")
 
+    def test_kernel_backend_triton_does_not_disable_inductor_compile(self):
+        with patch.dict(
+            os.environ,
+            {
+                "UNSLOTH_KERNEL_BACKEND": "triton",
+            },
+            clear = True,
+        ):
+            with patch("importlib.util.find_spec", return_value = object()):
+                self.assertEqual(common._detect_compile_backend(), "inductor")
+
     def test_make_torch_compile_keeps_inductor_call_shape_default(self):
         captured = {}
 
