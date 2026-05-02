@@ -1051,6 +1051,12 @@ def create_new_function(
     old_path = None
     new_module = None
 
+    def _exec_source_module(new_module, file_location):
+        with open(file_location, "rb") as f:
+            source = f.read()
+        code = compile(source, file_location, "exec")
+        exec(code, new_module.__dict__)
+
     def _load_runtime_module_instance(compile_folder, name, runtime_module_name = None):
         file_location = os.path.join(compile_folder, name) + ".py"
         runtime_module_name = runtime_module_name or (
@@ -1070,7 +1076,10 @@ def create_new_function(
                 )
                 new_module = importlib.util.module_from_spec(spec)
                 sys.modules[runtime_module_name] = new_module
-                spec.loader.exec_module(new_module)
+                try:
+                    _exec_source_module(new_module, file_location)
+                finally:
+                    sys.modules.pop(runtime_module_name, None)
                 return new_module, old_path
         except Exception:
             sys.modules.pop(runtime_module_name, None)
@@ -1094,6 +1103,7 @@ def create_new_function(
     def import_module(compile_folder, name):
         target_name = os.path.join(compile_folder, f"{name}.py")
         lock = get_lock(target_name)
+        old_path = None
         if isolated_runtime_module:
             new_module, old_path = _load_runtime_module_instance(compile_folder, name)
             _bind_kernel_globals(new_module)
@@ -1107,8 +1117,22 @@ def create_new_function(
             sys.path.insert(0, compile_folder)
         try:
             with lock:
-                # Try standard import
-                new_module = importlib.import_module(name)
+                importlib.invalidate_caches()
+                existing_module = sys.modules.get(name)
+                if existing_module is not None and overwrite:
+                    spec = importlib.util.spec_from_file_location(name, target_name)
+                    new_module = importlib.util.module_from_spec(spec)
+                    sys.modules[name] = new_module
+                    try:
+                        _exec_source_module(new_module, target_name)
+                    except Exception:
+                        sys.modules[name] = existing_module
+                        raise
+                elif existing_module is not None:
+                    new_module = existing_module
+                else:
+                    # Try standard import
+                    new_module = importlib.import_module(name)
                 _bind_kernel_globals(new_module)
                 return new_module, old_path
         except Exception as e:
