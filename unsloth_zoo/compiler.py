@@ -57,7 +57,15 @@ from importlib.metadata import version as importlib_version
 import functools
 from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
-from .temporary_patches.common import get_torch_compile_options, torch_compile as _unsloth_torch_compile, UNSLOTH_COMPILE_BACKEND
+from .temporary_patches.common import (
+    get_torch_compile_options,
+    torch_compile as _unsloth_torch_compile,
+)
+from .compile_policy import (
+    UNSLOTH_COMPILE_BACKEND,
+    get_torch_compile_decorator_source,
+    get_torch_compile_import_source,
+)
 from .hf_utils import get_transformers_model_type
 
 try:
@@ -108,21 +116,6 @@ def should_skip_fused_lm_head_patch():
         OLD_TORCH_VERSION or
         (OLD_TRITON_VERSION and UNSLOTH_COMPILE_BACKEND == "inductor")
     )
-pass
-
-def _generated_torch_compile_decorator(fullgraph = True, dynamic = True):
-    if UNSLOTH_COMPILE_BACKEND == "inductor":
-        return (
-            f"@torch.compile(fullgraph = {fullgraph}, dynamic = {dynamic}, "
-            "options = torch_compile_options)"
-        )
-    return f"@_unsloth_torch_compile(fullgraph = {fullgraph}, dynamic = {dynamic})"
-pass
-
-def _generated_torch_compile_import():
-    if UNSLOTH_COMPILE_BACKEND == "inductor":
-        return ""
-    return "from unsloth_zoo.temporary_patches.common import torch_compile as _unsloth_torch_compile\n"
 pass
 
 # Check if Unsloth Studio is allowed
@@ -846,7 +839,7 @@ def create_new_function(
     pass
 
     if add_torch_compile:
-        new_source = f"{_generated_torch_compile_decorator(fullgraph = True, dynamic = True)}\n{new_source}"
+        new_source = f"{get_torch_compile_decorator_source(fullgraph = True, dynamic = True)}\n{new_source}"
     pass
 
     # Fix invalid signatures like: def fn(..., kwargs, **kwargs): -> rename param + alias
@@ -1280,7 +1273,7 @@ def create_standalone_class(
 
     if disable is not None:
         compile = (
-            _generated_torch_compile_decorator(fullgraph = fullgraph, dynamic = True)
+            get_torch_compile_decorator_source(fullgraph = fullgraph, dynamic = True)
             if not disable
             else "@torch.compiler.disable(recursive = False)"
         )
@@ -1474,10 +1467,10 @@ pass
 """
 _cross_entropy_code = _cross_entropy_code.replace(
     "__UNSLOTH_COMPILE_IMPORT__",
-    _generated_torch_compile_import(),
+    get_torch_compile_import_source(),
 ).replace(
     "__UNSLOTH_COMPILE_DECORATOR__",
-    _generated_torch_compile_decorator(fullgraph = True, dynamic = True),
+    get_torch_compile_decorator_source(fullgraph = True, dynamic = True),
 )
 
 __DYNAMO__RECOMPILING__ = """
@@ -4069,7 +4062,7 @@ def unsloth_compile_transformers(
                 )
             elif not disable:
                 parameters = (
-                    f"{_generated_torch_compile_decorator(fullgraph = UNSLOTH_FULLGRAPH, dynamic = True)}\n"
+                    f"{get_torch_compile_decorator_source(fullgraph = UNSLOTH_FULLGRAPH, dynamic = True)}\n"
                     f"{parameters}"
                 )
             all_standalone_classes[module] = parameters
@@ -4118,7 +4111,7 @@ def unsloth_compile_transformers(
                         source = "@torch.compiler.disable(recursive = False)\n" + source
                 elif not disable:
                     source = (
-                        f"{_generated_torch_compile_decorator(fullgraph = UNSLOTH_FULLGRAPH, dynamic = True)}\n"
+                        f"{get_torch_compile_decorator_source(fullgraph = UNSLOTH_FULLGRAPH, dynamic = True)}\n"
                         f"{source}"
                     )
                 print(f"Unsloth: Compiled function {module}.")

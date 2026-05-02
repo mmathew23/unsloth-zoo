@@ -27,28 +27,32 @@ __all__ = [
     "_is_triton_importable",
     "_detect_compile_backend",
     "_make_torch_compile",
+    "DIRECT_TORCH_COMPILE_SOURCE_BACKENDS",
+    "torch_compile_uses_direct_source",
+    "get_torch_compile_decorator_source",
+    "get_torch_compile_import_source",
 ]
 
 import os
 import sys
 import logging
-import importlib
 from ..log import logger
 import functools
+from ..compile_policy import (
+    UNSLOTH_COMPILE_BACKEND,
+    DIRECT_TORCH_COMPILE_SOURCE_BACKENDS,
+    _is_triton_importable,
+    _detect_compile_backend,
+    torch_compile_uses_direct_source,
+    get_torch_compile_decorator_source,
+    get_torch_compile_import_source,
+)
 UNSLOTH_ENABLE_LOGGING  = os.environ.get("UNSLOTH_ENABLE_LOGGING",  "0") == "1"
 UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1"
 
 # Get only allowed options
 import inspect
 import torch
-
-
-def _is_triton_importable() -> bool:
-    try:
-        importlib.import_module("triton")
-    except Exception:
-        return False
-    return True
 
 
 if not _is_triton_importable():
@@ -186,16 +190,6 @@ def noop(*args: Any, **kwargs: Any):
         return torch.compiler.disable(func)
     return _decorator
 pass
-
-def _detect_compile_backend() -> str:
-    explicit = os.environ.get("UNSLOTH_TORCH_COMPILE_BACKEND", "").strip()
-    if explicit:
-        return explicit
-    if _is_triton_importable():
-        return "inductor"
-    return "aot_eager"
-
-UNSLOTH_COMPILE_BACKEND: str = _detect_compile_backend()
 
 def _make_torch_compile(default_options):
     def _warn_compile_fallback(backend, exc):

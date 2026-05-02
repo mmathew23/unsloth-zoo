@@ -4,23 +4,24 @@ import sys
 import unittest
 from unittest.mock import patch
 
+import unsloth_zoo.compile_policy as compile_policy
 from unsloth_zoo.temporary_patches import common
 
 
 class CompileBackendCommonTests(unittest.TestCase):
     def test_detect_compile_backend_prefers_explicit_env(self):
         with patch.dict(os.environ, {"UNSLOTH_TORCH_COMPILE_BACKEND": "aot_eager"}):
-            self.assertEqual(common._detect_compile_backend(), "aot_eager")
+            self.assertEqual(compile_policy._detect_compile_backend(), "aot_eager")
 
     def test_detect_compile_backend_uses_aot_eager_without_triton(self):
         with patch.dict(os.environ, {}, clear=True):
-            with patch.object(common, "_is_triton_importable", return_value = False):
-                self.assertEqual(common._detect_compile_backend(), "aot_eager")
+            with patch.object(compile_policy, "_is_triton_importable", return_value = False):
+                self.assertEqual(compile_policy._detect_compile_backend(), "aot_eager")
 
     def test_detect_compile_backend_uses_aot_eager_when_triton_import_fails(self):
         with patch.dict(os.environ, {}, clear=True):
             with patch("importlib.import_module", side_effect = OSError("broken triton")):
-                self.assertEqual(common._detect_compile_backend(), "aot_eager")
+                self.assertEqual(compile_policy._detect_compile_backend(), "aot_eager")
 
     def test_kernel_backend_triton_does_not_disable_inductor_compile(self):
         with patch.dict(
@@ -30,8 +31,8 @@ class CompileBackendCommonTests(unittest.TestCase):
             },
             clear = True,
         ):
-            with patch.object(common, "_is_triton_importable", return_value = True):
-                self.assertEqual(common._detect_compile_backend(), "inductor")
+            with patch.object(compile_policy, "_is_triton_importable", return_value = True):
+                self.assertEqual(compile_policy._detect_compile_backend(), "inductor")
 
     def test_make_torch_compile_keeps_inductor_call_shape_default(self):
         captured = {}
@@ -142,14 +143,12 @@ class CompileBackendCommonTests(unittest.TestCase):
             self.assertTrue(compiler.should_skip_fused_lm_head_patch())
 
     def test_generated_cache_uses_direct_torch_compile_on_inductor(self):
-        from unsloth_zoo import compiler
-
-        with patch.object(compiler, "UNSLOTH_COMPILE_BACKEND", "inductor"):
-            decorator = compiler._generated_torch_compile_decorator(
+        with patch.object(compile_policy, "UNSLOTH_COMPILE_BACKEND", "inductor"):
+            decorator = compile_policy.get_torch_compile_decorator_source(
                 fullgraph = True,
                 dynamic = True,
             )
-            compile_import = compiler._generated_torch_compile_import()
+            compile_import = compile_policy.get_torch_compile_import_source()
 
         self.assertEqual(
             decorator,
@@ -158,20 +157,41 @@ class CompileBackendCommonTests(unittest.TestCase):
         self.assertEqual(compile_import, "")
 
     def test_generated_cache_uses_wrapper_on_non_inductor(self):
-        from unsloth_zoo import compiler
-
-        with patch.object(compiler, "UNSLOTH_COMPILE_BACKEND", "aot_eager"):
-            decorator = compiler._generated_torch_compile_decorator(
+        with patch.object(compile_policy, "UNSLOTH_COMPILE_BACKEND", "aot_eager"):
+            decorator = compile_policy.get_torch_compile_decorator_source(
                 fullgraph = False,
                 dynamic = True,
             )
-            compile_import = compiler._generated_torch_compile_import()
+            compile_import = compile_policy.get_torch_compile_import_source()
 
         self.assertEqual(
             decorator,
             "@_unsloth_torch_compile(fullgraph = False, dynamic = True)",
         )
         self.assertIn("torch_compile as _unsloth_torch_compile", compile_import)
+
+    def test_generated_cache_policy_can_target_explicit_backend(self):
+        with patch.object(compile_policy, "UNSLOTH_COMPILE_BACKEND", "inductor"):
+            decorator = compile_policy.get_torch_compile_decorator_source(
+                fullgraph = True,
+                dynamic = None,
+                backend = "aot_eager",
+                wrapper_name = "_compile_for_decode",
+            )
+
+        self.assertEqual(
+            decorator,
+            "@_compile_for_decode(fullgraph = True, dynamic = None)",
+        )
+
+    def test_generated_cache_policy_does_not_mutate_temporary_patch_registry(self):
+        before = tuple(common.TEMPORARY_PATCHES)
+
+        compile_policy.get_torch_compile_decorator_source()
+        compile_policy.get_torch_compile_import_source()
+        compile_policy.torch_compile_uses_direct_source()
+
+        self.assertEqual(tuple(common.TEMPORARY_PATCHES), before)
 
 
 if __name__ == "__main__":
