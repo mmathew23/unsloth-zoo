@@ -1,12 +1,45 @@
 import os
 import importlib
 import inspect
+import re
 import sys
 import unittest
+import warnings
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import unsloth_zoo.compile_policy as compile_policy
 from unsloth_zoo.temporary_patches import common
+
+
+@contextmanager
+def _expect_single_warning(testcase, category, pattern):
+    compiled = re.compile(pattern)
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        yield
+
+    matches = [
+        warning
+        for warning in caught
+        if issubclass(warning.category, category) and compiled.search(str(warning.message))
+    ]
+    unexpected = [
+        warning
+        for warning in caught
+        if warning not in matches
+    ]
+    testcase.assertEqual(
+        len(matches),
+        1,
+        f"Expected exactly one {category.__name__} matching {pattern!r}; "
+        f"captured {[str(w.message) for w in caught]}",
+    )
+    testcase.assertEqual(
+        unexpected,
+        [],
+        f"Unexpected warnings captured: {[str(w.message) for w in unexpected]}",
+    )
 
 
 class CompileBackendCommonTests(unittest.TestCase):
@@ -83,7 +116,12 @@ class CompileBackendCommonTests(unittest.TestCase):
         with patch.object(compile_policy, "UNSLOTH_COMPILE_BACKEND", "aot_eager"):
             with patch.object(common.torch, "compile", boom_compile):
                 decorator = common._make_torch_compile({"trace.enabled": False})
-                compiled = decorator(dynamic = True)(fn)
+                with _expect_single_warning(
+                    self,
+                    UserWarning,
+                    r"torch\.compile backend 'aot_eager' failed .* falling back to eager",
+                ):
+                    compiled = decorator(dynamic = True)(fn)
 
         self.assertIs(compiled, fn)
 
@@ -104,7 +142,12 @@ class CompileBackendCommonTests(unittest.TestCase):
                         "torch.cuda.memory.mem_get_info",
                         return_value = (0, 16 * 1024 * 1024 * 1024),
                     ):
-                        flex_utils = importlib.import_module("unsloth_zoo.flex_attention.utils")
+                        with _expect_single_warning(
+                            self,
+                            UserWarning,
+                            r"flex_attention disabled: requires inductor .* Falling back to SDPA",
+                        ):
+                            flex_utils = importlib.import_module("unsloth_zoo.flex_attention.utils")
             self.assertFalse(flex_utils.HAS_FLEX_ATTENTION)
             self.assertIsNone(flex_utils.flex_attention)
         finally:
