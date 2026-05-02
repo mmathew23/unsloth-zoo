@@ -23,7 +23,7 @@ from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
 try:
     from triton import __version__ as triton_version
-except ModuleNotFoundError:
+except Exception:
     triton_version = "0.0.0"
 from . import DEVICE_TYPE
 from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, torch_compile, logger

@@ -24,6 +24,7 @@ __all__ = [
     "torch_compile",
     "_torch_compile",
     "UNSLOTH_COMPILE_BACKEND",
+    "_is_triton_importable",
     "_detect_compile_backend",
     "_make_torch_compile",
 ]
@@ -31,7 +32,7 @@ __all__ = [
 import os
 import sys
 import logging
-import importlib.util
+import importlib
 from ..log import logger
 import functools
 UNSLOTH_ENABLE_LOGGING  = os.environ.get("UNSLOTH_ENABLE_LOGGING",  "0") == "1"
@@ -162,11 +163,19 @@ def noop(*args: Any, **kwargs: Any):
     return _decorator
 pass
 
+def _is_triton_importable() -> bool:
+    try:
+        importlib.import_module("triton")
+    except Exception:
+        return False
+    return True
+
+
 def _detect_compile_backend() -> str:
     explicit = os.environ.get("UNSLOTH_TORCH_COMPILE_BACKEND", "").strip()
     if explicit:
         return explicit
-    if importlib.util.find_spec("triton") is not None:
+    if _is_triton_importable():
         return "inductor"
     return "aot_eager"
 

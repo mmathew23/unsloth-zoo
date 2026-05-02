@@ -14,7 +14,12 @@ class CompileBackendCommonTests(unittest.TestCase):
 
     def test_detect_compile_backend_uses_aot_eager_without_triton(self):
         with patch.dict(os.environ, {}, clear=True):
-            with patch("importlib.util.find_spec", return_value = None):
+            with patch.object(common, "_is_triton_importable", return_value = False):
+                self.assertEqual(common._detect_compile_backend(), "aot_eager")
+
+    def test_detect_compile_backend_uses_aot_eager_when_triton_import_fails(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("importlib.import_module", side_effect = OSError("broken triton")):
                 self.assertEqual(common._detect_compile_backend(), "aot_eager")
 
     def test_kernel_backend_triton_does_not_disable_inductor_compile(self):
@@ -25,7 +30,7 @@ class CompileBackendCommonTests(unittest.TestCase):
             },
             clear = True,
         ):
-            with patch("importlib.util.find_spec", return_value = object()):
+            with patch.object(common, "_is_triton_importable", return_value = True):
                 self.assertEqual(common._detect_compile_backend(), "inductor")
 
     def test_make_torch_compile_keeps_inductor_call_shape_default(self):

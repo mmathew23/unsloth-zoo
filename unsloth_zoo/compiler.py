@@ -49,7 +49,7 @@ from .utils import (
 from .log import logger
 try:
     import triton
-except ModuleNotFoundError:
+except Exception:
     triton = None
 import regex
 from .peft_utils import get_lora_layer_modules
@@ -964,16 +964,19 @@ def create_new_function(
                     overwrite = True
     pass
     if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
-        # Even with OVERWRITE disabled, force recompile on transformers version mismatch
+        # Even with OVERWRITE disabled, force recompile on version/backend mismatch.
         if file_source is not None and "__UNSLOTH_VERSIONING__" in file_source:
             cached_versions = file_source[:file_source.find("__UNSLOTH_VERSIONING__")]
             cached_lines = [l.strip() for l in cached_versions.strip().strip('"').split("\n") if l.strip()]
-            # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version]
+            # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version, compile_backend]
             cached_tf_version = cached_lines[2] if len(cached_lines) > 2 else "0"
-            if cached_tf_version != transformers_version:
+            cached_compile_backend = cached_lines[4] if len(cached_lines) > 4 else "inductor"
+            if cached_tf_version != transformers_version or cached_compile_backend != UNSLOTH_COMPILE_BACKEND:
                 logger.warning_once(
-                    f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but transformers version changed "
-                    f"({cached_tf_version} -> {transformers_version}). Forcing recompile of {name}."
+                    f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but compile cache metadata changed "
+                    f"(transformers {cached_tf_version} -> {transformers_version}, "
+                    f"backend {cached_compile_backend} -> {UNSLOTH_COMPILE_BACKEND}). "
+                    f"Forcing recompile of {name}."
                 )
                 # Don't set overwrite = False; keep overwrite = True from version mismatch detection
             else:
