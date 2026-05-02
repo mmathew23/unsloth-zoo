@@ -28,6 +28,7 @@ from .common import (
     get_torch_compile_options,
     UNSLOTH_ENABLE_LOGGING,
     UNSLOTH_COMPILE_DISABLE,
+    UNSLOTH_COMPILE_BACKEND,
 )
 from importlib.metadata import version as importlib_version
 from ..utils import Version
@@ -1866,6 +1867,13 @@ TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 _GPT_OSS_FLEX_ATTENTION_DISABLED_PRINTED = False
 
 
+def _gpt_oss_flex_attention_patch_enabled() -> bool:
+    explicit = os.environ.get("UNSLOTH_ENABLE_GPT_OSS_FLEX_ATTENTION", "").strip()
+    if explicit:
+        return explicit in ("1", "true", "True", "yes", "on")
+    return UNSLOTH_COMPILE_BACKEND == "inductor"
+
+
 def _print_gpt_oss_flex_attention_disabled_once() -> None:
     global _GPT_OSS_FLEX_ATTENTION_DISABLED_PRINTED
     if _GPT_OSS_FLEX_ATTENTION_DISABLED_PRINTED:
@@ -1878,7 +1886,7 @@ def _print_gpt_oss_flex_attention_disabled_once() -> None:
 
 def patch_GptOssAttention():
     if "gpt_oss" not in _normalized_unsloth_model_name(): return
-    if os.environ.get("UNSLOTH_ENABLE_GPT_OSS_FLEX_ATTENTION", "0") != "1":
+    if not _gpt_oss_flex_attention_patch_enabled():
         _print_gpt_oss_flex_attention_disabled_once()
         return
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
@@ -2456,7 +2464,7 @@ def patch_GptOssModel():
             # BlockMask and ignores the attention_mask argument entirely.
             # Skip dense 4D mask creation to avoid O(seq_len^2) memory allocation
             # which causes OOM at long context lengths (e.g. 500K tokens).
-            if self.training:
+            if self.training and _gpt_oss_flex_attention_patch_enabled():
                 attention_mask = None
 
             # Accumulate hidden states if requested
