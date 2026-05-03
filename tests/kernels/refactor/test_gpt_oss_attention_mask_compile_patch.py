@@ -5,7 +5,7 @@ from pathlib import Path
 from unsloth_zoo.compiler import patch_gpt_oss_dict_attention_mask
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 
 
 class TestGptOssAttentionMaskCompilePatch(unittest.TestCase):
