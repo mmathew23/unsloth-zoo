@@ -51,8 +51,29 @@ DIRECT_TORCH_COMPILE_SOURCE_BACKENDS = frozenset({"inductor"})
 
 
 def torch_compile_uses_direct_source(backend = None) -> bool:
-    backend = UNSLOTH_COMPILE_BACKEND if backend is None else backend
+    backend = _normalize_compile_backend(
+        UNSLOTH_COMPILE_BACKEND if backend is None else backend
+    )
     return backend in DIRECT_TORCH_COMPILE_SOURCE_BACKENDS
+
+
+def _resolve_source_backend(backend = None) -> str:
+    global_backend = _normalize_compile_backend(UNSLOTH_COMPILE_BACKEND)
+    backend = _normalize_compile_backend(
+        global_backend if backend is None else backend
+    )
+    if not backend:
+        backend = global_backend
+    if (
+        backend != global_backend
+        and backend not in DIRECT_TORCH_COMPILE_SOURCE_BACKENDS
+    ):
+        raise ValueError(
+            "Explicit non-Inductor backend source generation is unsupported "
+            "because the generated wrapper import is bound to the process-wide "
+            "compile policy."
+        )
+    return backend
 
 
 def get_torch_compile_decorator_source(
@@ -62,6 +83,7 @@ def get_torch_compile_decorator_source(
     options_name = "torch_compile_options",
     wrapper_name = "_unsloth_torch_compile",
 ) -> str:
+    backend = _resolve_source_backend(backend)
     if torch_compile_uses_direct_source(backend):
         return (
             f"@torch.compile(fullgraph = {fullgraph}, dynamic = {dynamic}, "
@@ -74,6 +96,7 @@ def get_torch_compile_import_source(
     backend = None,
     wrapper_name = "_unsloth_torch_compile",
 ) -> str:
+    backend = _resolve_source_backend(backend)
     if torch_compile_uses_direct_source(backend):
         return ""
     return (

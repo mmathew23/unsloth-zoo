@@ -958,10 +958,23 @@ def grpo_accumulated_loss(
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, -(logits_to_keep + max_left_pad + 1): , :]
                     new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
-                    # Some eager/generic model paths return logits even when
-                    # UNSLOTH_RETURN_HIDDEN_STATES=1. Avoid projecting vocab logits
-                    # through lm_head a second time.
-                    if new_hidden_states_chunk.shape[-1] == lm_head.shape[1]:
+                    # Some eager/generic paths ignore
+                    # UNSLOTH_RETURN_HIDDEN_STATES and return vocab logits.
+                    # Do not silently guess when hidden and vocab widths match.
+                    _logits_width = new_hidden_states_chunk.shape[-1]
+                    _hidden_width = lm_head.shape[1]
+                    _vocab_width = lm_head.shape[0]
+                    if (
+                        _logits_width == _hidden_width
+                        and _logits_width == _vocab_width
+                    ):
+                        raise RuntimeError(
+                            "Unsloth: cannot determine whether GRPO model output "
+                            "contains hidden states or logits because hidden_size == "
+                            "vocab_size. The model forward path must provide an "
+                            "explicit hidden-state/logits contract."
+                        )
+                    if _logits_width == _hidden_width:
                         logprobs_chunk = efficient_log_softmax(
                             new_hidden_states_chunk,
                             lm_head,
@@ -973,11 +986,16 @@ def grpo_accumulated_loss(
                             temperature=temperature,
                             batch_size = B
                         )
-                    else:
+                    elif _logits_width == _vocab_width:
                         logprobs_chunk = chunked_selective_log_softmax(
                             new_hidden_states_chunk,
                             completion_ids,
                             temperature=temperature,
+                        )
+                    else:
+                        raise RuntimeError(
+                            "Unsloth: model output width does not match either "
+                            "hidden_size or vocab_size in GRPO logprob path."
                         )
                 else:
                     new_hidden_states_chunk = unwrapped_model(
@@ -992,8 +1010,22 @@ def grpo_accumulated_loss(
                     ).logits
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
-                    # Guard: check if model returned hidden states or logits
-                    if new_hidden_states_chunk.shape[-1] == lm_head.shape[1]:
+                    # Guard: check if model returned hidden states or logits.
+                    # Do not silently guess when hidden and vocab widths match.
+                    _logits_width = new_hidden_states_chunk.shape[-1]
+                    _hidden_width = lm_head.shape[1]
+                    _vocab_width = lm_head.shape[0]
+                    if (
+                        _logits_width == _hidden_width
+                        and _logits_width == _vocab_width
+                    ):
+                        raise RuntimeError(
+                            "Unsloth: cannot determine whether GRPO model output "
+                            "contains hidden states or logits because hidden_size == "
+                            "vocab_size. The model forward path must provide an "
+                            "explicit hidden-state/logits contract."
+                        )
+                    if _logits_width == _hidden_width:
                         logprobs_chunk = efficient_log_softmax(
                             new_hidden_states_chunk,
                             lm_head,
@@ -1005,9 +1037,14 @@ def grpo_accumulated_loss(
                             temperature=temperature,
                             batch_size = B
                         )
-                    else:
+                    elif _logits_width == _vocab_width:
                         # Model returned logits directly - scaling/softcapping already applied by model forward
                         logprobs_chunk = chunked_selective_log_softmax(new_hidden_states_chunk, completion_ids, temperature)
+                    else:
+                        raise RuntimeError(
+                            "Unsloth: model output width does not match either "
+                            "hidden_size or vocab_size in GRPO logprob path."
+                        )
                 #This is needed to avoid race conditions with GPT OSS offload_embbed=True
                 #However, it seems that this line does not slow down or disrupt models.
                 device_synchronize()

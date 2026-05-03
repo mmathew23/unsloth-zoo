@@ -208,17 +208,38 @@ class CompileBackendCommonTests(unittest.TestCase):
         self.assertIn("torch_compile as _unsloth_torch_compile", compile_import)
 
     def test_generated_cache_policy_can_target_explicit_backend(self):
-        with patch.object(compile_policy, "UNSLOTH_COMPILE_BACKEND", "inductor"):
+        with patch.object(compile_policy, "UNSLOTH_COMPILE_BACKEND", "aot_eager"):
             decorator = compile_policy.get_torch_compile_decorator_source(
                 fullgraph = True,
                 dynamic = None,
-                backend = "aot_eager",
+                backend = " INDUCTOR ",
                 wrapper_name = "_compile_for_decode",
             )
 
         self.assertEqual(
             decorator,
-            "@_compile_for_decode(fullgraph = True, dynamic = None)",
+            "@torch.compile(fullgraph = True, dynamic = None, options = torch_compile_options)",
+        )
+
+    def test_generated_cache_policy_rejects_unsafe_explicit_wrapper_backend(self):
+        with patch.object(compile_policy, "UNSLOTH_COMPILE_BACKEND", "inductor"):
+            with self.assertRaises(ValueError):
+                compile_policy.get_torch_compile_decorator_source(
+                    backend = "aot-eager",
+                    wrapper_name = "_compile_for_decode",
+                )
+
+    def test_generated_cache_policy_normalizes_global_backend(self):
+        with patch.object(compile_policy, "UNSLOTH_COMPILE_BACKEND", " INDUCTOR "):
+            self.assertTrue(compile_policy.torch_compile_uses_direct_source())
+            decorator = compile_policy.get_torch_compile_decorator_source(
+                fullgraph = True,
+                dynamic = True,
+            )
+
+        self.assertEqual(
+            decorator,
+            "@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)",
         )
 
     def test_generated_cache_policy_does_not_mutate_temporary_patch_registry(self):
