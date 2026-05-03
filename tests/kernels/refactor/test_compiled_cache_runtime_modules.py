@@ -84,7 +84,7 @@ def generated_value():
         sys.modules.pop(name, None)
 
 
-def test_create_new_function_recompiles_cache_missing_backend_metadata(tmp_path, monkeypatch):
+def test_create_new_function_recompiles_cache_missing_schema_metadata(tmp_path, monkeypatch):
     monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(tmp_path))
     monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
     monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(tmp_path))
@@ -115,9 +115,56 @@ def generated_value():
             overwrite = False,
         )
         assert module.generated_value() == 2
-        assert compiler.UNSLOTH_COMPILE_BACKEND in cache_path.read_text(encoding = "utf-8")
+        assert compiler.UNSLOTH_COMPILE_CACHE_SCHEMA in cache_path.read_text(encoding = "utf-8")
     finally:
         sys.modules.pop(name, None)
+
+
+def test_create_new_function_keeps_same_cache_file_across_backend_switch(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_LOCATION", str(tmp_path))
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_USE_TEMP", False)
+    name = f"backend_neutral_cache_{uuid.uuid4().hex}"
+    source = """
+def generated_value():
+    return 1
+"""
+
+    monkeypatch.setenv("UNSLOTH_KERNEL_BACKEND", "triton")
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_BACKEND", "inductor")
+    first = compiler.create_new_function(
+        name,
+        source,
+        "math",
+        [],
+        add_torch_compile = True,
+        isolated_runtime_module = True,
+    )
+    cache_path = tmp_path / f"{name}.py"
+    first_source = cache_path.read_text(encoding = "utf-8")
+
+    monkeypatch.setenv("UNSLOTH_KERNEL_BACKEND", "cutile")
+    monkeypatch.setattr(compiler, "UNSLOTH_COMPILE_BACKEND", "aot_eager")
+    second = compiler.create_new_function(
+        name,
+        source,
+        "math",
+        [],
+        overwrite = False,
+        add_torch_compile = True,
+        isolated_runtime_module = True,
+    )
+    second_source = cache_path.read_text(encoding = "utf-8")
+
+    assert first is not second
+    assert first.__file__ == second.__file__
+    assert first_source == second_source
+    assert compiler.UNSLOTH_COMPILE_CACHE_SCHEMA in second_source
+    assert "\naot_eager\n__UNSLOTH_VERSIONING__" not in second_source
+    assert "\ninductor\n__UNSLOTH_VERSIONING__" not in second_source
+    assert "UNSLOTH_KERNEL_BACKEND" not in second_source
+    assert "@_unsloth_torch_compile(fullgraph = True, dynamic = True)" in second_source
 
 
 def test_create_new_function_fails_fast_on_runtime_binding_error(tmp_path, monkeypatch):

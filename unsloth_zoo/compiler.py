@@ -90,6 +90,7 @@ global UNSLOTH_COMPILE_USE_TEMP
 UNSLOTH_COMPILE_USE_TEMP = False
 
 _RUNTIME_MODULE_COUNTER = itertools.count()
+UNSLOTH_COMPILE_CACHE_SCHEMA = "backend_neutral_v1"
 
 
 class _KernelRuntimeBindingError(RuntimeError):
@@ -948,7 +949,7 @@ def create_new_function(
         f"{unsloth_version}\n"
         f"{transformers_version}\n"
         f"{trl_version}\n"
-        f"{UNSLOTH_COMPILE_BACKEND}\n__UNSLOTH_VERSIONING__\n" + '"""\n'
+        f"{UNSLOTH_COMPILE_CACHE_SCHEMA}\n__UNSLOTH_VERSIONING__\n" + '"""\n'
     )
 
     if _full_license_header not in new_source:
@@ -979,19 +980,22 @@ def create_new_function(
                     overwrite = True
     pass
     if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
-        # Even with OVERWRITE disabled, force recompile on version/backend mismatch.
+        # Even with OVERWRITE disabled, force recompile on cache ABI mismatch.
+        # The selected torch.compile backend is intentionally not part of this
+        # source metadata: backend choice belongs to the runtime module variant
+        # and compiled callable, while the generated disk source stays stable.
         if file_source is not None and "__UNSLOTH_VERSIONING__" in file_source:
             cached_versions = file_source[:file_source.find("__UNSLOTH_VERSIONING__")]
             cached_lines = [l.strip() for l in cached_versions.strip().strip('"').split("\n") if l.strip()]
-            # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version, compile_backend]
+            # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version, cache_schema]
             cached_tf_version = cached_lines[2] if len(cached_lines) > 2 else "0"
-            cached_compile_backend = cached_lines[4] if len(cached_lines) > 4 else None
-            if cached_tf_version != transformers_version or cached_compile_backend != UNSLOTH_COMPILE_BACKEND:
-                shown_cached_backend = cached_compile_backend or "<missing>"
+            cached_cache_schema = cached_lines[4] if len(cached_lines) > 4 else None
+            if cached_tf_version != transformers_version or cached_cache_schema != UNSLOTH_COMPILE_CACHE_SCHEMA:
+                shown_cached_schema = cached_cache_schema or "<missing>"
                 logger.warning_once(
                     f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but compile cache metadata changed "
                     f"(transformers {cached_tf_version} -> {transformers_version}, "
-                    f"backend {shown_cached_backend} -> {UNSLOTH_COMPILE_BACKEND}). "
+                    f"schema {shown_cached_schema} -> {UNSLOTH_COMPILE_CACHE_SCHEMA}). "
                     f"Forcing recompile of {name}."
                 )
                 # Don't set overwrite = False; keep overwrite = True from version mismatch detection
