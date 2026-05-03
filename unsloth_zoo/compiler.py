@@ -91,6 +91,11 @@ UNSLOTH_COMPILE_USE_TEMP = False
 
 _RUNTIME_MODULE_COUNTER = itertools.count()
 
+
+class _KernelRuntimeBindingError(RuntimeError):
+    pass
+
+
 # Disable some compilations if old versions are seen
 OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
 
@@ -980,12 +985,13 @@ def create_new_function(
             cached_lines = [l.strip() for l in cached_versions.strip().strip('"').split("\n") if l.strip()]
             # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version, compile_backend]
             cached_tf_version = cached_lines[2] if len(cached_lines) > 2 else "0"
-            cached_compile_backend = cached_lines[4] if len(cached_lines) > 4 else "inductor"
+            cached_compile_backend = cached_lines[4] if len(cached_lines) > 4 else None
             if cached_tf_version != transformers_version or cached_compile_backend != UNSLOTH_COMPILE_BACKEND:
+                shown_cached_backend = cached_compile_backend or "<missing>"
                 logger.warning_once(
                     f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but compile cache metadata changed "
                     f"(transformers {cached_tf_version} -> {transformers_version}, "
-                    f"backend {cached_compile_backend} -> {UNSLOTH_COMPILE_BACKEND}). "
+                    f"backend {shown_cached_backend} -> {UNSLOTH_COMPILE_BACKEND}). "
                     f"Forcing recompile of {name}."
                 )
                 # Don't set overwrite = False; keep overwrite = True from version mismatch detection
@@ -1094,11 +1100,9 @@ def create_new_function(
             )
             _bind_kernel_runtime_globals(new_module)
         except Exception as e:
-            if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
-                logger.error(
-                    f"Unsloth: Failed to bind kernel runtime globals for {name} "
-                    f"because {str(e)}"
-                )
+            raise _KernelRuntimeBindingError(
+                f"Unsloth: failed to bind kernel runtime globals for {name}."
+            ) from e
 
     def import_module(compile_folder, name):
         target_name = os.path.join(compile_folder, f"{name}.py")
@@ -1146,6 +1150,8 @@ def create_new_function(
 
     try:
         new_module, old_path = import_module(compile_folder, name)
+    except _KernelRuntimeBindingError:
+        raise
     except Exception as e:
         new_module = None
         # Try using temp directory instead!
@@ -1179,6 +1185,8 @@ def create_new_function(
                 if old_path is None:
                     old_path = fallback_old_path
                 _bind_kernel_globals(new_module)
+            except _KernelRuntimeBindingError:
+                raise
             except Exception as e:
                 raise RuntimeError(f"Direct module loading failed for {name}: {e}")
         pass

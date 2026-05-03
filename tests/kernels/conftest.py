@@ -66,12 +66,34 @@ def pytest_configure(config):
         r"ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
     )
 
+_UNSLOTH_IMPORT_ERROR = None
+
 # Import Unsloth through its normal package entrypoint before importing
 # unsloth_zoo modules; unsloth_zoo intentionally rejects standalone imports.
 try:
     import unsloth  # noqa: F401, E402
 except Exception as exc:
-    pytest.skip(
-        f"kernel test environment cannot import the full unsloth stack: {exc}",
-        allow_module_level = True,
-    )
+    _UNSLOTH_IMPORT_ERROR = exc
+
+
+def pytest_ignore_collect(collection_path, config):
+    if _UNSLOTH_IMPORT_ERROR is None:
+        return False
+    return collection_path.name.startswith("test_")
+
+
+def pytest_report_collectionfinish(config, start_path, items):
+    if _UNSLOTH_IMPORT_ERROR is None:
+        return []
+    return [
+        "kernel tests skipped: full unsloth stack could not be imported: "
+        f"{_UNSLOTH_IMPORT_ERROR}"
+    ]
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if (
+        _UNSLOTH_IMPORT_ERROR is not None
+        and exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED
+    ):
+        session.exitstatus = pytest.ExitCode.OK
