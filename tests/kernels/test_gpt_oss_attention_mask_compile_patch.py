@@ -81,14 +81,8 @@ class TestGptOssTemporaryPatchSource(unittest.TestCase):
 
         self.assertIn("GPT-OSS Flex Attention patch is disabled", source)
         self.assertIn('return UNSLOTH_COMPILE_BACKEND == "inductor"', source)
-        self.assertIn("def _gpt_oss_flex_attention_runtime_enabled()", source)
-        self.assertIn(
-            'os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") != "0"',
-            source,
-        )
-        self.assertIn("and not UNSLOTH_COMPILE_DISABLE", source)
         self.assertIn("_print_gpt_oss_flex_attention_disabled_once()", source)
-        self.assertIn("self.training and _gpt_oss_flex_attention_runtime_enabled()", source)
+        self.assertIn("self.training and _gpt_oss_flex_attention_patch_enabled()", source)
 
 
 if __name__ == "__main__":

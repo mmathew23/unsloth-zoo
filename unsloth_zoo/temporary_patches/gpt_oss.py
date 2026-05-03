@@ -1874,14 +1874,6 @@ def _gpt_oss_flex_attention_patch_enabled() -> bool:
     return UNSLOTH_COMPILE_BACKEND == "inductor"
 
 
-def _gpt_oss_flex_attention_runtime_enabled() -> bool:
-    return (
-        _gpt_oss_flex_attention_patch_enabled()
-        and os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") != "0"
-        and not UNSLOTH_COMPILE_DISABLE
-    )
-
-
 def _print_gpt_oss_flex_attention_disabled_once() -> None:
     global _GPT_OSS_FLEX_ATTENTION_DISABLED_PRINTED
     if _GPT_OSS_FLEX_ATTENTION_DISABLED_PRINTED:
@@ -1894,13 +1886,15 @@ def _print_gpt_oss_flex_attention_disabled_once() -> None:
 
 def patch_GptOssAttention():
     if "gpt_oss" not in _normalized_unsloth_model_name(): return
-    if not _gpt_oss_flex_attention_runtime_enabled():
+    if not _gpt_oss_flex_attention_patch_enabled():
         _print_gpt_oss_flex_attention_disabled_once()
         return
+    if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
     # Uncompiled flex_attention backward has a dtype bug in PyTorch
     # (sdpa_dense_backward: expected Float got BFloat16). The inplace eager
     # fallback also uses out= matmul which is incompatible with autograd.
     # Skip the patch and let stock transformers eager attention handle sinks.
+    if UNSLOTH_COMPILE_DISABLE: return
     try:
         from ..flex_attention import (
             flex_attention_with_sink,
@@ -2140,6 +2134,8 @@ TEMPORARY_PATCHES.append(patch_GptOssAttention)
 
 
 def patch_GptOssModel():
+    if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
+    if UNSLOTH_COMPILE_DISABLE: return
     if "gpt_oss" not in _normalized_unsloth_model_name(): return
     try:
         import transformers.models.gpt_oss.modeling_gpt_oss
@@ -2468,7 +2464,7 @@ def patch_GptOssModel():
             # BlockMask and ignores the attention_mask argument entirely.
             # Skip dense 4D mask creation to avoid O(seq_len^2) memory allocation
             # which causes OOM at long context lengths (e.g. 500K tokens).
-            if self.training and _gpt_oss_flex_attention_runtime_enabled():
+            if self.training and _gpt_oss_flex_attention_patch_enabled():
                 attention_mask = None
 
             # Accumulate hidden states if requested
