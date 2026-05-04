@@ -1,49 +1,24 @@
-"""
-Integrated-GPU loader patches for transformers >= 5.5.0.
+"""Integrated-GPU loader patches for unified-memory devices.
 
-On unified-memory devices (NVIDIA GB10 / Spark, where
-``torch.cuda.get_device_properties(0).is_integrated == 1``) the GPU memory
-pool IS the system RAM pool. transformers 5.5.0 restructured the model load
-path in two ways that are harmless on discrete GPUs but produce a ~2x peak
-memory spike (and an outright load-time error) on integrated GPUs:
+Wraps two transformers symbols when running on an integrated-memory GPU
+(``torch.cuda.get_device_properties(0).is_integrated == 1``, e.g. NVIDIA
+GB10 / Spark) and transformers >= ``_MIN_VERSION``:
 
-1. ``transformers.integrations.accelerate._get_device_map`` (5.5.0:339-375)
-   calls ``infer_auto_device_map`` BEFORE ``hf_quantizer.validate_environment``.
-   For ``device_map`` strings ("auto"/"sequential"/"balanced") on a unified-
-   memory device, ``infer_auto_device_map`` sees host RAM as a separate pool
-   and returns a dict mixing GPU indices with ``"cpu"``. The bnb-4bit
-   validator at ``transformers/quantizers/quantizer_bnb_4bit.py:74-81`` then
-   raises ``ValueError("Some modules are dispatched on the CPU or the disk...")``.
-   In 4.57.6 the bnb quantizer's own ``update_device_map(None) -> {"": 0}``
-   ran first; the order changed in 5.5.0.
+* ``transformers.integrations.accelerate._get_device_map`` -> coerce
+  string device_maps so ``infer_auto_device_map`` doesn't scatter modules
+  to ``"cpu"`` (which on unified memory is the same pool the GPUs see).
+* ``transformers.modeling_utils.PreTrainedModel._load_pretrained_model``
+  -> stream pre-quantized safetensors shards one at a time instead of
+  pre-allocating the full footprint and mmap'ing every shard upfront.
 
-2. ``transformers.modeling_utils.PreTrainedModel._load_pretrained_model``
-   (5.5.0:4174-4264) now calls ``caching_allocator_warmup`` to pre-allocate
-   the full model size up to ``total_device_memory - 1.2 GiB`` (4827) and then
-   opens ALL safetensors shards via ``safe_open(..., device="cpu")`` (4240),
-   accumulating slices in one ``merged_state_dict`` (4243) before processing
-   (4252). On unified memory, the pre-allocation eats the same RAM the mmap
-   needs, AND the all-files-open-at-once pattern keeps every shard's mmap
-   pages resident in process RSS until end-of-load (4262). Empirical peak on
-   the 122 GiB GB10 with bnb-4bit gpt-oss-120b: 113 GiB (vs 71 GiB on 4.57.6).
+On any other configuration the originals run unchanged.
+``apply_integrated_gpu_loader_patches()`` is idempotent.
 
-This module monkey-patches both functions with routed wrappers gated on
-``_should_patch()`` (integrated GPU + transformers >= 5.5.0). On any other
-configuration (discrete GPU, or transformers < 5.5.0) the originals run
-unchanged. ``apply_integrated_gpu_loader_patches()`` is idempotent.
+Override the auto-detection with ``UNSLOTH_INTEGRATED_GPU_LOADER=1``
+(force on) or ``=0`` (force off).
 
-The streaming ``_load_pretrained_model`` variant:
-* skips ``caching_allocator_warmup`` (cudaMalloc speedup is meaningless when
-  GPU and CPU share the pool)
-* opens, processes and closes one safetensors shard at a time
-* calls ``posix_fadvise(POSIX_FADV_DONTNEED)`` after each shard to release
-  page cache
-* merges per-shard ``LoadStateDictInfo`` results so the returned object is
-  identical to a single-call invocation (downstream
-  ``_finalize_model_loading`` sees the same data)
-
-Override the auto-detection with ``UNSLOTH_INTEGRATED_GPU_LOADER=1`` (force
-on) or ``=0`` (force off) for testing.
+Background, regressions, and empirical results: see
+``docs/integrated_gpu_loader.md``.
 """
 from __future__ import annotations
 
@@ -64,8 +39,12 @@ logger = logging.getLogger(__name__)
 _PATCH_FLAG_ATTR = "_unsloth_integrated_loader_patched"
 
 
-# Below this version transformers does not have the regressions we patch
-# (4.57.x and earlier already streams shards correctly).
+# 4.57.x and earlier streams shards correctly and doesn't have the
+# device_map regression. The relevant load-path rewrite lands in 5.x;
+# the early 5.x line saw frequent churn in the symbols we depend on, so
+# in practice the patch only activates on >= 5.5 (5.0.x..5.4.x will
+# typically fail _check_symbols and decline). Keep the floor at 5.0 so
+# the symbol check is the source of truth, not a string compare.
 _MIN_VERSION = "5.0.0"
 
 
@@ -182,22 +161,11 @@ def _required_symbols_present() -> bool:
 
 
 def _should_patch() -> bool:
-    """Decide whether to install the integrated-GPU patches.
+    """Binary decision: install the patches, or leave transformers alone.
 
-    Behaviour is binary:
-      * returns True  -> patches install; you get the streaming loader.
-      * returns False -> patches do NOT install; the original transformers
-                         loader runs. On integrated memory this is the
-                         slow path (peak ~2x final), but it is correct.
-
-    There is no "warn and patch anyway" branch. If anything looks off
-    (hardware not integrated, transformers too old, or any symbol /
-    signature we depend on doesn't exist with the expected shape) we
-    decline and log WHY. A separate runtime safety net inside
-    `_routed_load_pretrained_model` catches exceptions thrown from inside
-    the streaming code itself (in case a future transformers release
-    passes our install-time checks but breaks the call sequence at run
-    time).
+    Declines on discrete GPUs, on transformers < ``_MIN_VERSION``, and on
+    any signature/symbol mismatch from ``_check_symbols``. Mismatches log
+    a WARNING so future upstream churn is visible at import time.
     """
     if not _is_integrated_gpu():
         return False
@@ -205,13 +173,9 @@ def _should_patch() -> bool:
         return False
     ok, reason = _check_symbols()
     if not ok:
-        # Surface mismatches loudly so a future upstream change is visible
-        # at unsloth_zoo import time rather than just looking like
-        # "unsloth got slow again on Spark".
         logger.warning(
             "Unsloth: integrated_gpu_loader will NOT patch this transformers "
-            "version because %s. Original (slower on unified-memory) loader "
-            "will run unchanged.",
+            "version because %s. Original loader will run unchanged.",
             reason,
         )
         return False
@@ -222,12 +186,18 @@ def _should_patch() -> bool:
 # helpers
 # ---------------------------------------------------------------------------
 
-def _drop_file_page_cache(path: str) -> None:
-    """Best-effort: ask the kernel to drop cached pages for ``path``.
-
-    No-op on systems without ``posix_fadvise`` or for non-existent files. We
-    swallow OSError because this is a memory hint, not a correctness step.
+def _has_disk_offload(device_map: Any) -> bool:
+    """``device_map`` can be ``None``, a string ("auto", "balanced"), or a
+    dict. ``"disk" in device_map.values()`` only makes sense in the dict
+    case; on a string it raises AttributeError before our outer try/except
+    catches it.
     """
+    return isinstance(device_map, dict) and "disk" in device_map.values()
+
+
+def _drop_file_page_cache(path: str) -> None:
+    """Best-effort ``posix_fadvise(POSIX_FADV_DONTNEED)`` on ``path``. No-op
+    where unsupported. Errors are swallowed -- this is a memory hint."""
     fadvise = getattr(os, "posix_fadvise", None)
     dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
     if fadvise is None or dontneed is None:
@@ -249,15 +219,11 @@ def _drop_file_page_cache(path: str) -> None:
 
 
 def _merge_loading_infos(model, per_shard_infos):
-    """Combine per-shard ``LoadStateDictInfo`` objects into one that matches a
-    single-call invocation of ``convert_and_load_state_dict_in_model``.
-
-    Each per-shard call seeds ``missing_keys`` from the full model state_dict
-    and removes only the keys it loaded. The intersection across shards is
-    therefore the truly missing set. ``unexpected_keys`` /
-    ``mismatched_keys`` / ``error_msgs`` get unioned; ``conversion_errors``
-    is merged first-write-wins.
-    """
+    """Combine per-shard ``LoadStateDictInfo`` objects so the result matches
+    a single-call invocation. ``missing_keys`` is intersected across shards
+    (each shard seeds with the full model state_dict and removes what it
+    loaded). The other fields are unioned; ``conversion_errors`` merges
+    first-write-wins via ``ChainMap``."""
     from transformers.utils.loading_report import LoadStateDictInfo
 
     if not per_shard_infos:
@@ -313,11 +279,9 @@ def _build_routed_get_device_map(original):
         ):
             return original(model, device_map, max_memory, hf_quantizer)
 
-        # Two distinct integrated-GPU branches. We MUST NOT collapse a real
-        # multi-GPU placement to a single device just because the user asked
-        # for "balanced" or "sequential" — those are intentional distribution
-        # strategies. Only collapse when there is exactly one visible GPU
-        # (current Spark hardware, plus each DDP rank's per-process view).
+        # Single-GPU branch coerces to {"": cur}; multi-GPU branch keeps
+        # balanced/sequential intent and only zeros the cpu bucket. Never
+        # collapse a real multi-GPU placement to a single device.
         try:
             import torch
             device_count = torch.cuda.device_count()
@@ -325,24 +289,33 @@ def _build_routed_get_device_map(original):
             device_count = 1
 
         if device_count <= 1:
-            # Single visible GPU. ``current_device()`` (not hard-coded 0) so
-            # each DDP rank picks up its own ``CUDA_VISIBLE_DEVICES`` index.
+            # ``current_device()`` (not hard-coded 0) so each DDP rank
+            # picks up its own ``CUDA_VISIBLE_DEVICES`` index.
             try:
                 import torch
                 idx = torch.cuda.current_device()
             except Exception:
                 idx = 0
             coerced = {"": idx}
+            # Re-validate so we surface real quantizer/environment problems
+            # (mismatched dtype, missing kernels, etc.) instead of pretending
+            # the coercion fixed them. The original CPU-scatter ValueError
+            # cannot fire against this dict, so legitimate errors are the
+            # only thing this catches.
             try:
                 hf_quantizer.validate_environment(device_map=coerced)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning(
+                    "Unsloth: integrated_gpu_loader: hf_quantizer.validate_environment "
+                    "rejected coerced device_map=%r (%r). Falling back to original "
+                    "_get_device_map.", coerced, exc,
+                )
+                return original(model, device_map, max_memory, hf_quantizer)
             return coerced
 
-        # Multi-GPU integrated (multi-Spark or future hardware). Preserve
-        # balanced/sequential intent by calling the original infer path, but
-        # force ``cpu = 0`` in ``max_memory`` so it places everything on
-        # GPUs. Bnb-style validators that reject CPU-tagged maps then pass.
+        # Multi-GPU integrated. Force cpu=0 so the original infer path
+        # places everything on GPUs; quantizer validators that reject
+        # CPU-tagged maps then pass.
         try:
             import torch
             adjusted = {} if max_memory is None else dict(max_memory)
@@ -365,38 +338,32 @@ def _build_routed_get_device_map(original):
 def _streaming_load_pretrained_model(model, state_dict, checkpoint_files, load_config, expected_keys=None):
     """Integrated-GPU variant of ``PreTrainedModel._load_pretrained_model``.
 
-    Mirrors transformers/modeling_utils.py:_load_pretrained_model (5.5.0:4174-4264)
-    with three changes:
-      1. skip caching_allocator_warmup (the up-front pre-allocation is harmful
-         on unified memory),
-      2. process safetensors shards one-at-a-time (open, build slice dict,
-         convert, close, posix_fadvise, gc.collect),
-      3. merge per-shard LoadStateDictInfo via ``_merge_loading_infos``.
+    Skips ``caching_allocator_warmup`` and processes shards one at a time
+    (safetensors via mmap'd ``safe_open`` + ``posix_fadvise`` between
+    shards; ``.bin`` via ``load_state_dict`` + ``gc.collect`` between
+    shards). Per-shard ``LoadStateDictInfo`` results are merged via
+    ``_merge_loading_infos`` so the returned object matches a single-call
+    invocation.
 
-    Falls back to the original loader for: deepspeed-zero3 paths, .bin
-    checkpoints, in-memory state_dicts, and disk-offload device_maps.
+    The deepspeed-zero3 branch and the in-memory ``state_dict`` branch
+    delegate to the original convert/load helpers (no shard streaming
+    involved).
     """
     from transformers.core_model_loading import convert_and_load_state_dict_in_model
     from transformers.modeling_utils import (
         accelerate_disk_offload,
         is_deepspeed_zero3_enabled,
     )
-    from transformers.utils.quantization_config import QuantizationMethod
     from transformers.utils.loading_report import LoadStateDictInfo
     from safetensors import safe_open
 
     is_quantized = load_config.is_quantized
-    is_hqq_or_quark = is_quantized and load_config.hf_quantizer.quantization_config.quant_method in {
-        QuantizationMethod.HQQ,
-        QuantizationMethod.QUARK,
-    }
 
     # Materialise expected_keys exactly like the original (5.5.0:4190).
     expected_keys = list(model.state_dict().keys()) if expected_keys is None else expected_keys
 
-    # Disk offload bookkeeping.
     disk_offload_index = None
-    if load_config.device_map is not None and "disk" in load_config.device_map.values():
+    if _has_disk_offload(getattr(load_config, "device_map", None)):
         disk_offload_index = accelerate_disk_offload(
             model,
             load_config.disk_offload_folder,
@@ -407,12 +374,7 @@ def _streaming_load_pretrained_model(model, state_dict, checkpoint_files, load_c
             load_config.weight_mapping,
         )
 
-    # NOTE: caching_allocator_warmup intentionally skipped here.
-    _ = is_hqq_or_quark  # kept for parity with the original gate at 4210-4212
-
-    # Deepspeed-zero3 path: defer to original behaviour (no streaming benefit).
     if is_deepspeed_zero3_enabled() and not is_quantized:
-        # Replicate the original deepspeed branch (5.5.0:4216-4232) without the warmup.
         from transformers.modeling_utils import _load_state_dict_into_zero3_model, load_state_dict
         if state_dict is None:
             merged = {}
@@ -491,24 +453,23 @@ def _streaming_load_pretrained_model(model, state_dict, checkpoint_files, load_c
 
 
 def _is_pre_quantized_load(load_config) -> bool:
-    """True only if the checkpoint is already quantized end-to-end.
+    """True iff the checkpoint is already fully quantized.
 
-    The streaming loader is safe ONLY for pre_quantized=True checkpoints,
-    where each checkpoint key maps directly to a model param (no fusion
-    converters that would require multiple source tensors landing in the
-    same call to convert_and_load_state_dict_in_model). For on-the-fly
-    quantization or fp16->fp16 loads with weight fusion (e.g. MoE
-    gate/up/down stacking from per-expert checkpoint keys), the original
-    loader must run to keep all source tensors live until the converter
-    fires.
+    Streaming is safe only when each shard's keys map directly onto model
+    params. On-the-fly quantization (fp16/bf16 checkpoint + bnb config at
+    load time) and any path with cross-shard fusion converters needs every
+    source tensor live in one ``convert_and_load_state_dict_in_model``
+    call, so the original loader must run.
+
+    Practical consequence: ``unsloth/gpt-oss-120b-unsloth-bnb-4bit`` and
+    similar pre-quantized repos hit the streaming path. ``unsloth/Llama-3.1-8B``
+    + ``BitsAndBytesConfig(load_in_4bit=True)`` does NOT -- only Patch A
+    (device_map coercion) helps that case. See
+    ``docs/integrated_gpu_loader.md`` for the per-architecture matrix.
     """
     try:
         hf_q = getattr(load_config, "hf_quantizer", None)
         if hf_q is None:
-            # Non-quantized fp16/bf16 load. May still have safetensors-level
-            # weight renaming, but no fusion converters that span shards in
-            # any model architecture we know of for the bnb-4bit-on-Spark
-            # use-case. Be conservative and decline to stream.
             return False
         return bool(getattr(hf_q, "pre_quantized", False))
     except Exception:
@@ -521,33 +482,31 @@ def _build_routed_load_pretrained_model(original):
         # Cheap gates first; do nothing on a discrete GPU.
         if not _is_integrated_gpu():
             return original(model, state_dict, checkpoint_files, load_config, expected_keys)
-        # Disk-offload uses the original path: streaming doesn't apply.
-        if (
-            getattr(load_config, "device_map", None) is not None
-            and "disk" in load_config.device_map.values()
-        ):
+        # Disk offload uses the original path; streaming doesn't apply.
+        if _has_disk_offload(getattr(load_config, "device_map", None)):
             return original(model, state_dict, checkpoint_files, load_config, expected_keys)
-        # Cross-shard weight converters (the gpt-oss MoE fp16->bnb path, etc.)
-        # need every source tensor in one convert_and_load call. Per-shard
-        # streaming would split them and produce missing keys. Only stream
-        # when the checkpoint is already fully quantized.
         if not _is_pre_quantized_load(load_config):
             return original(model, state_dict, checkpoint_files, load_config, expected_keys)
-        # Try the fast streaming path. If anything in our copy of the loader
-        # raises (e.g. a future transformers releases reshapes
-        # convert_and_load_state_dict_in_model or LoadStateDictInfo in a way
-        # our install-time checks didn't catch), fall back to the original
-        # loader and log loudly. The unpatched path still WORKS on this
-        # hardware -- it just spikes peak memory; correctness is preserved.
         try:
             return _streaming_load_pretrained_model(
                 model, state_dict, checkpoint_files, load_config, expected_keys
             )
         except Exception as e:
+            # The streaming loop may have already mutated the model (some
+            # shards loaded, hooks/quantizer state applied, tied-weight
+            # bookkeeping started) before raising. Re-running the original
+            # loader on top of that partial state usually overwrites the
+            # loaded params with the same values, but we cannot guarantee
+            # it for every quantizer/offload combination -- the surviving
+            # model object may end up in a partially-converted state. Log
+            # loudly so this is investigable, then defer to the original.
             logger.warning(
-                "Unsloth: integrated_gpu_loader streaming path raised %r; "
-                "falling back to original _load_pretrained_model. Peak load "
-                "memory may spike.", e,
+                "Unsloth: integrated_gpu_loader streaming raised %r AFTER "
+                "potentially mutating the model; falling back to the "
+                "original _load_pretrained_model on the partially-loaded "
+                "object. Set UNSLOTH_INTEGRATED_GPU_LOADER=0 to force the "
+                "original loader from the start, or report this with the "
+                "traceback so the streaming gate can be tightened.", e,
             )
             return original(model, state_dict, checkpoint_files, load_config, expected_keys)
 
