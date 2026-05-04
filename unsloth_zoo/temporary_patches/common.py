@@ -52,8 +52,8 @@ try:
     inductor_config_source = inspect.getsource(torch._inductor.config)
 except Exception:
     # Broken or absent Triton can make torch._inductor fail during lazy import.
-    # No-Triton installs route torch.compile through aot_eager below, where
-    # inductor options are stripped before calling torch.compile.
+    # No-Triton installs default to dynamo_disable. Explicit non-Inductor
+    # torch.compile backends such as aot_eager strip inductor options below.
     inductor_config_source = ""
 
 @functools.lru_cache(1)
@@ -185,6 +185,8 @@ def _make_torch_compile(default_options):
 
     def _compile(fn=None, **kwargs):
         backend = compile_policy.UNSLOTH_COMPILE_BACKEND
+        if backend == "dynamo_disable":
+            return noop(fn, **kwargs)
         # When the resolved backend is the torch.compile default ("inductor"),
         # do NOT pass `backend=` explicitly. Match `functools.partial(
         # torch.compile, options=...)` byte-for-byte so torch's compile cache
@@ -216,7 +218,7 @@ def _make_torch_compile(default_options):
             return fn
     return _compile
 
-if UNSLOTH_COMPILE_DISABLE:
+if UNSLOTH_COMPILE_DISABLE or compile_policy.UNSLOTH_COMPILE_BACKEND == "dynamo_disable":
     torch_compile = noop
     _torch_compile = noop
 elif compile_policy.UNSLOTH_COMPILE_BACKEND == "inductor":

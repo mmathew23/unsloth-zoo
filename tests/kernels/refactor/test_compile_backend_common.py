@@ -54,15 +54,30 @@ class CompileBackendCommonTests(unittest.TestCase):
         with patch.dict(os.environ, {"UNSLOTH_TORCH_COMPILE_BACKEND": "INDUCTOR"}):
             self.assertEqual(compile_policy._detect_compile_backend(), "inductor")
 
-    def test_detect_compile_backend_uses_aot_eager_without_triton(self):
+        with patch.dict(os.environ, {"UNSLOTH_TORCH_COMPILE_BACKEND": "dynamo-disabled"}):
+            self.assertEqual(compile_policy._detect_compile_backend(), "dynamo_disable")
+
+        with patch.dict(
+            os.environ,
+            {
+                "UNSLOTH_TORCH_COMPILE_BACKEND": "dynamo_disable",
+                "TORCHDYNAMO_DISABLE": "0",
+            },
+        ):
+            self.assertEqual(compile_policy._detect_compile_backend(), "dynamo_disable")
+            self.assertEqual(os.environ["TORCHDYNAMO_DISABLE"], "1")
+
+    def test_detect_compile_backend_uses_dynamo_disable_without_triton(self):
         with patch.dict(os.environ, {}, clear=True):
             with patch.object(compile_policy, "_is_triton_importable", return_value = False):
-                self.assertEqual(compile_policy._detect_compile_backend(), "aot_eager")
+                self.assertEqual(compile_policy._detect_compile_backend(), "dynamo_disable")
+                self.assertEqual(os.environ["TORCHDYNAMO_DISABLE"], "1")
 
-    def test_detect_compile_backend_uses_aot_eager_when_triton_import_fails(self):
+    def test_detect_compile_backend_uses_dynamo_disable_when_triton_import_fails(self):
         with patch.dict(os.environ, {}, clear=True):
             with patch("importlib.import_module", side_effect = OSError("broken triton")):
-                self.assertEqual(compile_policy._detect_compile_backend(), "aot_eager")
+                self.assertEqual(compile_policy._detect_compile_backend(), "dynamo_disable")
+                self.assertEqual(os.environ["TORCHDYNAMO_DISABLE"], "1")
 
     def test_kernel_backend_triton_does_not_disable_inductor_compile(self):
         with patch.dict(
@@ -105,6 +120,30 @@ class CompileBackendCommonTests(unittest.TestCase):
         self.assertEqual(captured["backend"], "aot_eager")
         self.assertNotIn("options", captured)
         self.assertNotIn("mode", captured)
+
+    def test_make_torch_compile_dynamo_disable_does_not_call_torch_compile(self):
+        called = {"compile": False, "noop": False}
+
+        def fake_compile(*args, **kwargs):
+            called["compile"] = True
+            raise AssertionError("dynamo_disable must not call torch.compile")
+
+        def fake_noop(*args, **kwargs):
+            called["noop"] = True
+            return args[0] if args and callable(args[0]) else (lambda f: f)
+
+        def fn(x):
+            return x
+
+        with patch.object(compile_policy, "UNSLOTH_COMPILE_BACKEND", "dynamo_disable"):
+            with patch.object(common.torch, "compile", fake_compile):
+                with patch.object(common, "noop", fake_noop):
+                    decorator = common._make_torch_compile({"trace.enabled": False})
+                    compiled = decorator(fn, mode = "max-autotune")
+
+        self.assertIs(compiled, fn)
+        self.assertTrue(called["noop"])
+        self.assertFalse(called["compile"])
 
     def test_make_torch_compile_non_inductor_decorator_falls_back_to_eager(self):
         def boom_compile(*args, **kwargs):

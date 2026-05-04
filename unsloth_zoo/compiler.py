@@ -116,8 +116,8 @@ OLD_TRITON_VERSION = triton is None or Version(triton.__version__) < Version("3.
 
 def should_skip_fused_lm_head_patch():
     # NVIDIA_REVIEW: Missing Triton only blocks the fused LM-head patch when
-    # torch.compile is using inductor. Cutile-only installs intentionally route
-    # generated cache code through aot_eager, so they should still get this
+    # torch.compile is using inductor. Cutile-only installs intentionally avoid
+    # the inductor path, so they should still get this
     # compiler-disabled fused CE forward instead of silently falling back to the
     # slower higher-VRAM Transformers loss path.
     return (

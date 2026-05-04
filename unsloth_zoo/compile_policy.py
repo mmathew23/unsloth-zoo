@@ -32,7 +32,10 @@ def _is_triton_importable() -> bool:
 def _normalize_compile_backend(backend: str | None) -> str:
     if backend is None:
         return ""
-    return str(backend).strip().lower().replace("-", "_")
+    normalized = str(backend).strip().lower().replace("-", "_")
+    if normalized in {"dynamo_disabled", "torchdynamo_disable"}:
+        return "dynamo_disable"
+    return normalized
 
 
 def _detect_compile_backend() -> str:
@@ -40,10 +43,13 @@ def _detect_compile_backend() -> str:
         os.environ.get("UNSLOTH_TORCH_COMPILE_BACKEND", "")
     )
     if explicit:
+        if explicit == "dynamo_disable":
+            os.environ["TORCHDYNAMO_DISABLE"] = "1"
         return explicit
     if _is_triton_importable():
         return "inductor"
-    return "aot_eager"
+    os.environ["TORCHDYNAMO_DISABLE"] = "1"
+    return "dynamo_disable"
 
 
 UNSLOTH_COMPILE_BACKEND: str = _detect_compile_backend()
