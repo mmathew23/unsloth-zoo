@@ -39,6 +39,7 @@ import tempfile
 import sys
 import textwrap
 import tokenize
+import itertools
 from .utils import (
     Version,
     is_main_process,
@@ -47,14 +48,25 @@ from .utils import (
     get_lock,
 )
 from .log import logger
-import triton
+try:
+    import triton
+except Exception:
+    triton = None
 import regex
 from .peft_utils import get_lora_layer_modules
 from importlib.metadata import version as importlib_version
 import functools
 from .compiler_replacements import compiler_replacements
 from . import DEVICE_TYPE
-from .temporary_patches.common import get_torch_compile_options
+from .temporary_patches.common import (
+    get_torch_compile_options,
+    torch_compile as _unsloth_torch_compile,
+)
+from .compile_policy import (
+    UNSLOTH_COMPILE_BACKEND,
+    get_torch_compile_decorator_source,
+    get_torch_compile_import_source,
+)
 from .hf_utils import get_transformers_model_type
 
 try:
@@ -77,6 +89,14 @@ if "UNSLOTH_COMPILE_LOCATION" not in globals():
 global UNSLOTH_COMPILE_USE_TEMP
 UNSLOTH_COMPILE_USE_TEMP = False
 
+_RUNTIME_MODULE_COUNTER = itertools.count()
+UNSLOTH_COMPILE_CACHE_SCHEMA = "backend_neutral_v1"
+
+
+class _KernelRuntimeBindingError(RuntimeError):
+    pass
+
+
 # Disable some compilations if old versions are seen
 OLD_TORCH_VERSION = Version(torch.__version__) < Version("2.5.0")
 
@@ -92,7 +112,20 @@ elif DEVICE_TYPE == "xpu":
     OLD_CUDA_ARCH_VERSION = False
 pass
 
-OLD_TRITON_VERSION = Version(triton.__version__) < Version("3.0.0")
+OLD_TRITON_VERSION = triton is None or Version(triton.__version__) < Version("3.0.0")
+
+def should_skip_fused_lm_head_patch():
+    # NVIDIA_REVIEW: Missing Triton only blocks the fused LM-head patch when
+    # torch.compile is using inductor. Cutile-only installs intentionally avoid
+    # the inductor path, so they should still get this
+    # compiler-disabled fused CE forward instead of silently falling back to the
+    # slower higher-VRAM Transformers loss path.
+    return (
+        OLD_CUDA_ARCH_VERSION or
+        OLD_TORCH_VERSION or
+        (OLD_TRITON_VERSION and UNSLOTH_COMPILE_BACKEND == "inductor")
+    )
+pass
 
 # Check if Unsloth Studio is allowed
 import importlib.util
@@ -800,6 +833,8 @@ def create_new_function(
     append="",
     overwrite=True,
     add_torch_compile=False,
+    isolated_runtime_module=False,
+    bind_kernel_runtime_globals=False,
 ):
     # All Unsloth Zoo code licensed under LGPLv3
     old_new_source = new_source
@@ -815,10 +850,7 @@ def create_new_function(
     pass
 
     if add_torch_compile:
-        new_source = (
-            "@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)\n"
-            f"{new_source}"
-        )
+        new_source = f"{get_torch_compile_decorator_source(fullgraph = True, dynamic = True)}\n{new_source}"
     pass
 
     # Fix invalid signatures like: def fn(..., kwargs, **kwargs): -> rename param + alias
@@ -848,7 +880,9 @@ def create_new_function(
     imports += "import torch\n"
     imports += "import torch.nn as nn\n"
     imports += "from torch.nn import functional as F\n"
-    if "torch_compile" in new_source:
+    if "_unsloth_torch_compile" in new_source:
+        imports += "from unsloth_zoo.temporary_patches.common import torch_compile as _unsloth_torch_compile\n"
+    elif "torch_compile" in new_source:
         imports += "from unsloth_zoo.temporary_patches.common import torch_compile\n"
     if "KWARGS_TYPE" in new_source:
         imports += "from unsloth_zoo.temporary_patches.utils import KWARGS_TYPE\n"
@@ -914,7 +948,8 @@ def create_new_function(
         '"""\n' + f"{unsloth_zoo_version}\n"
         f"{unsloth_version}\n"
         f"{transformers_version}\n"
-        f"{trl_version}\n__UNSLOTH_VERSIONING__\n" + '"""\n'
+        f"{trl_version}\n"
+        f"{UNSLOTH_COMPILE_CACHE_SCHEMA}\n__UNSLOTH_VERSIONING__\n" + '"""\n'
     )
 
     if _full_license_header not in new_source:
@@ -945,16 +980,23 @@ def create_new_function(
                     overwrite = True
     pass
     if os.environ.get("UNSLOTH_COMPILE_OVERWRITE", "1") == "0":
-        # Even with OVERWRITE disabled, force recompile on transformers version mismatch
+        # Even with OVERWRITE disabled, force recompile on cache ABI mismatch.
+        # The selected torch.compile backend is intentionally not part of this
+        # source metadata: backend choice belongs to the runtime module variant
+        # and compiled callable, while the generated disk source stays stable.
         if file_source is not None and "__UNSLOTH_VERSIONING__" in file_source:
             cached_versions = file_source[:file_source.find("__UNSLOTH_VERSIONING__")]
             cached_lines = [l.strip() for l in cached_versions.strip().strip('"').split("\n") if l.strip()]
-            # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version]
+            # Format: [unsloth_zoo_version, unsloth_version, transformers_version, trl_version, cache_schema]
             cached_tf_version = cached_lines[2] if len(cached_lines) > 2 else "0"
-            if cached_tf_version != transformers_version:
+            cached_cache_schema = cached_lines[4] if len(cached_lines) > 4 else None
+            if cached_tf_version != transformers_version or cached_cache_schema != UNSLOTH_COMPILE_CACHE_SCHEMA:
+                shown_cached_schema = cached_cache_schema or "<missing>"
                 logger.warning_once(
-                    f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but transformers version changed "
-                    f"({cached_tf_version} -> {transformers_version}). Forcing recompile of {name}."
+                    f"Unsloth: UNSLOTH_COMPILE_OVERWRITE=0 is set, but compile cache metadata changed "
+                    f"(transformers {cached_tf_version} -> {transformers_version}, "
+                    f"schema {shown_cached_schema} -> {UNSLOTH_COMPILE_CACHE_SCHEMA}). "
+                    f"Forcing recompile of {name}."
                 )
                 # Don't set overwrite = False; keep overwrite = True from version mismatch detection
             else:
@@ -1019,9 +1061,61 @@ def create_new_function(
     old_path = None
     new_module = None
 
+    def _exec_source_module(new_module, file_location):
+        with open(file_location, "rb") as f:
+            source = f.read()
+        code = compile(source, file_location, "exec")
+        exec(code, new_module.__dict__)
+
+    def _load_runtime_module_instance(compile_folder, name, runtime_module_name = None):
+        file_location = os.path.join(compile_folder, name) + ".py"
+        runtime_module_name = runtime_module_name or (
+            f"unsloth_runtime_cache_{name}_{os.getpid()}_"
+            f"{next(_RUNTIME_MODULE_COUNTER)}"
+        )
+        lock = get_lock(file_location)
+        old_path = None
+        if compile_folder not in sys.path:
+            old_path = list(sys.path)
+            sys.path.insert(0, compile_folder)
+        try:
+            with lock:
+                spec = importlib.util.spec_from_file_location(
+                    runtime_module_name,
+                    file_location,
+                )
+                new_module = importlib.util.module_from_spec(spec)
+                sys.modules[runtime_module_name] = new_module
+                try:
+                    _exec_source_module(new_module, file_location)
+                finally:
+                    sys.modules.pop(runtime_module_name, None)
+                return new_module, old_path
+        except Exception:
+            sys.modules.pop(runtime_module_name, None)
+            raise
+
+    def _bind_kernel_globals(new_module):
+        if not bind_kernel_runtime_globals:
+            return
+        try:
+            from unsloth.kernels.runtime_bindings import (
+                bind_kernel_runtime_globals as _bind_kernel_runtime_globals,
+            )
+            _bind_kernel_runtime_globals(new_module)
+        except Exception as e:
+            raise _KernelRuntimeBindingError(
+                f"Unsloth: failed to bind kernel runtime globals for {name}."
+            ) from e
+
     def import_module(compile_folder, name):
         target_name = os.path.join(compile_folder, f"{name}.py")
         lock = get_lock(target_name)
+        old_path = None
+        if isolated_runtime_module:
+            new_module, old_path = _load_runtime_module_instance(compile_folder, name)
+            _bind_kernel_globals(new_module)
+            return new_module, old_path
         # Add directory to sys.path temporarily if it's not already there
         if compile_folder not in sys.path:
             old_path = list(sys.path)
@@ -1031,8 +1125,23 @@ def create_new_function(
             sys.path.insert(0, compile_folder)
         try:
             with lock:
-                # Try standard import
-                new_module = importlib.import_module(name)
+                importlib.invalidate_caches()
+                existing_module = sys.modules.get(name)
+                if existing_module is not None and overwrite:
+                    spec = importlib.util.spec_from_file_location(name, target_name)
+                    new_module = importlib.util.module_from_spec(spec)
+                    sys.modules[name] = new_module
+                    try:
+                        _exec_source_module(new_module, target_name)
+                    except Exception:
+                        sys.modules[name] = existing_module
+                        raise
+                elif existing_module is not None:
+                    new_module = existing_module
+                else:
+                    # Try standard import
+                    new_module = importlib.import_module(name)
+                _bind_kernel_globals(new_module)
                 return new_module, old_path
         except Exception as e:
             if os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1":
@@ -1045,6 +1154,8 @@ def create_new_function(
 
     try:
         new_module, old_path = import_module(compile_folder, name)
+    except _KernelRuntimeBindingError:
+        raise
     except Exception as e:
         new_module = None
         # Try using temp directory instead!
@@ -1070,16 +1181,16 @@ def create_new_function(
         # Fallback to direct module loading
         if new_module is None:
             try:
-                module_name = f"unsloth_cache_{name}"
-                file_location = os.path.join(compile_folder, name) + ".py"
-                lock = get_lock(file_location)
-                with lock:
-                    spec = importlib.util.spec_from_file_location(
-                        module_name, file_location
-                    )
-                    new_module = importlib.util.module_from_spec(spec)
-                    sys.modules[module_name] = new_module
-                    spec.loader.exec_module(new_module)
+                new_module, fallback_old_path = _load_runtime_module_instance(
+                    compile_folder,
+                    name,
+                    runtime_module_name = f"unsloth_cache_{name}",
+                )
+                if old_path is None:
+                    old_path = fallback_old_path
+                _bind_kernel_globals(new_module)
+            except _KernelRuntimeBindingError:
+                raise
             except Exception as e:
                 raise RuntimeError(f"Direct module loading failed for {name}: {e}")
         pass
@@ -1246,7 +1357,7 @@ def create_standalone_class(
 
     if disable is not None:
         compile = (
-            f"@torch.compile(fullgraph = {fullgraph}, dynamic = True, options = torch_compile_options)"
+            get_torch_compile_decorator_source(fullgraph = fullgraph, dynamic = True)
             if not disable
             else "@torch.compiler.disable(recursive = False)"
         )
@@ -1381,8 +1492,9 @@ pass
 
 _cross_entropy_code = """
 from torch.nn import CrossEntropyLoss
+__UNSLOTH_COMPILE_IMPORT__
 
-@torch.compile(fullgraph = True, dynamic = True, options = torch_compile_options)
+__UNSLOTH_COMPILE_DECORATOR__
 def normal_cross_entropy_loss(self, hidden_states, labels):
     logits = self.lm_head(hidden_states)
     logits = logits.float()
@@ -1437,6 +1549,13 @@ def mask_attention_mask_out(labels = None, attention_mask = None):
 pass
 
 """
+_cross_entropy_code = _cross_entropy_code.replace(
+    "__UNSLOTH_COMPILE_IMPORT__",
+    get_torch_compile_import_source(),
+).replace(
+    "__UNSLOTH_COMPILE_DECORATOR__",
+    get_torch_compile_decorator_source(fullgraph = True, dynamic = True),
+)
 
 __DYNAMO__RECOMPILING__ = """
 
@@ -2134,6 +2253,28 @@ def convert_attention_masks_to_bool(module, old_source):
     new_source = "\n".join(all_splits)
     print(f"Unsloth: Boolean mask for {module}")
     return new_source
+
+
+def patch_gpt_oss_dict_attention_mask(source, *, model_type = None):
+    if model_type != "gpt_oss":
+        return source
+    if "attn_weights = attn_weights + attention_mask" not in source or "module" not in source:
+        return source
+    if "key_states" not in source:
+        return source
+    # Transformers 5.x can pass GPT-OSS generation masks as a dict keyed by layer
+    # type; the selected mask still needs slicing to the current KV-cache length.
+    return re.sub(
+        r"(\s+)(if attention_mask is not None:\s*\n\s+attn_weights = attn_weights \+ attention_mask)",
+        r"\1if attention_mask is not None:\n"
+        r"\1    if isinstance(attention_mask, dict):\n"
+        r"\1        attention_mask = attention_mask.get(getattr(module, 'layer_type', None), None)\n"
+        r"\1    if attention_mask is not None:\n"
+        r"\1        attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]\n"
+        r"\1        attn_weights = attn_weights + attention_mask",
+        source,
+        flags=re.MULTILINE,
+    )
 
 
 pass
@@ -2849,8 +2990,8 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
             forward = eval(norm).forward
             if hasattr(forward, "get_compiler_config"):
                 continue
-            forward = torch.compile(
-                forward, fullgraph=True, dynamic=None, options=torch_compile_options
+            forward = _unsloth_torch_compile(
+                forward, fullgraph=True, dynamic=None,
             )
             exec(f"timm.layers.norm_act.{norm}.forward = forward")
             if UNSLOTH_ENABLE_LOGGING:
@@ -2880,8 +3021,8 @@ def compile_timm_models(UNSLOTH_ENABLE_LOGGING, torch_compile_options):
             forward = eval(block).forward
             if hasattr(forward, "get_compiler_config"):
                 continue
-            forward = torch.compile(
-                forward, fullgraph=True, dynamic=None, options=torch_compile_options
+            forward = _unsloth_torch_compile(
+                forward, fullgraph=True, dynamic=None,
             )
             exec(f"timm.models._efficientnet_blocks.{block}.forward = forward")
             if UNSLOTH_ENABLE_LOGGING:
@@ -3700,8 +3841,9 @@ def unsloth_compile_transformers(
         modules = dir(modeling_file)
 
         for module in modules:
-            # Disable if torch < 2.5 or V100s 7.0 (Tesla T4 7.5 works) or old Triton < 3
-            if OLD_CUDA_ARCH_VERSION or OLD_TORCH_VERSION or OLD_TRITON_VERSION:
+            # Disable if torch < 2.5, V100s 7.0 (Tesla T4 7.5 works), or if
+            # inductor would need unavailable/old Triton support.
+            if should_skip_fused_lm_head_patch():
                 continue
 
             module_class = getattr(modeling_file, module)
@@ -4005,7 +4147,10 @@ def unsloth_compile_transformers(
                     + parameters
                 )
             elif not disable:
-                parameters = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{parameters}"
+                parameters = (
+                    f"{get_torch_compile_decorator_source(fullgraph = UNSLOTH_FULLGRAPH, dynamic = True)}\n"
+                    f"{parameters}"
+                )
             all_standalone_classes[module] = parameters
         pass
 
@@ -4032,20 +4177,7 @@ def unsloth_compile_transformers(
             if sdpa_bool_masks:
                 source = convert_attention_masks_to_bool(module, source)
 
-            # Fix dict-based attention masks for gpt_oss (transformers 5.x).
-            # In v5, create_masks_for_generate returns a dict of masks keyed by
-            # layer pattern instead of a single tensor.
-            if "attn_weights = attn_weights + attention_mask" in source and "module" in source:
-                source = re.sub(
-                    r"(\s+)(if attention_mask is not None:\s*\n\s+attn_weights = attn_weights \+ attention_mask)",
-                    r"\1if attention_mask is not None:\n"
-                    r"\1    if isinstance(attention_mask, dict):\n"
-                    r"\1        attention_mask = attention_mask.get(getattr(module, 'layer_type', None), None)\n"
-                    r"\1    if attention_mask is not None:\n"
-                    r"\1        attn_weights = attn_weights + attention_mask",
-                    source,
-                    flags=re.MULTILINE,
-                )
+            source = patch_gpt_oss_dict_attention_mask(source, model_type = model_type)
 
             # Check erroring out
             bad = False
@@ -4057,14 +4189,17 @@ def unsloth_compile_transformers(
             if not bad:
                 if module in disable_compile_functions:
                     source = re.sub(
-                        r"@torch.compile\([^\n]*\)\n",
+                        r"@(?:torch\.compile|_unsloth_torch_compile)\([^\n]*\)\n",
                         "@torch.compiler.disable(recursive = False)\n",
                         source,
                     )
                     if "@torch.compiler.disable(recursive = False)\n" not in source:
                         source = "@torch.compiler.disable(recursive = False)\n" + source
                 elif not disable:
-                    source = f"@torch.compile(fullgraph = {UNSLOTH_FULLGRAPH}, dynamic = True, options = torch_compile_options)\n{source}"
+                    source = (
+                        f"{get_torch_compile_decorator_source(fullgraph = UNSLOTH_FULLGRAPH, dynamic = True)}\n"
+                        f"{source}"
+                    )
                 print(f"Unsloth: Compiled function {module}.")
             else:
                 print(
@@ -4117,6 +4252,8 @@ def unsloth_compile_transformers(
             + f"\ntorch_compile_options = {torch_compile_options}\n"
             + _cross_entropy_code
             + "\n",
+            isolated_runtime_module=True,
+            bind_kernel_runtime_globals=True,
         )
     except Exception as exception:
         if not disable:

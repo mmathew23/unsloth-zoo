@@ -26,11 +26,11 @@ import logging
 import numpy as np
 from typing import Union, Callable, Optional, List, Dict
 from .device_type import DEVICE_TYPE, device_synchronize
-from .temporary_patches.common import torch_compile_options
+from .temporary_patches.common import torch_compile_options, torch_compile
 RL_REPLACEMENTS = dict()
 
 # https://github.com/huggingface/trl/blob/main/trl/trainer/utils.py#L1674
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@torch_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def selective_log_softmax(logits, index):
     logits = logits.to(torch.float32)
     selected_logits = torch.gather(logits, dim = -1, index = index.unsqueeze(-1)).squeeze(-1)
@@ -43,7 +43,7 @@ pass
 
 # More memory efficient by chunking on (bsz+qlen) dimension
 # Exactly equivalent to the above
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@torch_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_selective_log_softmax(logits, index, temperature: float = 1.0):
     # Split into 4 chunks only
     chunked_logits = torch.chunk(logits.reshape(-1, logits.shape[-1]), chunks = 4, dim = 0)
@@ -66,7 +66,7 @@ pass
 
 RL_REPLACEMENTS["selective_log_softmax"] = chunked_selective_log_softmax
 
-@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
+@torch_compile(dynamic = True, fullgraph = True, options = torch_compile_options,)
 def chunked_hidden_states_selective_log_softmax(
     hidden_states: torch.Tensor,
     lm_head: torch.Tensor,
@@ -537,7 +537,7 @@ def grpo_compute_loss(
 pass
 RL_REPLACEMENTS["grpo_compute_loss"]      = grpo_compute_loss
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
-    f"@torch.compile(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\
+    f"@torch_compile(dynamic = True, fullgraph = True, options = torch_compile_options)\n"\
     f"{inspect.getsource(grpo_compute_loss)}"
 RL_REPLACEMENTS["grpo_compute_loss_slow"] = \
     RL_REPLACEMENTS["grpo_compute_loss_slow"].replace(
@@ -605,12 +605,11 @@ class UnslothEfficientGRPO(torch.autograd.Function):
             grad_inputs_j[:] = chunk_grad_input
         pass
 
-        accumulate_chunk = torch.compile(
+        accumulate_chunk = torch_compile(
             accumulate_chunk,
             fullgraph = True,
             # [TODO] Dynamic marking causes torch.compile errors if sequence length is long
             dynamic = True,
-            options = torch_compile_options,
         )
 
         grad_inputs_chunks = torch.chunk(grad_inputs,        chunks = n_chunks, dim = 0)
@@ -1013,17 +1012,45 @@ def grpo_accumulated_loss(
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, -(logits_to_keep + max_left_pad + 1): , :]
                     new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
-                    logprobs_chunk = efficient_log_softmax(
-                        new_hidden_states_chunk,
-                        lm_head,
-                        completion_ids,
-                        chunks=input_ids_chunk.shape[0]*multiplier,
-                        logit_scale_multiply=logit_scale_multiply,
-                        logit_scale_divide=logit_scale_divide,
-                        logit_softcapping=logit_softcapping,
-                        temperature=temperature,
-                        batch_size = B
-                    )
+                    # Some eager/generic paths ignore
+                    # UNSLOTH_RETURN_HIDDEN_STATES and return vocab logits.
+                    # Do not silently guess when hidden and vocab widths match.
+                    _logits_width = new_hidden_states_chunk.shape[-1]
+                    _hidden_width = lm_head.shape[1]
+                    _vocab_width = lm_head.shape[0]
+                    if (
+                        _logits_width == _hidden_width
+                        and _logits_width == _vocab_width
+                    ):
+                        raise RuntimeError(
+                            "Unsloth: cannot determine whether GRPO model output "
+                            "contains hidden states or logits because hidden_size == "
+                            "vocab_size. The model forward path must provide an "
+                            "explicit hidden-state/logits contract."
+                        )
+                    if _logits_width == _hidden_width:
+                        logprobs_chunk = efficient_log_softmax(
+                            new_hidden_states_chunk,
+                            lm_head,
+                            completion_ids,
+                            chunks=input_ids_chunk.shape[0]*multiplier,
+                            logit_scale_multiply=logit_scale_multiply,
+                            logit_scale_divide=logit_scale_divide,
+                            logit_softcapping=logit_softcapping,
+                            temperature=temperature,
+                            batch_size = B
+                        )
+                    elif _logits_width == _vocab_width:
+                        logprobs_chunk = chunked_selective_log_softmax(
+                            new_hidden_states_chunk,
+                            completion_ids,
+                            temperature=temperature,
+                        )
+                    else:
+                        raise RuntimeError(
+                            "Unsloth: model output width does not match either "
+                            "hidden_size or vocab_size in GRPO logprob path."
+                        )
                 else:
                     new_hidden_states_chunk = unwrapped_model(
                         input_ids = input_ids_chunk,
@@ -1037,8 +1064,22 @@ def grpo_accumulated_loss(
                     ).logits
 
                     new_hidden_states_chunk = new_hidden_states_chunk[:, :-1, :]
-                    # Guard: check if model returned hidden states or logits
-                    if new_hidden_states_chunk.shape[-1] == lm_head.shape[1]:
+                    # Guard: check if model returned hidden states or logits.
+                    # Do not silently guess when hidden and vocab widths match.
+                    _logits_width = new_hidden_states_chunk.shape[-1]
+                    _hidden_width = lm_head.shape[1]
+                    _vocab_width = lm_head.shape[0]
+                    if (
+                        _logits_width == _hidden_width
+                        and _logits_width == _vocab_width
+                    ):
+                        raise RuntimeError(
+                            "Unsloth: cannot determine whether GRPO model output "
+                            "contains hidden states or logits because hidden_size == "
+                            "vocab_size. The model forward path must provide an "
+                            "explicit hidden-state/logits contract."
+                        )
+                    if _logits_width == _hidden_width:
                         logprobs_chunk = efficient_log_softmax(
                             new_hidden_states_chunk,
                             lm_head,
@@ -1050,9 +1091,14 @@ def grpo_accumulated_loss(
                             temperature=temperature,
                             batch_size = B
                         )
-                    else:
+                    elif _logits_width == _vocab_width:
                         # Model returned logits directly - scaling/softcapping already applied by model forward
                         logprobs_chunk = chunked_selective_log_softmax(new_hidden_states_chunk, completion_ids, temperature)
+                    else:
+                        raise RuntimeError(
+                            "Unsloth: model output width does not match either "
+                            "hidden_size or vocab_size in GRPO logprob path."
+                        )
                 #This is needed to avoid race conditions with GPT OSS offload_embbed=True
                 #However, it seems that this line does not slow down or disrupt models.
                 device_synchronize()

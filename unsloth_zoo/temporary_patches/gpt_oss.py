@@ -29,6 +29,7 @@ from .common import (
     UNSLOTH_ENABLE_LOGGING,
     UNSLOTH_COMPILE_DISABLE,
 )
+from ..compile_policy import UNSLOTH_COMPILE_BACKEND
 from importlib.metadata import version as importlib_version
 from ..utils import Version
 transformers_version = Version(importlib_version("transformers"))
@@ -1863,14 +1864,37 @@ pass
 TEMPORARY_PATCHES.append(patch_gpt_oss_linearized)
 
 
+_GPT_OSS_FLEX_ATTENTION_DISABLED_PRINTED = False
+
+
+def _gpt_oss_flex_attention_patch_enabled() -> bool:
+    explicit = os.environ.get("UNSLOTH_ENABLE_GPT_OSS_FLEX_ATTENTION", "").strip()
+    if explicit:
+        return explicit in ("1", "true", "True", "yes", "on")
+    return UNSLOTH_COMPILE_BACKEND == "inductor"
+
+
+def _print_gpt_oss_flex_attention_disabled_once() -> None:
+    global _GPT_OSS_FLEX_ATTENTION_DISABLED_PRINTED
+    if _GPT_OSS_FLEX_ATTENTION_DISABLED_PRINTED:
+        return
+    print(
+        "Unsloth: GPT-OSS Flex Attention patch is disabled; using stock attention for attention sinks."
+    )
+    _GPT_OSS_FLEX_ATTENTION_DISABLED_PRINTED = True
+
+
 def patch_GptOssAttention():
+    if "gpt_oss" not in _normalized_unsloth_model_name(): return
+    if not _gpt_oss_flex_attention_patch_enabled():
+        _print_gpt_oss_flex_attention_disabled_once()
+        return
     if os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0": return
     # Uncompiled flex_attention backward has a dtype bug in PyTorch
     # (sdpa_dense_backward: expected Float got BFloat16). The inplace eager
     # fallback also uses out= matmul which is incompatible with autograd.
     # Skip the patch and let stock transformers eager attention handle sinks.
     if UNSLOTH_COMPILE_DISABLE: return
-    if "gpt_oss" not in _normalized_unsloth_model_name(): return
     try:
         from ..flex_attention import (
             flex_attention_with_sink,
@@ -2396,10 +2420,16 @@ def patch_GptOssModel():
             torch.compiler.cudagraph_mark_step_begin()
             # Initialize for common return path
             all_hidden_states = None
-            for decoder_layer in self.layers:
-                _attn_type = getattr(decoder_layer, "attention_type", None)
+            for i, decoder_layer in enumerate(self.layers):
+                _attn_type = getattr(getattr(decoder_layer, "self_attn", None), "layer_type", None)
+                if _attn_type is None and hasattr(self.config, "layer_types"):
+                    _attn_type = self.config.layer_types[i]
                 if isinstance(attention_mask, dict):
-                    mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
+                    # NVIDIA_REVIEW: GPT-OSS mixes full and sliding attention; keep
+                    # the mask keyed to the exact layer type during generation.
+                    mask = attention_mask.get(_attn_type, None)
+                    if mask is None:
+                        mask = next(iter(attention_mask.values()))
                 else:
                     mask = attention_mask
                 hidden_states, residual = inference_forward(
@@ -2434,7 +2464,7 @@ def patch_GptOssModel():
             # BlockMask and ignores the attention_mask argument entirely.
             # Skip dense 4D mask creation to avoid O(seq_len^2) memory allocation
             # which causes OOM at long context lengths (e.g. 500K tokens).
-            if self.training:
+            if self.training and _gpt_oss_flex_attention_patch_enabled():
                 attention_mask = None
 
             # Accumulate hidden states if requested
@@ -2443,13 +2473,19 @@ def patch_GptOssModel():
             )
             all_hidden_states = () if output_hidden_states else None
 
-            for decoder_layer in self.layers:
+            for i, decoder_layer in enumerate(self.layers):
                 if output_hidden_states:
                     all_hidden_states += (hidden_states,)
 
-                _attn_type = getattr(decoder_layer, "attention_type", None)
+                _attn_type = getattr(getattr(decoder_layer, "self_attn", None), "layer_type", None)
+                if _attn_type is None and hasattr(self.config, "layer_types"):
+                    _attn_type = self.config.layer_types[i]
                 if isinstance(attention_mask, dict):
-                    mask = attention_mask.get(_attn_type) or next(iter(attention_mask.values()))
+                    # NVIDIA_REVIEW: GPT-OSS mixes full and sliding attention; keep
+                    # the mask keyed to the exact layer type during generation.
+                    mask = attention_mask.get(_attn_type, None)
+                    if mask is None:
+                        mask = next(iter(attention_mask.values()))
                 else:
                     mask = attention_mask
                 hidden_states = decoder_layer(

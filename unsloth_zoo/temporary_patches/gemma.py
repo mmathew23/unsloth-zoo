@@ -37,6 +37,29 @@ from .utils import (
 import inspect
 
 _UNSLOTH_FLEX_ATTENTION_DISABLED = os.environ.get("UNSLOTH_ENABLE_FLEX_ATTENTION", "1") == "0"
+try:
+    from ..flex_attention.utils import flex_attention as _flex_attention_fn
+except Exception:
+    _flex_attention_fn = None
+
+
+def _gemma3_flex_attention_available():
+    return (not _UNSLOTH_FLEX_ATTENTION_DISABLED) and _flex_attention_fn is not None
+
+
+def _gemma3_sdpa_attention_mask(attention_mask, dtype = None):
+    if attention_mask is None:
+        return None
+    if not isinstance(attention_mask, torch.Tensor):
+        # Flex BlockMask objects are only valid for flex_attention. If the
+        # runtime has fallen back to SDPA, let SDPA use its causal path rather
+        # than passing an incompatible BlockMask into the kernel.
+        return None
+    if attention_mask.dtype != torch.bool and dtype is not None:
+        return attention_mask.to(dtype)
+    if attention_mask.dtype != torch.bool:
+        return attention_mask.to(torch.float32)
+    return attention_mask
 
 
 def _make_gemma3_attn_forwards(forward_function, has_cache_position):
@@ -408,9 +431,7 @@ def patch_Gemma3Attention():
         query_states_fp32, key_states_fp32 = apply_rotary_pos_emb(query_states_fp32, key_states_fp32, cos = cos_fp32, sin = sin_fp32)
 
         # 6. Core Attention mechanism (SDPA) in fp32
-        attn_mask_for_sdpa = attention_mask
-        if isinstance(attn_mask_for_sdpa, torch.Tensor) and attn_mask_for_sdpa.dtype != torch.bool:
-            attn_mask_for_sdpa = attn_mask_for_sdpa.to(torch.float32)
+        attn_mask_for_sdpa = _gemma3_sdpa_attention_mask(attention_mask)
         return (
             query_states_fp32.contiguous(),
             key_states_fp32.contiguous(),
@@ -514,8 +535,8 @@ def patch_Gemma3Attention():
         """
         # output_attentions = kwargs.get("output_attentions", False)
         attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
-        if _UNSLOTH_FLEX_ATTENTION_DISABLED:
-            attn_impl = "sdpa"
+        if not _gemma3_flex_attention_available():
+            attn_impl = "sdpa"  # cutile-only fallback
         if attn_impl == "flex_attention":
             attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
             attn_output_fp32, attn_weights = attention_interface(
@@ -523,7 +544,7 @@ def patch_Gemma3Attention():
                 query_states_fp32,
                 key_states_fp32,
                 value_states_fp32,
-                attn_mask_for_sdpa,
+                attention_mask,
                 dropout = self.attention_dropout if self.training else 0.0,
                 scaling = getattr(self, "scaling", None),
                 sliding_window = getattr(self, "sliding_window", None),
@@ -642,10 +663,10 @@ def patch_Gemma3Attention_generic():
         query_states_fp32, key_states_fp32 = apply_rotary_pos_emb(query_states_fp32, key_states_fp32, cos = cos_fp32, sin = sin_fp32)
 
         # 6. Core Attention mechanism (SDPA) in fp32
-        attn_mask_for_sdpa = attention_mask
-        if isinstance(attn_mask_for_sdpa, torch.Tensor) and attn_mask_for_sdpa.dtype != torch.bool:
-            attn_mask_for_sdpa = attn_mask_for_sdpa#.to(torch.float32)
-            attn_mask_for_sdpa = attn_mask_for_sdpa.to(query_states_fp32.dtype)
+        attn_mask_for_sdpa = _gemma3_sdpa_attention_mask(
+            attention_mask,
+            dtype = query_states_fp32.dtype,
+        )
         return (
             query_states_fp32.contiguous(),
             key_states_fp32.contiguous(),
@@ -750,8 +771,8 @@ def patch_Gemma3Attention_generic():
         """
         # output_attentions = kwargs.get("output_attentions", False)
         attn_impl = getattr(self.config, "_attn_implementation", "sdpa")
-        if _UNSLOTH_FLEX_ATTENTION_DISABLED:
-            attn_impl = "sdpa"
+        if not _gemma3_flex_attention_available():
+            attn_impl = "sdpa"  # cutile-only fallback
         if attn_impl == "flex_attention":
             attention_interface = ALL_ATTENTION_FUNCTIONS[attn_impl]
             attn_output_fp32, attn_weights = attention_interface(
@@ -759,7 +780,7 @@ def patch_Gemma3Attention_generic():
                 query_states_fp32,
                 key_states_fp32,
                 value_states_fp32,
-                attn_mask_for_sdpa,
+                attention_mask,
                 dropout = self.attention_dropout if self.training else 0.0,
                 scaling = getattr(self, "scaling", None),
                 sliding_window = getattr(self, "sliding_window", None),

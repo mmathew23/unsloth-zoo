@@ -47,7 +47,7 @@ except:
     from typing_extensions import _TypedDictMeta as t_TypedDictMeta
 
 from ..utils import Version
-from .common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compile_options, logger
+from .common import UNSLOTH_ENABLE_LOGGING, UNSLOTH_COMPILE_DISABLE, torch_compile, logger
 
 EMPTY = inspect._empty
 
@@ -578,11 +578,10 @@ def patch_function(
             new_func = new_func.__wrapped__
         if hasattr(original_func, "get_compiler_config"):
             original_func = original_func.__wrapped__
-        new_func = torch.compile(
+        new_func = torch_compile(
             new_func,
             fullgraph = fullgraph,
             dynamic = dynamic,
-            options = torch_compile_options,
         )
     pass
 

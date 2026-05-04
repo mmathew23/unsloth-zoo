@@ -15,7 +15,7 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 __all__ = [
-    "TEMPORARY_PATCHES", 
+    "TEMPORARY_PATCHES",
     "torch_compile_options",
     "UNSLOTH_ENABLE_LOGGING",
     "UNSLOTH_COMPILE_DISABLE",
@@ -23,6 +23,7 @@ __all__ = [
     "logger",
     "torch_compile",
     "_torch_compile",
+    "_make_torch_compile",
 ]
 
 import os
@@ -30,13 +31,30 @@ import sys
 import logging
 from ..log import logger
 import functools
+from .. import compile_policy
 UNSLOTH_ENABLE_LOGGING  = os.environ.get("UNSLOTH_ENABLE_LOGGING",  "0") == "1"
 UNSLOTH_COMPILE_DISABLE = os.environ.get("UNSLOTH_COMPILE_DISABLE", "0") == "1"
 
 # Get only allowed options
 import inspect
 import torch
-inductor_config_source = inspect.getsource(torch._inductor.config)
+
+
+if not compile_policy._is_triton_importable():
+    try:
+        import torch.utils._triton as _torch_triton_utils
+        _torch_triton_utils.has_triton_package = lambda: False
+    except Exception:
+        pass
+
+
+try:
+    inductor_config_source = inspect.getsource(torch._inductor.config)
+except Exception:
+    # Broken or absent Triton can make torch._inductor fail during lazy import.
+    # No-Triton installs default to dynamo_disable. Explicit non-Inductor
+    # torch.compile backends such as aot_eager strip inductor options below.
+    inductor_config_source = ""
 
 @functools.lru_cache(1)
 def determine_compile_threads():
@@ -158,20 +176,71 @@ def noop(*args: Any, **kwargs: Any):
     return _decorator
 pass
 
-if UNSLOTH_COMPILE_DISABLE:
+def _make_torch_compile(default_options):
+    def _warn_compile_fallback(backend, exc):
+        import warnings
+        warnings.warn(
+            f"Unsloth: torch.compile backend '{backend}' failed ({exc!r}); "
+            f"falling back to eager.", stacklevel=2)
+
+    def _compile(fn=None, **kwargs):
+        backend = compile_policy.UNSLOTH_COMPILE_BACKEND
+        if backend == "dynamo_disable":
+            return noop(fn, **kwargs)
+        # When the resolved backend is the torch.compile default ("inductor"),
+        # do NOT pass `backend=` explicitly. Match `functools.partial(
+        # torch.compile, options=...)` byte-for-byte so torch's compile cache
+        # key, options handling, and inductor heuristics behave the same as
+        # they would for a plain `@torch.compile(options=...)` decoration —
+        # critical for matching PyPI's compile-graph fusion (and therefore
+        # peak activation memory + per-step kernel-launch count).
+        if backend == "inductor":
+            if default_options is not None and "options" not in kwargs:
+                kwargs["options"] = default_options
+            compile_kwargs = kwargs
+        else:
+            kwargs.pop("options", None)
+            kwargs.pop("mode", None)
+            compile_kwargs = {**kwargs, "backend": backend}
+        if fn is None or not callable(fn):
+            def _decorator(f):
+                try:
+                    return torch.compile(f, **compile_kwargs)
+                except Exception as e:
+                    _warn_compile_fallback(backend, e)
+                    return f
+            return _decorator
+        try:
+            return torch.compile(fn, **compile_kwargs)
+        except Exception as e:
+            # Fallback to eager (uncompiled) if backend tracing fails
+            _warn_compile_fallback(backend, e)
+            return fn
+    return _compile
+
+if UNSLOTH_COMPILE_DISABLE or compile_policy.UNSLOTH_COMPILE_BACKEND == "dynamo_disable":
     torch_compile = noop
-else:
+    _torch_compile = noop
+elif compile_policy.UNSLOTH_COMPILE_BACKEND == "inductor":
+    # Match PyPI byte-for-byte when running on the default backend. The
+    # `_make_torch_compile` wrapper produces an indistinguishable compiled
+    # result on paper, but its `_compile` closure has different identity
+    # metadata than `functools.partial(torch.compile, ...)`, which can
+    # affect dynamo's inlining decisions when an outer `torch.compile`
+    # (e.g. HF generate's `cache_implementation="static"` decode loop)
+    # encounters an inner `@torch_compile`-decorated function. Using
+    # `functools.partial` here makes the inner-vs-outer decoration
+    # identical to PyPI and lets dynamo inline the inner cleanly,
+    # eliminating the `Torch-Compiled Region: 1/x` boundary that was
+    # adding ~10% wall time on GRPO generate.
     torch_compile = functools.partial(
         torch.compile,
         options = torch_compile_options,
     )
-
-if UNSLOTH_COMPILE_DISABLE:
-    _torch_compile = noop
+    _torch_compile = functools.partial(torch.compile)
 else:
-    _torch_compile = functools.partial(
-        torch.compile,
-    )
+    torch_compile = _make_torch_compile(torch_compile_options)
+    _torch_compile = _make_torch_compile(default_options=None)
 
 global TEMPORARY_PATCHES
 TEMPORARY_PATCHES = []

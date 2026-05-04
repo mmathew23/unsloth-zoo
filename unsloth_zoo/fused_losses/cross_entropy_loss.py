@@ -26,7 +26,7 @@ import inspect
 import functools
 import math
 import os
-from ..temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from ..temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, torch_compile, logger
 from ..device_type import DEVICE_TYPE
         
 
@@ -158,6 +158,12 @@ def get_chunk_size(bsz, qlen, vocab_size, target_gb = None):
     n_splits = max(round(n_splits) * 4, 1)
     return n_splits
 pass
+
+# Capture the module-level torch_compile function before UnslothFusedLoss is defined.
+# This avoids the parameter name `torch_compile` in forward() shadowing this module-level
+# name, which would cause `torch_compile(accumulate_chunk, ...)` to call `True(...)` and
+# immediately set _FUSED_CE_COMPILE_SUPPORTED = False (TypeError: 'bool' not callable).
+_module_torch_compile = torch_compile
 
 class UnslothFusedLoss(torch.autograd.Function):
     # One-time flag so the "scaling=0" info message is logged at most once per
@@ -327,11 +333,10 @@ class UnslothFusedLoss(torch.autograd.Function):
 
         if torch_compile and _FUSED_CE_COMPILE_SUPPORTED is not False:
             try:
-                accumulate_chunk = torch.compile(
+                accumulate_chunk = _module_torch_compile(
                     accumulate_chunk,
                     dynamic = True,
                     fullgraph = True,
-                    options = torch_compile_options,
                 )
             except Exception:
                 _FUSED_CE_COMPILE_SUPPORTED = False

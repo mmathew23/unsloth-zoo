@@ -21,9 +21,17 @@ import math
 import functools
 from typing import Optional
 torch_nn_functional_cross_entropy = torch.nn.functional.cross_entropy
-from triton import __version__ as triton_version
+try:
+    from triton import __version__ as triton_version
+except Exception:
+    triton_version = "0.0.0"
 from . import DEVICE_TYPE
-from .temporary_patches.common import UNSLOTH_ENABLE_LOGGING, torch_compile_options, logger
+from .temporary_patches.common import (
+    UNSLOTH_ENABLE_LOGGING,
+    torch_compile_options,
+    torch_compile as _module_torch_compile,
+    logger,
+)
 import inspect
 
 global HAS_CUT_CROSS_ENTROPY
@@ -38,8 +46,7 @@ pass
 if DEVICE_TYPE == "cuda":
     major, minor = torch.cuda.get_device_capability()
     if (Version(torch.__version__) >= Version("2.4.0")) and \
-        (not ((major <= 7) and (minor < 5))) and \
-        (not (Version(triton_version) < Version("3.0.0"))):
+        (not ((major <= 7) and (minor < 5))):
         try:
             from cut_cross_entropy import linear_cross_entropy
             HAS_CUT_CROSS_ENTROPY = True
@@ -126,11 +133,10 @@ def patch_loss_functions(_fast_cross_entropy_loss, torch_compile = True):
         UnslothForCausalLMLoss = torch._disable_dynamo(UnslothForCausalLMLoss)
     
     elif torch_compile:
-        UnslothForCausalLMLoss = torch.compile(
+        UnslothForCausalLMLoss = _module_torch_compile(
             UnslothForCausalLMLoss,
             dynamic = True,
             fullgraph = False,
-            options = torch_compile_options,
         )
     pass
 
