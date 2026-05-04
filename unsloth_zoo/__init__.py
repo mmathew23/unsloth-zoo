@@ -310,4 +310,14 @@ try:
 except:
     pass
 
+# Install integrated-GPU loader patches for transformers >= 5.5.0 on
+# unified-memory devices (Spark / GB10 / is_integrated=1). No-ops on discrete
+# GPUs and on transformers < 5.5.0. See unsloth_zoo/integrated_gpu_loader.py
+# for the full rationale.
+try:
+    from .integrated_gpu_loader import apply_integrated_gpu_loader_patches
+    apply_integrated_gpu_loader_patches()
+except Exception:
+    pass
+
 del os, warnings, re
