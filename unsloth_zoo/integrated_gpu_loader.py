@@ -111,7 +111,7 @@ _LOAD_STATE_DICT_CONFIG_FIELDS = frozenset({
     "dtype",
 })
 
-_ACCELERATE_DISK_OFFLOAD_MIN_POSITIONAL = 7
+_ACCELERATE_DISK_OFFLOAD_POSITIONAL = 7
 # model, folder, files, device_map, sharded_metadata, dtype, weight_mapping
 
 _STRING_DEVICE_MAPS = ("auto", "sequential", "balanced", "balanced_low_0")
@@ -189,11 +189,21 @@ def _signature_has_exact_params(fn, expected: tuple[str, ...]) -> tuple[bool, st
 
 
 def _signature_accepts_kwargs(fn, required: frozenset[str]) -> tuple[bool, str]:
-    """``fn`` must accept every name in ``required`` AS A KEYWORD argument.
+    """``fn`` must be callable with exactly the keyword arguments in
+    ``required``.
 
-    A ``**kwargs`` parameter passes the check unconditionally. Otherwise
-    every required name must be present AND not POSITIONAL_ONLY (those
-    cannot be passed by name even if they exist with the right name).
+    Three failure modes, each fail-closed:
+      * a required positional-only parameter (cannot be passed by name);
+      * a required name we'd pass that ``fn`` doesn't have AND ``fn``
+        has no ``**kwargs`` to absorb it;
+      * an additional REQUIRED parameter on ``fn`` that we don't pass
+        (positional-or-keyword or keyword-only with no default). A
+        ``**kwargs`` parameter does NOT silence this check, since extras
+        in **kwargs cannot satisfy a required named parameter.
+
+    Positional-only parameters with defaults are tolerated (they may
+    legitimately exist alongside our keyword call as long as they're
+    optional).
     """
     import inspect
 
@@ -201,36 +211,93 @@ def _signature_accepts_kwargs(fn, required: frozenset[str]) -> tuple[bool, str]:
         params = inspect.signature(fn).parameters
     except (TypeError, ValueError) as exc:
         return False, f"{fn!r} not introspectable: {exc!r}"
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return True, ""
-    missing_or_posonly = {
+
+    has_varkw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+    )
+
+    # 1) positional-only blockers: required names that cannot be passed
+    #    by name, AND positional-only params with no default that we'd
+    #    skip past entirely with our keyword call.
+    positional_only_blockers = {
         name
-        for name in required
-        if name not in params
-        or params[name].kind == inspect.Parameter.POSITIONAL_ONLY
+        for name, param in params.items()
+        if param.kind == inspect.Parameter.POSITIONAL_ONLY
+        and (name in required or param.default is inspect.Parameter.empty)
     }
-    if missing_or_posonly:
+    if positional_only_blockers:
         return False, (
-            f"missing keyword-compatible params {missing_or_posonly} "
-            f"(got {tuple(params.keys())})"
+            f"positional-only params incompatible with keyword call "
+            f"{positional_only_blockers} (got {tuple(params.keys())})"
         )
+
+    # 2) named-presence: every required name must be findable, unless
+    #    **kwargs is present to absorb it.
+    if not has_varkw:
+        missing = required - set(params)
+        if missing:
+            return False, (
+                f"missing keyword-compatible params {missing} "
+                f"(got {tuple(params.keys())})"
+            )
+
+    # 3) extra-required: positional-or-keyword / keyword-only params
+    #    without defaults that we don't pass. **kwargs does NOT cover
+    #    these -- they are required NAMES.
+    extra_required = {
+        name
+        for name, param in params.items()
+        if name not in required
+        and param.default is inspect.Parameter.empty
+        and param.kind
+        in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    }
+    if extra_required:
+        return False, (
+            f"has additional required params {extra_required} "
+            f"that this patch does not pass"
+        )
+
     return True, ""
 
 
-def _signature_has_min_positional(
-    fn, minimum: int
-) -> tuple[bool, str]:
-    """``fn`` must accept at least ``minimum`` positional args. ``*args``
-    counts as accepting arbitrary positional arity."""
+def _signature_accepts_n_positionals(fn, n: int) -> tuple[bool, str]:
+    """``fn`` must be callable with EXACTLY ``n`` positional arguments.
+
+    Three failure modes, each fail-closed:
+      * required keyword-only parameters (we only pass positionals);
+      * more required positional params than ``n`` (we'd be missing some);
+      * fewer accepting positional params than ``n`` AND no ``*args``
+        to absorb the overflow.
+
+    Optional positional params past ``n`` are fine.
+    """
     import inspect
 
     try:
         params = list(inspect.signature(fn).parameters.values())
     except (TypeError, ValueError) as exc:
         return False, f"{fn!r} not introspectable: {exc!r}"
-    if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params):
-        return True, ""
-    named_positional = [
+
+    required_kwonly = [
+        p.name
+        for p in params
+        if p.kind == inspect.Parameter.KEYWORD_ONLY
+        and p.default is inspect.Parameter.empty
+    ]
+    if required_kwonly:
+        return False, (
+            f"has required keyword-only params {required_kwonly} "
+            f"that this patch's positional call does not pass"
+        )
+
+    has_varargs = any(
+        p.kind == inspect.Parameter.VAR_POSITIONAL for p in params
+    )
+    positional = [
         p
         for p in params
         if p.kind
@@ -239,10 +306,20 @@ def _signature_has_min_positional(
             inspect.Parameter.POSITIONAL_OR_KEYWORD,
         )
     ]
-    if len(named_positional) < minimum:
+    required_positional = [
+        p for p in positional if p.default is inspect.Parameter.empty
+    ]
+
+    if len(required_positional) > n:
         return False, (
-            f"arity changed: got {tuple(p.name for p in params)}, "
-            f"expected at least {minimum} positional"
+            f"requires {len(required_positional)} positional args "
+            f"({tuple(p.name for p in required_positional)}), "
+            f"but patch passes {n}"
+        )
+    if not has_varargs and len(positional) < n:
+        return False, (
+            f"accepts only {len(positional)} positional args, "
+            f"but patch passes {n}"
         )
     return True, ""
 
@@ -294,8 +371,8 @@ def _check_symbols() -> tuple[bool, str]:
             convert_and_load_state_dict_in_model, _CONVERT_AND_LOAD_REQUIRED_KWARGS
         ),
         _signature_accepts_kwargs(_get_device_map, _GET_DEVICE_MAP_REQUIRED_KWARGS),
-        _signature_has_min_positional(
-            accelerate_disk_offload, _ACCELERATE_DISK_OFFLOAD_MIN_POSITIONAL
+        _signature_accepts_n_positionals(
+            accelerate_disk_offload, _ACCELERATE_DISK_OFFLOAD_POSITIONAL
         ),
         _dataclass_has_fields(LoadStateDictInfo, _LOAD_STATE_DICT_INFO_FIELDS),
         _dataclass_has_fields(LoadStateDictConfig, _LOAD_STATE_DICT_CONFIG_FIELDS),
@@ -547,13 +624,26 @@ def _is_pre_quantized_load(load_config) -> bool:
 def _build_routed_get_device_map(original):
     @functools.wraps(original)
     def _routed_get_device_map(model, device_map, max_memory, hf_quantizer):
+        # Use keyword calls everywhere so the runtime contract matches
+        # what `_signature_accepts_kwargs(_GET_DEVICE_MAP_REQUIRED_KWARGS)`
+        # validates at install time. If upstream ever reorders parameters,
+        # a positional call could pass the wrong values without the probe
+        # noticing.
+        def call_original(_max_memory):
+            return original(
+                model=model,
+                device_map=device_map,
+                max_memory=_max_memory,
+                hf_quantizer=hf_quantizer,
+            )
+
         if not (
             _is_integrated_gpu()
             and hf_quantizer is not None
             and isinstance(device_map, str)
             and device_map in _STRING_DEVICE_MAPS
         ):
-            return original(model, device_map, max_memory, hf_quantizer)
+            return call_original(max_memory)
 
         # Single-GPU branch coerces to {"": cur}; multi-GPU branch keeps
         # balanced/sequential intent and only zeros the cpu bucket. Never
@@ -589,7 +679,7 @@ def _build_routed_get_device_map(original):
                     coerced,
                     exc,
                 )
-                return original(model, device_map, max_memory, hf_quantizer)
+                return call_original(max_memory)
             return coerced
 
         # Multi-GPU integrated. Force cpu=0 so the original infer path
@@ -605,7 +695,7 @@ def _build_routed_get_device_map(original):
             adjusted["cpu"] = 0
         except Exception:
             adjusted = max_memory
-        return original(model, device_map, adjusted, hf_quantizer)
+        return call_original(adjusted)
 
     _routed_get_device_map._is_unsloth_routed = True
     return _routed_get_device_map
@@ -954,15 +1044,16 @@ def _build_routed_load_pretrained_model(original):
 def apply_integrated_gpu_loader_patches() -> bool:
     """Idempotently install the routed wrappers when the gate fires.
 
-    Safe to call multiple times — the ``_PATCH_FLAG_ATTR`` flag on
-    ``PreTrainedModel`` short-circuits subsequent invocations. If a
-    third-party module reloads ``transformers.modeling_utils`` later
-    (rare; not done by accelerate, peft, or transformers itself), the
-    reloaded ``PreTrainedModel`` is a fresh class object and our
-    staticmethod patch is on the old one. To re-arm after a reload,
-    invoke this function again — the flag check looks up the new class.
-    The same is true of
-    ``transformers.integrations.accelerate._get_device_map``.
+    Safe to call multiple times. Patch A (``_get_device_map``) is checked
+    and re-armed on every call; the ``_PATCH_FLAG_ATTR`` flag on
+    ``PreTrainedModel`` only short-circuits Patch B
+    (``_load_pretrained_model``). This split matters after a third-party
+    ``importlib.reload(transformers.integrations.accelerate)`` resets the
+    ``_get_device_map`` symbol -- re-invoking this function re-arms Patch
+    A even if PreTrainedModel still carries the stale flag from a prior
+    install. Reloading ``transformers.modeling_utils`` produces a fresh
+    ``PreTrainedModel`` class, so the flag is False on it and Patch B is
+    re-installed normally.
     """
     if not _should_patch():
         return False
@@ -1007,13 +1098,14 @@ def apply_integrated_gpu_loader_patches() -> bool:
             accel_int._get_device_map
         )
     # transformers/modeling_utils.py imports the symbol locally at module
-    # load (5.5.0 line ~4113). Rebind mu._get_device_map to the routed
-    # version even if accel_int was already routed -- this matters after
-    # ``importlib.reload(transformers.modeling_utils)`` resets mu to the
-    # original.
-    if hasattr(mu, "_get_device_map") and not getattr(
-        mu._get_device_map, "_is_unsloth_routed", False
-    ):
+    # load (5.5.0 line ~4113). ALWAYS rebind ``mu._get_device_map`` to
+    # the current ``accel_int._get_device_map`` -- not just when mu's
+    # binding lacks ``_is_unsloth_routed``. Otherwise after
+    # ``importlib.reload(transformers.integrations.accelerate)`` we
+    # could end up with mu pointing at a stale routed closure that
+    # closes over the OLD original, while accel_int has the new wrapper
+    # closing over the new original.
+    if hasattr(mu, "_get_device_map"):
         mu._get_device_map = accel_int._get_device_map
 
     # Patch B: skip only if the model class itself has been flagged.
@@ -1033,7 +1125,10 @@ def apply_integrated_gpu_loader_patches() -> bool:
     setattr(mu.PreTrainedModel, _PATCH_FLAG_ATTR, True)
 
     logger.info(
-        "Unsloth: installed integrated-GPU loader patches (transformers=%s, is_integrated=1)",
+        "Unsloth: installed integrated-GPU loader patches "
+        "(transformers=%s, detected_integrated=%s, override=%r)",
         transformers.__version__,
+        _detect_integrated_gpu(),
+        _integrated_gpu_override(),
     )
     return True
