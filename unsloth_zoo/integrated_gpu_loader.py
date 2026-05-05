@@ -14,6 +14,31 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+"""Integrated GPU loader patch for unified-memory hosts.
+
+Wraps two transformers symbols when running on an integrated-memory GPU
+(NVIDIA GB10 / Spark, where ``torch.cuda.get_device_properties(0).is_integrated == 1``)
+and transformers >= ``_MIN_VERSION``:
+
+* ``transformers.integrations.accelerate._get_device_map`` — coerce
+  string device_maps so ``infer_auto_device_map`` doesn't scatter modules
+  to ``"cpu"`` (which on unified memory is the same pool the GPUs see).
+* ``transformers.modeling_utils.PreTrainedModel._load_pretrained_model``
+  — stream pre-quantized safetensors shards one at a time instead of
+  pre-allocating the full footprint and mmap'ing every shard upfront.
+
+Design constraints:
+  * Patch ONLY when the hardware/env/version gates pass.
+  * NEVER fall back to the original loader after possible model mutation.
+  * Stream ONLY pre-quantized checkpoints.
+  * DECLINE streaming when weight converters require cross-shard fusion.
+
+Override the auto-detection with ``UNSLOTH_INTEGRATED_GPU_LOADER=1``
+(force on) or ``=0`` (force off).
+
+Background, regressions, and empirical results: see
+``docs/integrated_gpu_loader.md``.
+"""
 from __future__ import annotations
 
 import functools
@@ -38,24 +63,103 @@ _PATCH_FLAG_ATTR = "_unsloth_integrated_loader_patched"
 _MIN_VERSION = "5.0.0"
 
 
-def _is_integrated_gpu(index: int = 0) -> bool:
-    override = os.environ.get("UNSLOTH_INTEGRATED_GPU_LOADER", "").strip()
-    if override == "1":
+# ---------------------------------------------------------------------------
+# Compatibility contract with transformers internals.
+# These constants document the surface area we monkey-patch against;
+# `_check_symbols` validates each one at install time.
+# ---------------------------------------------------------------------------
+
+_LOAD_PRETRAINED_MODEL_PARAMS = (
+    "model",
+    "state_dict",
+    "checkpoint_files",
+    "load_config",
+    "expected_keys",
+)
+
+_CONVERT_AND_LOAD_REQUIRED_KWARGS = frozenset({
+    "model",
+    "state_dict",
+    "load_config",
+    "tp_plan",
+    "disk_offload_index",
+})
+
+_GET_DEVICE_MAP_REQUIRED_KWARGS = frozenset({
+    "model",
+    "device_map",
+    "max_memory",
+    "hf_quantizer",
+})
+
+_LOAD_STATE_DICT_INFO_FIELDS = frozenset({
+    "missing_keys",
+    "unexpected_keys",
+    "mismatched_keys",
+    "error_msgs",
+    "conversion_errors",
+})
+
+_LOAD_STATE_DICT_CONFIG_FIELDS = frozenset({
+    "device_map",
+    "disable_mmap",
+    "weights_only",
+    "hf_quantizer",
+    "weight_mapping",
+    "sharded_metadata",
+    "disk_offload_folder",
+    "dtype",
+})
+
+_ACCELERATE_DISK_OFFLOAD_MIN_POSITIONAL = 7
+# model, folder, files, device_map, sharded_metadata, dtype, weight_mapping
+
+_STRING_DEVICE_MAPS = ("auto", "sequential", "balanced", "balanced_low_0")
+
+
+# ---------------------------------------------------------------------------
+# Hardware + environment detection
+# ---------------------------------------------------------------------------
+
+
+def _integrated_gpu_override() -> bool | None:
+    """Parse ``UNSLOTH_INTEGRATED_GPU_LOADER``. Returns ``True`` (force on),
+    ``False`` (force off), or ``None`` (no override).
+    """
+    value = os.environ.get("UNSLOTH_INTEGRATED_GPU_LOADER", "").strip()
+    if value == "1":
         return True
-    if override == "0":
+    if value == "0":
         return False
+    return None
+
+
+def _detect_integrated_gpu(index: int = 0) -> bool:
+    """Hardware-only probe: True iff CUDA device ``index`` reports
+    ``is_integrated == 1`` (NVIDIA GB10 / Spark). Ignores the env override.
+    """
     try:
         import torch
 
         if not torch.cuda.is_available():
             return False
-        return getattr(torch.cuda.get_device_properties(index), "is_integrated", 0) == 1
+        props = torch.cuda.get_device_properties(index)
+        return getattr(props, "is_integrated", 0) == 1
     except Exception:
         return False
 
 
+def _is_integrated_gpu(index: int = 0) -> bool:
+    """Composed gate used everywhere internally: env override wins, else
+    hardware detection."""
+    override = _integrated_gpu_override()
+    if override is not None:
+        return override
+    return _detect_integrated_gpu(index)
+
+
 def _transformers_at_least_min() -> bool:
-    """True if transformers >= _MIN_VERSION (no upper bound)."""
+    """True if transformers >= ``_MIN_VERSION`` (no upper bound)."""
     try:
         from importlib.metadata import version
 
@@ -66,22 +170,100 @@ def _transformers_at_least_min() -> bool:
         return False
 
 
-def _check_symbols() -> tuple[bool, str]:
-    """Verify every transformers symbol/signature we depend on still has
-    the shape we expect. Returns (ok, reason).
-    """
-    try:
-        import inspect
+# ---------------------------------------------------------------------------
+# Symbol-shape probes (composed by `_check_symbols`)
+# ---------------------------------------------------------------------------
 
+
+def _signature_has_exact_params(fn, expected: tuple[str, ...]) -> tuple[bool, str]:
+    """``fn`` must have exactly these parameter names in this order."""
+    import inspect
+
+    try:
+        actual = tuple(inspect.signature(fn).parameters.keys())
+    except (TypeError, ValueError) as exc:
+        return False, f"{fn!r} not introspectable: {exc!r}"
+    if actual != expected:
+        return False, f"signature changed: got {actual}, expected {expected}"
+    return True, ""
+
+
+def _signature_accepts_kwargs(fn, required: frozenset[str]) -> tuple[bool, str]:
+    """``fn`` must accept every name in ``required`` as a kwarg."""
+    import inspect
+
+    try:
+        actual = set(inspect.signature(fn).parameters.keys())
+    except (TypeError, ValueError) as exc:
+        return False, f"{fn!r} not introspectable: {exc!r}"
+    missing = required - actual
+    if missing:
+        return False, f"missing kwargs {missing} (got {actual})"
+    return True, ""
+
+
+def _signature_has_min_positional(
+    fn, minimum: int
+) -> tuple[bool, str]:
+    """``fn`` must accept at least ``minimum`` positional args. ``*args``
+    counts as accepting arbitrary positional arity."""
+    import inspect
+
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError) as exc:
+        return False, f"{fn!r} not introspectable: {exc!r}"
+    if any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params):
+        return True, ""
+    named_positional = [
+        p
+        for p in params
+        if p.kind
+        in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    if len(named_positional) < minimum:
+        return False, (
+            f"arity changed: got {tuple(p.name for p in params)}, "
+            f"expected at least {minimum} positional"
+        )
+    return True, ""
+
+
+def _dataclass_has_fields(cls, required: frozenset[str]) -> tuple[bool, str]:
+    """``cls`` must be a dataclass with every name in ``required`` as a field."""
+    fields_attr = getattr(cls, "__dataclass_fields__", None)
+    if fields_attr is None:
+        return False, f"{cls.__name__} is no longer a dataclass"
+    actual = set(fields_attr.keys())
+    missing = required - actual
+    if missing:
+        return False, f"{cls.__name__} missing fields {missing} (got {actual})"
+    return True, ""
+
+
+def _check_symbols() -> tuple[bool, str]:
+    """Verify every transformers symbol/signature we depend on. Returns
+    ``(ok, reason)``; ``reason`` is empty on success."""
+    try:
         from safetensors import safe_open  # noqa: F401
-        from transformers.core_model_loading import convert_and_load_state_dict_in_model
+        from transformers.core_model_loading import (  # noqa: F401
+            Concatenate,
+            MergeModulelist,
+            WeightConverter,
+            convert_and_load_state_dict_in_model,
+        )
         from transformers.integrations.accelerate import _get_device_map
         from transformers.modeling_utils import (
+            LoadStateDictConfig,
             PreTrainedModel,
-            accelerate_disk_offload,  # noqa: F401
+            accelerate_disk_offload,
             is_deepspeed_zero3_enabled,  # noqa: F401
             load_state_dict,  # noqa: F401
         )
+        from transformers.quantizers.base import HfQuantizer  # noqa: F401
         from transformers.utils.loading_report import LoadStateDictInfo
         from transformers.utils.quantization_config import (
             QuantizationMethod,  # noqa: F401
@@ -89,167 +271,40 @@ def _check_symbols() -> tuple[bool, str]:
     except Exception as e:
         return False, f"import failed: {e!r}"
 
-    # 1. _load_pretrained_model must be a staticmethod with our 5-arg shape.
-    try:
-        sig = inspect.signature(PreTrainedModel._load_pretrained_model)
-    except (TypeError, ValueError) as e:
-        return False, f"_load_pretrained_model not introspectable: {e!r}"
-    expected_lpm = (
-        "model",
-        "state_dict",
-        "checkpoint_files",
-        "load_config",
-        "expected_keys",
-    )
-    if tuple(sig.parameters.keys()) != expected_lpm:
-        return False, (
-            f"_load_pretrained_model signature changed: "
-            f"got {tuple(sig.parameters.keys())}, expected {expected_lpm}"
-        )
-
-    # 2. convert_and_load_state_dict_in_model must accept the kwargs we pass.
-    try:
-        sig2 = inspect.signature(convert_and_load_state_dict_in_model)
-    except (TypeError, ValueError) as e:
-        return False, f"convert_and_load_state_dict_in_model not introspectable: {e!r}"
-    needed_calsdim = {
-        "model",
-        "state_dict",
-        "load_config",
-        "tp_plan",
-        "disk_offload_index",
-    }
-    actual_calsdim = set(sig2.parameters.keys())
-    if not needed_calsdim.issubset(actual_calsdim):
-        return False, (
-            f"convert_and_load_state_dict_in_model missing kwargs "
-            f"{needed_calsdim - actual_calsdim} (got {actual_calsdim})"
-        )
-
-    # 3. LoadStateDictInfo must be a dataclass with exactly the fields we
-    #    read+write during the per-shard merge.
-    needed_fields = {
-        "missing_keys",
-        "unexpected_keys",
-        "mismatched_keys",
-        "error_msgs",
-        "conversion_errors",
-    }
-    fields_attr = getattr(LoadStateDictInfo, "__dataclass_fields__", None)
-    if fields_attr is None:
-        return False, "LoadStateDictInfo no longer a dataclass"
-    fields = set(fields_attr.keys())
-    if not needed_fields.issubset(fields):
-        return False, (
-            f"LoadStateDictInfo missing fields {needed_fields - fields} (got {fields})"
-        )
-
-    # 4. _get_device_map signature.
-    try:
-        sig3 = inspect.signature(_get_device_map)
-    except (TypeError, ValueError) as e:
-        return False, f"_get_device_map not introspectable: {e!r}"
-    needed_gdm = {"model", "device_map", "max_memory", "hf_quantizer"}
-    actual_gdm = set(sig3.parameters.keys())
-    if not needed_gdm.issubset(actual_gdm):
-        return False, (
-            f"_get_device_map missing kwargs {needed_gdm - actual_gdm} "
-            f"(got {actual_gdm})"
-        )
-
-    # 5. accelerate_disk_offload accepts the 7 positional args we pass.
-    #    A *args-style signature passes the check (VAR_POSITIONAL absorbs
-    #    arbitrary positional arity); we only fail if there are NO *args
-    #    AND fewer than 7 named positional/keyword slots.
-    try:
-        sig4 = inspect.signature(accelerate_disk_offload)
-    except (TypeError, ValueError) as e:
-        return False, f"accelerate_disk_offload not introspectable: {e!r}"
-    needed_ado = 7  # model, folder, files, device_map, sharded_metadata, dtype, weight_mapping
-    has_var_positional = any(
-        p.kind == inspect.Parameter.VAR_POSITIONAL
-        for p in sig4.parameters.values()
-    )
-    named_positional = [
-        p
-        for p in sig4.parameters.values()
-        if p.kind
-        in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        )
+    checks: list[tuple[bool, str]] = [
+        _signature_has_exact_params(
+            PreTrainedModel._load_pretrained_model, _LOAD_PRETRAINED_MODEL_PARAMS
+        ),
+        _signature_accepts_kwargs(
+            convert_and_load_state_dict_in_model, _CONVERT_AND_LOAD_REQUIRED_KWARGS
+        ),
+        _signature_accepts_kwargs(_get_device_map, _GET_DEVICE_MAP_REQUIRED_KWARGS),
+        _signature_has_min_positional(
+            accelerate_disk_offload, _ACCELERATE_DISK_OFFLOAD_MIN_POSITIONAL
+        ),
+        _dataclass_has_fields(LoadStateDictInfo, _LOAD_STATE_DICT_INFO_FIELDS),
+        _dataclass_has_fields(LoadStateDictConfig, _LOAD_STATE_DICT_CONFIG_FIELDS),
     ]
-    if not has_var_positional and len(named_positional) < needed_ado:
-        return False, (
-            f"accelerate_disk_offload arity changed: got "
-            f"{tuple(sig4.parameters.keys())}, expected at least {needed_ado} positional"
-        )
+    for ok, reason in checks:
+        if not ok:
+            return False, reason
 
-    # 6. LoadStateDictConfig fields we consume by name.
-    try:
-        from transformers.modeling_utils import LoadStateDictConfig
-    except Exception as e:
-        return False, f"LoadStateDictConfig import failed: {e!r}"
-    needed_lsdc_fields = {
-        "device_map",
-        "disable_mmap",
-        "weights_only",
-        "hf_quantizer",
-        "weight_mapping",
-        "sharded_metadata",
-        "disk_offload_folder",
-        "dtype",
-    }
-    fields_attr = getattr(LoadStateDictConfig, "__dataclass_fields__", None)
-    if fields_attr is None:
-        return False, "LoadStateDictConfig no longer a dataclass"
-    lsdc_fields = set(fields_attr.keys())
-    if not needed_lsdc_fields.issubset(lsdc_fields):
-        return False, (
-            f"LoadStateDictConfig missing fields "
-            f"{needed_lsdc_fields - lsdc_fields} (got {lsdc_fields})"
-        )
-    # is_quantized is a @property, not a dataclass field.
+    # Property + attribute checks that don't fit the helpers above.
     if not hasattr(LoadStateDictConfig, "is_quantized"):
         return False, "LoadStateDictConfig has no is_quantized property"
-
-    # 7. tp_plan must be a property on PreTrainedModel (returns _tp_plan or
-    #    _ep_plan depending on config.distributed_config.enable_expert_parallel).
     if not isinstance(PreTrainedModel.__dict__.get("tp_plan"), property):
         return False, "PreTrainedModel.tp_plan is no longer a property"
-
-    # 8. HfQuantizer base class import. ``pre_quantized`` is an instance
-    #    attribute set in ``__init__``, so we cannot probe for it on the
-    #    class; ``_is_pre_quantized_load`` does a ``getattr(..., False)``
-    #    at runtime which covers a future removal gracefully.
-    try:
-        from transformers.quantizers.base import HfQuantizer  # noqa: F401
-    except Exception as e:
-        return False, f"HfQuantizer import failed: {e!r}"
-
-    # 9. WeightConverter + the hazardous fusion ops we gate against. If a
-    #    future transformers renames any of these, ``_has_cross_shard_fusion``
-    #    fails open (returns True conservatively). Decline patches entirely
-    #    so the user runs the original loader.
-    try:
-        from transformers.core_model_loading import (  # noqa: F401
-            Concatenate,
-            MergeModulelist,
-            WeightConverter,
-        )
-    except Exception as e:
-        return False, f"WeightConverter / fusion ops import failed: {e!r}"
 
     return True, ""
 
 
-def _required_symbols_present() -> bool:
-    ok, _reason = _check_symbols()
-    return ok
-
-
 def _should_patch() -> bool:
-    """Binary decision: install the patches, or leave transformers alone."""
+    """Binary decision: install the patches, or leave transformers alone.
+
+    Declines on discrete GPUs, on transformers < ``_MIN_VERSION``, and on
+    any signature/symbol mismatch from ``_check_symbols``. Mismatches log
+    a WARNING so future upstream churn is visible at import time.
+    """
     if not _is_integrated_gpu():
         return False
     if not _transformers_at_least_min():
@@ -272,6 +327,18 @@ def _should_patch() -> bool:
 
 def _has_disk_offload(device_map: Any) -> bool:
     return isinstance(device_map, dict) and "disk" in device_map.values()
+
+
+def _is_safetensors_file(path: Any) -> bool:
+    """Tolerant of pathlib.Path / os.PathLike inputs."""
+    return str(path).endswith(".safetensors")
+
+
+def _as_set(value: Any) -> set:
+    """Defensive set() wrapper — tolerates None and arbitrary iterables.
+    Used to normalize ``LoadStateDictInfo`` set-like fields whose runtime
+    type isn't strictly guaranteed by the upstream contract."""
+    return set(value or ())
 
 
 _PAGE_CACHE_FAIL_LOGGED = False
@@ -330,30 +397,32 @@ def _drop_file_page_cache(path: str) -> None:
 
 
 def _merge_loading_infos(model, per_shard_infos):
+    """Combine per-shard ``LoadStateDictInfo`` into one matching a single-call
+    invocation. Per-shard ``missing_keys`` is seeded with the full model
+    state-dict and removes only what the shard loaded; intersecting across
+    shards yields the truly-missing set. Other fields are unioned;
+    ``conversion_errors`` merges first-write-wins via ``ChainMap``."""
     from transformers.utils.loading_report import LoadStateDictInfo
 
     if not per_shard_infos:
-        all_keys = set(model.state_dict().keys())
         return LoadStateDictInfo(
-            missing_keys=all_keys,
+            missing_keys=set(model.state_dict().keys()),
             unexpected_keys=set(),
             mismatched_keys=set(),
             error_msgs=[],
             conversion_errors={},
         )
 
-    missing = set(per_shard_infos[0].missing_keys)
-    for li in per_shard_infos[1:]:
-        missing &= li.missing_keys
-
-    unexpected = set()
-    mismatched = set()
+    missing = _as_set(per_shard_infos[0].missing_keys)
+    unexpected: set = set()
+    mismatched: set = set()
     errors: list[str] = []
     convs_chain: list[dict[str, str]] = []
     for li in per_shard_infos:
-        unexpected |= li.unexpected_keys
-        mismatched |= li.mismatched_keys
-        errors.extend(li.error_msgs)
+        missing &= _as_set(li.missing_keys)
+        unexpected |= _as_set(li.unexpected_keys)
+        mismatched |= _as_set(li.mismatched_keys)
+        errors.extend(li.error_msgs or [])
         if li.conversion_errors:
             convs_chain.append(li.conversion_errors)
     convs = dict(ChainMap(*convs_chain)) if convs_chain else {}
@@ -367,11 +436,79 @@ def _merge_loading_infos(model, per_shard_infos):
     )
 
 
+def _has_cross_shard_fusion(load_config) -> bool:
+    """True if ``weight_mapping`` contains a multi-source ``WeightConverter``
+    whose operations need every matching source tensor live in one
+    ``convert()`` call.
+
+    Hazardous ops (verified by inspection of
+    ``transformers.core_model_loading``): ``MergeModulelist`` (fuses N
+    tensors along dim 0) and ``Concatenate`` (concatenates source
+    patterns). Both iterate ``source_patterns`` against ``input_dict`` and
+    silently produce a wrong-shape merged tensor when sources are split
+    across shards.
+
+    Single-source converters (PermuteForRope, Transpose, Chunk, etc.) are
+    safe under per-shard splits because each call independently reproduces
+    the transform.
+
+    Fail-safe on import failure: if ``WeightConverter`` or the hazardous
+    op classes can't be imported, return True so the patch declines
+    streaming rather than silently streaming a fusion load.
+    ``_check_symbols`` also probes these imports at install time so a
+    rename declines patches entirely.
+    """
+    try:
+        from transformers.core_model_loading import (
+            Concatenate,
+            MergeModulelist,
+            WeightConverter,
+        )
+    except Exception:
+        return True
+    hazardous = (MergeModulelist, Concatenate)
+    wm = getattr(load_config, "weight_mapping", None) or []
+    for entry in wm:
+        if not isinstance(entry, WeightConverter):
+            continue
+        try:
+            sources = getattr(entry, "source_patterns", []) or []
+            if len(sources) <= 1:
+                continue
+            ops = getattr(entry, "operations", []) or []
+            if any(isinstance(op, hazardous) for op in ops):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _is_pre_quantized_load(load_config) -> bool:
+    """True iff the checkpoint is already fully quantized.
+
+    Streaming is safe only when each shard's keys map directly onto model
+    params. On-the-fly quantization (fp16/bf16 checkpoint + bnb config at
+    load time) needs every source tensor live in one
+    ``convert_and_load_state_dict_in_model`` call, so the original loader
+    must run.
+
+    Practical consequence: ``unsloth/gpt-oss-120b-unsloth-bnb-4bit`` and
+    similar pre-quantized repos hit the streaming path. ``unsloth/Llama-3.1-8B``
+    + ``BitsAndBytesConfig(load_in_4bit=True)`` does NOT — only Patch A
+    (device_map coercion) helps that case.
+    """
+    try:
+        hf_q = getattr(load_config, "hf_quantizer", None)
+        if hf_q is None:
+            return False
+        return bool(getattr(hf_q, "pre_quantized", False))
+    except Exception:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Patch A: routed _get_device_map
 # ---------------------------------------------------------------------------
-
-_STRING_DEVICE_MAPS = ("auto", "sequential", "balanced", "balanced_low_0")
 
 
 def _build_routed_get_device_map(original):
@@ -406,10 +543,9 @@ def _build_routed_get_device_map(original):
                 idx = 0
             coerced = {"": idx}
             # Re-validate so we surface real quantizer/environment problems
-            # (mismatched dtype, missing kernels, etc.) instead of pretending
-            # the coercion fixed them. The original CPU-scatter ValueError
-            # cannot fire against this dict, so legitimate errors are the
-            # only thing this catches.
+            # (mismatched dtype, missing kernels, etc.). The original
+            # CPU-scatter ValueError cannot fire against this dict, so
+            # legitimate errors are the only thing this catches.
             try:
                 hf_quantizer.validate_environment(device_map=coerced)
             except Exception as exc:
@@ -450,30 +586,68 @@ def _build_routed_get_device_map(original):
 class _StreamingMutationState:
     """Records side-effects the streaming loader has applied to ``model`` /
     ``load_config`` so the caller can decide whether falling back to the
-    original loader is safe. Once a mutation has happened, falling back
-    risks double-applying disk_offload registrations or skipping meta->real
-    init for already-converted params."""
+    original loader is safe. Once a mutation MIGHT have started, falling
+    back risks double-applying disk_offload registrations or skipping
+    meta->real init for already-converted params.
+
+    The flag is set BEFORE the mutating call (not after), so a partial
+    mutation from a raise mid-call is correctly reflected.
+    """
 
     __slots__ = (
         "disk_offload_called",
-        "shards_processed",
+        "model_mutation_started",
+        "shards_completed",
         "in_memory_called",
         "zero3_called",
     )
 
     def __init__(self):
         self.disk_offload_called = False
-        self.shards_processed = 0
+        self.model_mutation_started = False
+        self.shards_completed = 0
         self.in_memory_called = False
         self.zero3_called = False
+
+    def mark_model_mutation_started(self) -> None:
+        self.model_mutation_started = True
+
+    def mark_shard_completed(self) -> None:
+        self.shards_completed += 1
 
     def is_clean(self) -> bool:
         return (
             not self.disk_offload_called
-            and self.shards_processed == 0
+            and not self.model_mutation_started
             and not self.in_memory_called
             and not self.zero3_called
         )
+
+
+def _convert_one_shard(
+    *,
+    model,
+    shard_state_dict,
+    load_config,
+    disk_offload_index,
+    mutation_state: _StreamingMutationState,
+):
+    """Single-shard ``convert_and_load_state_dict_in_model`` with mutation
+    bookkeeping. Marks ``model_mutation_started`` BEFORE the call so a
+    raise mid-conversion correctly disables the unsafe original-loader
+    fallback. Increments ``shards_completed`` on success."""
+    from transformers.core_model_loading import convert_and_load_state_dict_in_model
+
+    mutation_state.mark_model_mutation_started()
+    loading_info, disk_offload_index = convert_and_load_state_dict_in_model(
+        model=model,
+        state_dict=shard_state_dict,
+        load_config=load_config,
+        tp_plan=model.tp_plan,
+        disk_offload_index=disk_offload_index,
+    )
+    mutation_state.mark_shard_completed()
+    return loading_info, disk_offload_index
 
 
 def _streaming_load_pretrained_model(
@@ -499,7 +673,6 @@ def _streaming_load_pretrained_model(
     if mutation_state is None:
         mutation_state = _StreamingMutationState()
     from safetensors import safe_open
-    from transformers.core_model_loading import convert_and_load_state_dict_in_model
     from transformers.modeling_utils import (
         _is_on_hf_mount,
         _safe_load_bytes,
@@ -510,7 +683,6 @@ def _streaming_load_pretrained_model(
 
     disable_mmap = bool(getattr(load_config, "disable_mmap", False))
     weights_only = bool(getattr(load_config, "weights_only", True))
-
     is_quantized = load_config.is_quantized
 
     # Materialise expected_keys exactly like the original (5.5.0:4190).
@@ -531,6 +703,7 @@ def _streaming_load_pretrained_model(
         )
         mutation_state.disk_offload_called = True
 
+    # ---------- deepspeed-zero3 branch ----------
     if is_deepspeed_zero3_enabled() and not is_quantized:
         from transformers.modeling_utils import (
             _load_state_dict_into_zero3_model,
@@ -538,7 +711,7 @@ def _streaming_load_pretrained_model(
         )
 
         if state_dict is None:
-            merged = {}
+            merged: dict = {}
             for ckpt_file in checkpoint_files:
                 merged.update(
                     load_state_dict(
@@ -549,8 +722,6 @@ def _streaming_load_pretrained_model(
                     )
                 )
             state_dict = merged
-        # Mark BEFORE the mutating call: if it raises mid-way, the model is
-        # partially mutated and the caller must NOT fall back to original.
         mutation_state.zero3_called = True
         error_msgs, missing_keys = _load_state_dict_into_zero3_model(
             model, state_dict, load_config
@@ -566,30 +737,29 @@ def _streaming_load_pretrained_model(
             disk_offload_index,
         )
 
-    # State dict given in memory: still benefits from skipping warmup but no shard streaming.
+    # ---------- in-memory state_dict branch ----------
     if state_dict is not None:
-        # Mark BEFORE the mutating call: if convert_and_load raises after
-        # partially writing params, is_clean() must reflect that so the
-        # routed entry refuses the unsafe original-loader fallback.
         mutation_state.in_memory_called = True
-        loading_info, disk_offload_index = convert_and_load_state_dict_in_model(
+        loading_info, disk_offload_index = _convert_one_shard(
             model=model,
-            state_dict=state_dict,
+            shard_state_dict=state_dict,
             load_config=load_config,
-            tp_plan=model.tp_plan,
             disk_offload_index=disk_offload_index,
+            mutation_state=mutation_state,
         )
         return loading_info, disk_offload_index
 
-    # No checkpoint files at all -> mirror the original ValueError.
-    if checkpoint_files is None:
+    # ---------- shard-streaming branches ----------
+    if not checkpoint_files:
+        # Mirror the original ValueError. Handles both None and [].
         raise ValueError("Neither a state dict nor checkpoint files were found.")
 
-    # .bin path: process one shard at a time, no mmap to release; gc between.
-    if not checkpoint_files[0].endswith(".safetensors"):
+    per_shard_infos: list = []
+
+    if not _is_safetensors_file(checkpoint_files[0]):
+        # .bin path: read whole file into memory per shard, gc between.
         from transformers.modeling_utils import load_state_dict
 
-        per_shard_infos: list = []
         for ckpt_file in checkpoint_files:
             shard_state_dict = load_state_dict(
                 ckpt_file,
@@ -597,40 +767,37 @@ def _streaming_load_pretrained_model(
                 weights_only=weights_only,
                 disable_mmap=disable_mmap,
             )
-            li, disk_offload_index = convert_and_load_state_dict_in_model(
+            li, disk_offload_index = _convert_one_shard(
                 model=model,
-                state_dict=shard_state_dict,
+                shard_state_dict=shard_state_dict,
                 load_config=load_config,
-                tp_plan=model.tp_plan,
                 disk_offload_index=disk_offload_index,
+                mutation_state=mutation_state,
             )
             per_shard_infos.append(li)
-            mutation_state.shards_processed += 1
             del shard_state_dict
             gc.collect()
         return _merge_loading_infos(model, per_shard_infos), disk_offload_index
 
-    # safetensors streaming path. Branch on disable_mmap / hf-mount: when
-    # either is true, the original loader reads the file into memory via
-    # _safe_load_bytes (mmap interaction with hf-mount FUSE deadlocks under
-    # parallel page-faults). We mirror that branch here so users with
-    # `disable_mmap=True` or a checkpoint on hf-mount get the same semantics
-    # they would on the original loader -- still streamed one shard at a
-    # time, just without mmap.
-    per_shard_infos = []
+    # safetensors path. Branch on disable_mmap / hf-mount: when either is
+    # true, the original loader reads the file into memory via
+    # _safe_load_bytes (mmap interaction with hf-mount FUSE deadlocks
+    # under parallel page-faults). We mirror that branch here so users
+    # with disable_mmap=True or a checkpoint on hf-mount get the same
+    # semantics they would on the original loader -- still streamed one
+    # shard at a time, just without mmap.
     for file in checkpoint_files:
         if disable_mmap or _is_on_hf_mount(file):
             with open(file, "rb") as _fh:
                 shard_state_dict = _safe_load_bytes(_fh.read())
-            li, disk_offload_index = convert_and_load_state_dict_in_model(
+            li, disk_offload_index = _convert_one_shard(
                 model=model,
-                state_dict=shard_state_dict,
+                shard_state_dict=shard_state_dict,
                 load_config=load_config,
-                tp_plan=model.tp_plan,
                 disk_offload_index=disk_offload_index,
+                mutation_state=mutation_state,
             )
             per_shard_infos.append(li)
-            mutation_state.shards_processed += 1
             shard_state_dict.clear()
             del shard_state_dict
             gc.collect()
@@ -639,97 +806,38 @@ def _streaming_load_pretrained_model(
             shard_state_dict: dict[str, Any] = {}
             for k in file_pointer.keys():
                 shard_state_dict[k] = file_pointer.get_slice(k)
-            li, disk_offload_index = convert_and_load_state_dict_in_model(
+            li, disk_offload_index = _convert_one_shard(
                 model=model,
-                state_dict=shard_state_dict,
+                shard_state_dict=shard_state_dict,
                 load_config=load_config,
-                tp_plan=model.tp_plan,
                 disk_offload_index=disk_offload_index,
+                mutation_state=mutation_state,
             )
             per_shard_infos.append(li)
-            mutation_state.shards_processed += 1
-            # Drop our refs to the safetensors slices BEFORE the file closes
-            # so the mmap region has no live tensors when posix_fadvise runs.
+            # Drop our refs to the safetensors slices BEFORE the file
+            # closes so the mmap region has no live tensors when
+            # posix_fadvise runs.
             shard_state_dict.clear()
             del shard_state_dict
         _drop_file_page_cache(file)
         gc.collect()
 
-    loading_info = _merge_loading_infos(model, per_shard_infos)
-    return loading_info, disk_offload_index
+    return _merge_loading_infos(model, per_shard_infos), disk_offload_index
 
 
-def _has_cross_shard_fusion(load_config) -> bool:
-    """True if ``weight_mapping`` contains a multi-source ``WeightConverter``
-    whose operations need every matching source tensor live in one
-    ``convert()`` call.
-
-    Hazardous ops (verified by inspection of
-    ``transformers.core_model_loading``): ``MergeModulelist`` (fuses N
-    tensors along dim 0) and ``Concatenate`` (concatenates source
-    patterns). Both iterate ``source_patterns`` against ``input_dict`` and
-    silently produce a wrong-shape merged tensor when sources are split
-    across shards.
-
-    Single-source converters (PermuteForRope, Transpose, Chunk, etc.) are
-    safe under per-shard splits because each call independently reproduces
-    the transform.
-
-    Conservative-on-import-failure: if WeightConverter or the hazardous
-    op classes can't be imported (e.g. a future transformers rename),
-    return True so the patch declines streaming rather than silently
-    streaming a fusion load. ``_check_symbols`` also probes these
-    imports at install time so a rename declines patches entirely.
+def _streaming_decline_reason(load_config) -> str | None:
+    """Why we should NOT stream this load. Returns ``None`` when streaming
+    is safe; otherwise a short string suitable for debug logging.
     """
-    try:
-        from transformers.core_model_loading import (
-            Concatenate,
-            MergeModulelist,
-            WeightConverter,
-        )
-    except Exception:
-        return True  # fail-safe: decline streaming rather than risk wrong tensors
-    hazardous = (MergeModulelist, Concatenate)
-    wm = getattr(load_config, "weight_mapping", None) or []
-    for entry in wm:
-        if not isinstance(entry, WeightConverter):
-            continue
-        try:
-            sources = getattr(entry, "source_patterns", []) or []
-            if len(sources) <= 1:
-                # A single source pattern can't be split across shards
-                # in a way that affects fusion semantics.
-                continue
-            ops = getattr(entry, "operations", []) or []
-            if any(isinstance(op, hazardous) for op in ops):
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def _is_pre_quantized_load(load_config) -> bool:
-    """True iff the checkpoint is already fully quantized.
-
-    Streaming is safe only when each shard's keys map directly onto model
-    params. On-the-fly quantization (fp16/bf16 checkpoint + bnb config at
-    load time) and any path with cross-shard fusion converters needs every
-    source tensor live in one ``convert_and_load_state_dict_in_model``
-    call, so the original loader must run.
-
-    Practical consequence: ``unsloth/gpt-oss-120b-unsloth-bnb-4bit`` and
-    similar pre-quantized repos hit the streaming path. ``unsloth/Llama-3.1-8B``
-    + ``BitsAndBytesConfig(load_in_4bit=True)`` does NOT -- only Patch A
-    (device_map coercion) helps that case. See
-    ``docs/integrated_gpu_loader.md`` for the per-architecture matrix.
-    """
-    try:
-        hf_q = getattr(load_config, "hf_quantizer", None)
-        if hf_q is None:
-            return False
-        return bool(getattr(hf_q, "pre_quantized", False))
-    except Exception:
-        return False
+    if not _is_integrated_gpu():
+        return "not an integrated GPU"
+    if _has_disk_offload(getattr(load_config, "device_map", None)):
+        return "disk offload is enabled"
+    if not _is_pre_quantized_load(load_config):
+        return "load is not pre-quantized"
+    if _has_cross_shard_fusion(load_config):
+        return "weight mapping contains cross-shard fusion"
+    return None
 
 
 def _build_routed_load_pretrained_model(original):
@@ -737,28 +845,19 @@ def _build_routed_load_pretrained_model(original):
     def _routed_load_pretrained_model(
         model, state_dict, checkpoint_files, load_config, expected_keys=None
     ):
-        # Cheap gates first; do nothing on a discrete GPU.
-        if not _is_integrated_gpu():
+        def run_original():
             return original(
                 model, state_dict, checkpoint_files, load_config, expected_keys
             )
-        # Disk offload uses the original path; streaming doesn't apply.
-        if _has_disk_offload(getattr(load_config, "device_map", None)):
-            return original(
-                model, state_dict, checkpoint_files, load_config, expected_keys
+
+        reason = _streaming_decline_reason(load_config)
+        if reason is not None:
+            logger.debug(
+                "Unsloth: integrated_gpu_loader: using original loader: %s",
+                reason,
             )
-        if not _is_pre_quantized_load(load_config):
-            return original(
-                model, state_dict, checkpoint_files, load_config, expected_keys
-            )
-        # Cross-shard fusion converters (MergeModulelist) need every source
-        # tensor live in one convert() call; per-shard streaming would split
-        # them and produce wrong-shape merged tensors. Decline streaming so
-        # these loads run through the original loader unchanged.
-        if _has_cross_shard_fusion(load_config):
-            return original(
-                model, state_dict, checkpoint_files, load_config, expected_keys
-            )
+            return run_original()
+
         ms = _StreamingMutationState()
         try:
             return _streaming_load_pretrained_model(
@@ -769,42 +868,37 @@ def _build_routed_load_pretrained_model(original):
                 expected_keys,
                 mutation_state=ms,
             )
-        except Exception as e:
+        except Exception as exc:
             if ms.is_clean():
-                # Streaming raised before mutating model state (e.g. an
-                # import inside the streaming function failed, or the
-                # in-memory state_dict path raised before any per-shard
-                # processing started). Falling back to the original loader
-                # is safe -- the model is still in its meta state.
+                # Streaming raised before any mutation (e.g. an import
+                # inside the streaming function failed). Falling back to
+                # the original loader is safe -- the model is still in
+                # its meta state.
                 logger.warning(
                     "Unsloth: integrated_gpu_loader streaming raised %r "
-                    "before any model mutation; falling back to the "
-                    "original _load_pretrained_model.",
-                    e,
+                    "before model mutation; falling back to original loader.",
+                    exc,
                 )
-                return original(
-                    model,
-                    state_dict,
-                    checkpoint_files,
-                    load_config,
-                    expected_keys,
-                )
+                return run_original()
             # Partial mutation: the original loader cannot be trusted to
             # recover (it would re-call accelerate_disk_offload, double-
             # register hooks, or skip meta->real init for params whose
-            # _is_hf_initialized flag was already set by streaming). Re-
-            # raise with an annotation so the user sees a clean error
-            # instead of a downstream forward-pass crash on garbage state.
+            # _is_hf_initialized was already set by streaming). Re-raise
+            # so the user sees a clean error instead of a downstream
+            # crash on garbage state.
             logger.warning(
                 "Unsloth: integrated_gpu_loader streaming raised %r AFTER "
                 "partial model mutation (disk_offload_called=%s, "
-                "shards_processed=%d). Re-raising to avoid double-applying "
-                "the original loader on a partially-converted model. Set "
-                "UNSLOTH_INTEGRATED_GPU_LOADER=0 to force the original "
-                "loader from the start.",
-                e,
+                "model_mutation_started=%s, shards_completed=%d, "
+                "in_memory_called=%s, zero3_called=%s). Re-raising to avoid "
+                "unsafe fallback. Set UNSLOTH_INTEGRATED_GPU_LOADER=0 to "
+                "force the original loader from the start.",
+                exc,
                 ms.disk_offload_called,
-                ms.shards_processed,
+                ms.model_mutation_started,
+                ms.shards_completed,
+                ms.in_memory_called,
+                ms.zero3_called,
             )
             raise
 
@@ -813,35 +907,21 @@ def _build_routed_load_pretrained_model(original):
 
 
 # ---------------------------------------------------------------------------
-# install
+# Install
 # ---------------------------------------------------------------------------
-
-
-def _hardware_actually_integrated() -> bool:
-    """Detect-only: report whether the device REPORTS as integrated, ignoring
-    the ``UNSLOTH_INTEGRATED_GPU_LOADER`` override. Used to decide whether
-    to surface a "you forced this on a discrete GPU" warning at install."""
-    try:
-        import torch
-
-        if not torch.cuda.is_available():
-            return False
-        return getattr(torch.cuda.get_device_properties(0), "is_integrated", 0) == 1
-    except Exception:
-        return False
 
 
 def apply_integrated_gpu_loader_patches() -> bool:
     """Idempotently install the routed wrappers when the gate fires.
 
-    Safe to call multiple times -- the ``_PATCH_FLAG_ATTR`` flag on
+    Safe to call multiple times — the ``_PATCH_FLAG_ATTR`` flag on
     ``PreTrainedModel`` short-circuits subsequent invocations. If a
     third-party module reloads ``transformers.modeling_utils`` later
     (rare; not done by accelerate, peft, or transformers itself), the
     reloaded ``PreTrainedModel`` is a fresh class object and our
-    staticmethod patch is on the old one. To re-arm after a reload, the
-    caller can simply invoke this function again -- the flag check looks
-    up the new class. The same is true of
+    staticmethod patch is on the old one. To re-arm after a reload,
+    invoke this function again — the flag check looks up the new class.
+    The same is true of
     ``transformers.integrations.accelerate._get_device_map``.
     """
     if not _should_patch():
@@ -858,10 +938,9 @@ def apply_integrated_gpu_loader_patches() -> bool:
     # Warn loudly if the user forced patches on via the override despite
     # being on a real discrete GPU. The streaming path is correct on dGPU
     # but slower than upstream's caching_allocator_warmup; Patch A's
-    # multi-GPU branch sets ``max_memory["cpu"]=0`` which silently breaks
-    # legitimate auto/balanced placements that include host RAM offload.
-    override = os.environ.get("UNSLOTH_INTEGRATED_GPU_LOADER", "").strip()
-    if override == "1" and not _hardware_actually_integrated():
+    # multi-GPU branch sets max_memory["cpu"]=0 which silently breaks
+    # legitimate auto/balanced placements that include host-RAM offload.
+    if _integrated_gpu_override() is True and not _detect_integrated_gpu():
         try:
             import torch
             n = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -887,11 +966,12 @@ def apply_integrated_gpu_loader_patches() -> bool:
         accel_int._get_device_map = _build_routed_get_device_map(
             accel_int._get_device_map
         )
-    # ``transformers/modeling_utils.py`` imports the symbol locally at module
-    # load (line ~4113). Always rebind ``mu._get_device_map`` to the routed
-    # version, EVEN if accel_int was already routed -- this matters after
-    # ``importlib.reload(transformers.modeling_utils)`` resets ``mu`` to the
-    # original. Outside the inner ``if`` so re-arm works.
+    # transformers/modeling_utils.py imports the symbol locally at module
+    # load (5.5.0 line ~4113). Always rebind ``mu._get_device_map`` to
+    # the routed version even if accel_int was already routed -- this
+    # matters after ``importlib.reload(transformers.modeling_utils)``
+    # resets ``mu`` to the original. Outside the inner ``if`` so re-arm
+    # works.
     if hasattr(mu, "_get_device_map") and not getattr(
         mu._get_device_map, "_is_unsloth_routed", False
     ):
@@ -901,8 +981,10 @@ def apply_integrated_gpu_loader_patches() -> bool:
     if not getattr(
         mu.PreTrainedModel._load_pretrained_model, "_is_unsloth_routed", False
     ):
-        mu.PreTrainedModel._load_pretrained_model = _build_routed_load_pretrained_model(
-            mu.PreTrainedModel._load_pretrained_model
+        mu.PreTrainedModel._load_pretrained_model = (
+            _build_routed_load_pretrained_model(
+                mu.PreTrainedModel._load_pretrained_model
+            )
         )
 
     setattr(mu.PreTrainedModel, _PATCH_FLAG_ATTR, True)
