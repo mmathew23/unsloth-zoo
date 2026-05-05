@@ -189,16 +189,31 @@ def _signature_has_exact_params(fn, expected: tuple[str, ...]) -> tuple[bool, st
 
 
 def _signature_accepts_kwargs(fn, required: frozenset[str]) -> tuple[bool, str]:
-    """``fn`` must accept every name in ``required`` as a kwarg."""
+    """``fn`` must accept every name in ``required`` AS A KEYWORD argument.
+
+    A ``**kwargs`` parameter passes the check unconditionally. Otherwise
+    every required name must be present AND not POSITIONAL_ONLY (those
+    cannot be passed by name even if they exist with the right name).
+    """
     import inspect
 
     try:
-        actual = set(inspect.signature(fn).parameters.keys())
+        params = inspect.signature(fn).parameters
     except (TypeError, ValueError) as exc:
         return False, f"{fn!r} not introspectable: {exc!r}"
-    missing = required - actual
-    if missing:
-        return False, f"missing kwargs {missing} (got {actual})"
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return True, ""
+    missing_or_posonly = {
+        name
+        for name in required
+        if name not in params
+        or params[name].kind == inspect.Parameter.POSITIONAL_ONLY
+    }
+    if missing_or_posonly:
+        return False, (
+            f"missing keyword-compatible params {missing_or_posonly} "
+            f"(got {tuple(params.keys())})"
+        )
     return True, ""
 
 
@@ -396,17 +411,28 @@ def _drop_file_page_cache(path: str) -> None:
             pass
 
 
-def _merge_loading_infos(model, per_shard_infos):
+def _merge_loading_infos(model, per_shard_infos, expected_keys=None):
     """Combine per-shard ``LoadStateDictInfo`` into one matching a single-call
     invocation. Per-shard ``missing_keys`` is seeded with the full model
     state-dict and removes only what the shard loaded; intersecting across
     shards yields the truly-missing set. Other fields are unioned;
-    ``conversion_errors`` merges first-write-wins via ``ChainMap``."""
+    ``conversion_errors`` merges first-write-wins via ``ChainMap``.
+
+    ``expected_keys`` (optional): if provided, the empty/no-shard fallback
+    uses this set instead of rebuilding from ``model.state_dict()``. The
+    caller normally materialises ``expected_keys`` once at function
+    entry; passing it through lets us reuse that work and avoids an
+    extra ``state_dict()`` pass on the empty branch."""
     from transformers.utils.loading_report import LoadStateDictInfo
 
     if not per_shard_infos:
+        keys = (
+            set(expected_keys)
+            if expected_keys is not None
+            else set(model.state_dict().keys())
+        )
         return LoadStateDictInfo(
-            missing_keys=set(model.state_dict().keys()),
+            missing_keys=keys,
             unexpected_keys=set(),
             mismatched_keys=set(),
             error_msgs=[],
@@ -472,14 +498,21 @@ def _has_cross_shard_fusion(load_config) -> bool:
         if not isinstance(entry, WeightConverter):
             continue
         try:
-            sources = getattr(entry, "source_patterns", []) or []
+            sources = getattr(entry, "source_patterns", None)
+            ops = getattr(entry, "operations", None)
+            if sources is None or ops is None:
+                # Unexpected shape on a class we KNOW is a WeightConverter
+                # -> something changed in the upstream contract. Fail
+                # closed.
+                return True
             if len(sources) <= 1:
                 continue
-            ops = getattr(entry, "operations", []) or []
             if any(isinstance(op, hazardous) for op in ops):
                 return True
         except Exception:
-            continue
+            # Any failure to inspect a converter -> assume it could be a
+            # cross-shard fusion and decline streaming.
+            return True
     return False
 
 
@@ -692,6 +725,14 @@ def _streaming_load_pretrained_model(
 
     disk_offload_index = None
     if _has_disk_offload(getattr(load_config, "device_map", None)):
+        # Mark BEFORE the call: if accelerate_disk_offload partially
+        # registers state and then raises, is_clean() must reflect that
+        # so the routed entry refuses the unsafe original-loader fallback.
+        # (Note: under the current routing, _streaming_decline_reason
+        # already declines disk-offload loads, so this branch is mostly
+        # defensive -- keeping it correct in case the gating ever
+        # changes.)
+        mutation_state.disk_offload_called = True
         disk_offload_index = accelerate_disk_offload(
             model,
             load_config.disk_offload_folder,
@@ -701,7 +742,6 @@ def _streaming_load_pretrained_model(
             load_config.dtype,
             load_config.weight_mapping,
         )
-        mutation_state.disk_offload_called = True
 
     # ---------- deepspeed-zero3 branch ----------
     if is_deepspeed_zero3_enabled() and not is_quantized:
@@ -777,7 +817,7 @@ def _streaming_load_pretrained_model(
             per_shard_infos.append(li)
             del shard_state_dict
             gc.collect()
-        return _merge_loading_infos(model, per_shard_infos), disk_offload_index
+        return _merge_loading_infos(model, per_shard_infos, expected_keys), disk_offload_index
 
     # safetensors path. Branch on disable_mmap / hf-mount: when either is
     # true, the original loader reads the file into memory via
@@ -822,7 +862,7 @@ def _streaming_load_pretrained_model(
         _drop_file_page_cache(file)
         gc.collect()
 
-    return _merge_loading_infos(model, per_shard_infos), disk_offload_index
+    return _merge_loading_infos(model, per_shard_infos, expected_keys), disk_offload_index
 
 
 def _streaming_decline_reason(load_config) -> str | None:
@@ -958,26 +998,29 @@ def apply_integrated_gpu_loader_patches() -> bool:
             n,
         )
 
-    if getattr(mu.PreTrainedModel, _PATCH_FLAG_ATTR, False):
-        return True  # already installed
-
-    # Patch A
+    # Patch A is checked FIRST and idempotently re-armed every call. The
+    # _PATCH_FLAG_ATTR on PreTrainedModel guards Patch B only -- if a
+    # third party reloads transformers.integrations.accelerate, the flag
+    # would otherwise short-circuit re-arming Patch A.
     if not getattr(accel_int._get_device_map, "_is_unsloth_routed", False):
         accel_int._get_device_map = _build_routed_get_device_map(
             accel_int._get_device_map
         )
     # transformers/modeling_utils.py imports the symbol locally at module
-    # load (5.5.0 line ~4113). Always rebind ``mu._get_device_map`` to
-    # the routed version even if accel_int was already routed -- this
-    # matters after ``importlib.reload(transformers.modeling_utils)``
-    # resets ``mu`` to the original. Outside the inner ``if`` so re-arm
-    # works.
+    # load (5.5.0 line ~4113). Rebind mu._get_device_map to the routed
+    # version even if accel_int was already routed -- this matters after
+    # ``importlib.reload(transformers.modeling_utils)`` resets mu to the
+    # original.
     if hasattr(mu, "_get_device_map") and not getattr(
         mu._get_device_map, "_is_unsloth_routed", False
     ):
         mu._get_device_map = accel_int._get_device_map
 
-    # Patch B
+    # Patch B: skip only if the model class itself has been flagged.
+    # Re-arm if PreTrainedModel was reloaded (fresh class -> fresh attr).
+    if getattr(mu.PreTrainedModel, _PATCH_FLAG_ATTR, False):
+        return True
+
     if not getattr(
         mu.PreTrainedModel._load_pretrained_model, "_is_unsloth_routed", False
     ):
