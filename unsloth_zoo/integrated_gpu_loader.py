@@ -43,8 +43,11 @@ from __future__ import annotations
 
 import functools
 import gc
+import inspect
 import logging
 import os
+import re
+import threading
 from collections import ChainMap
 from typing import Any
 
@@ -52,6 +55,26 @@ logger = logging.getLogger(__name__)
 
 
 _PATCH_FLAG_ATTR = "_unsloth_integrated_loader_patched"
+
+# Serialise patch installs across threads. The body of
+# apply_integrated_gpu_loader_patches reads-then-mutates module-level
+# transformers attributes (Patch A on accel_int / mu, Patch B on
+# PreTrainedModel); without a lock two concurrent calls can both pass
+# the _is_unsloth_routed check and double-wrap.
+_INSTALL_LOCK = threading.Lock()
+
+# Reset the install lock in any forked child so a fork() that happens
+# while a parent thread held _INSTALL_LOCK can't deadlock the child.
+# multiprocessing's "fork" start method (Linux default through 3.13)
+# inherits lock state across the fork boundary; the holder thread does
+# not exist in the child, so the lock would otherwise stay locked
+# forever.
+if hasattr(os, "register_at_fork"):
+    def _reset_install_lock_after_fork() -> None:
+        global _INSTALL_LOCK
+        _INSTALL_LOCK = threading.Lock()
+
+    os.register_at_fork(after_in_child=_reset_install_lock_after_fork)
 
 
 # 4.57.x and earlier streams shards correctly and doesn't have the
@@ -111,8 +134,15 @@ _LOAD_STATE_DICT_CONFIG_FIELDS = frozenset({
     "dtype",
 })
 
-_ACCELERATE_DISK_OFFLOAD_POSITIONAL = 7
-# model, folder, files, device_map, sharded_metadata, dtype, weight_mapping
+_ACCELERATE_DISK_OFFLOAD_REQUIRED_KWARGS = frozenset({
+    "model",
+    "disk_offload_folder",
+    "checkpoint_files",
+    "device_map",
+    "sharded_metadata",
+    "dtype",
+    "weight_mapping",
+})
 
 _STRING_DEVICE_MAPS = ("auto", "sequential", "balanced", "balanced_low_0")
 
@@ -122,15 +152,37 @@ _STRING_DEVICE_MAPS = ("auto", "sequential", "balanced", "balanced_low_0")
 # ---------------------------------------------------------------------------
 
 
+_TRUTHY_OVERRIDES = frozenset({"1", "true", "yes", "on", "y", "t"})
+_FALSY_OVERRIDES = frozenset({"0", "false", "no", "off", "n", "f"})
+
+# One-shot tracker for the unrecognised-value warning so a typo'd
+# override doesn't spam logs once per from_pretrained.
+_UNRECOGNISED_OVERRIDES_WARNED: set[str] = set()
+
+
 def _integrated_gpu_override() -> bool | None:
     """Parse ``UNSLOTH_INTEGRATED_GPU_LOADER``. Returns ``True`` (force on),
-    ``False`` (force off), or ``None`` (no override).
+    ``False`` (force off), or ``None`` (no override). Accepts the usual
+    truthy/falsy spellings (``true``/``false``/``yes``/``no``/``on``/``off``,
+    case-insensitive); unrecognised non-empty values warn once per
+    distinct value and fall through to auto-detect.
     """
-    value = os.environ.get("UNSLOTH_INTEGRATED_GPU_LOADER", "").strip()
-    if value == "1":
+    raw = os.environ.get("UNSLOTH_INTEGRATED_GPU_LOADER", "")
+    value = raw.strip().lower()
+    if not value:
+        return None
+    if value in _TRUTHY_OVERRIDES:
         return True
-    if value == "0":
+    if value in _FALSY_OVERRIDES:
         return False
+    if value not in _UNRECOGNISED_OVERRIDES_WARNED:
+        _UNRECOGNISED_OVERRIDES_WARNED.add(value)
+        logger.warning(
+            "Unsloth: UNSLOTH_INTEGRATED_GPU_LOADER=%r not recognised; "
+            "ignoring (auto-detect will run). Accepted values: %s.",
+            raw,
+            sorted(_TRUTHY_OVERRIDES | _FALSY_OVERRIDES),
+        )
     return None
 
 
@@ -158,16 +210,22 @@ def _is_integrated_gpu(index: int = 0) -> bool:
     return _detect_integrated_gpu(index)
 
 
-def _transformers_at_least_min() -> bool:
-    """True if transformers >= ``_MIN_VERSION`` (no upper bound)."""
+def _transformers_at_least_min() -> tuple[bool, str]:
+    """``(ok, reason)`` for transformers >= ``_MIN_VERSION``. ``reason`` is
+    populated when the version probe itself fails (missing
+    ``packaging``, missing metadata) so ``_should_patch`` can log a
+    breadcrumb instead of failing silently."""
     try:
         from importlib.metadata import version
 
         from packaging.version import Version
 
-        return Version(version("transformers")) >= Version(_MIN_VERSION)
-    except Exception:
-        return False
+        v = Version(version("transformers"))
+    except Exception as exc:
+        return False, f"version probe failed: {exc!r}"
+    if v < Version(_MIN_VERSION):
+        return False, f"transformers={v} < {_MIN_VERSION}"
+    return True, ""
 
 
 # ---------------------------------------------------------------------------
@@ -175,16 +233,43 @@ def _transformers_at_least_min() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _signature_has_exact_params(fn, expected: tuple[str, ...]) -> tuple[bool, str]:
-    """``fn`` must have exactly these parameter names in this order."""
-    import inspect
+def _signature_has_leading_params(
+    fn, expected: tuple[str, ...]
+) -> tuple[bool, str]:
+    """``fn``'s first ``len(expected)`` params must equal ``expected`` in
+    order, AND every param after that must have a default. We re-call
+    ``fn`` positionally with ``len(expected)`` args, so trailing
+    optional params are harmless but trailing required params would be
+    silently dropped.
+
+    ``expected`` must be non-empty -- an empty tuple would degenerate
+    into "every param must have a default", which is not a useful gate.
+    Raised as ``ValueError`` (not ``assert``) so ``python -O`` cannot
+    strip the contract check.
+    """
+    if not expected:
+        raise ValueError("expected must be non-empty")
 
     try:
-        actual = tuple(inspect.signature(fn).parameters.keys())
+        params = list(inspect.signature(fn).parameters.values())
     except (TypeError, ValueError) as exc:
         return False, f"{fn!r} not introspectable: {exc!r}"
-    if actual != expected:
-        return False, f"signature changed: got {actual}, expected {expected}"
+
+    actual = tuple(p.name for p in params)
+    if actual[: len(expected)] != expected:
+        return False, (
+            f"leading params changed: got {actual[: len(expected)]}, "
+            f"expected {expected} (full signature: {actual})"
+        )
+    for p in params[len(expected) :]:
+        if p.default is inspect.Parameter.empty and p.kind not in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            return False, (
+                f"trailing required param {p.name!r} would be dropped "
+                f"by our positional call (full signature: {actual})"
+            )
     return True, ""
 
 
@@ -205,8 +290,6 @@ def _signature_accepts_kwargs(fn, required: frozenset[str]) -> tuple[bool, str]:
     legitimately exist alongside our keyword call as long as they're
     optional).
     """
-    import inspect
-
     try:
         params = inspect.signature(fn).parameters
     except (TypeError, ValueError) as exc:
@@ -264,66 +347,6 @@ def _signature_accepts_kwargs(fn, required: frozenset[str]) -> tuple[bool, str]:
     return True, ""
 
 
-def _signature_accepts_n_positionals(fn, n: int) -> tuple[bool, str]:
-    """``fn`` must be callable with EXACTLY ``n`` positional arguments.
-
-    Three failure modes, each fail-closed:
-      * required keyword-only parameters (we only pass positionals);
-      * more required positional params than ``n`` (we'd be missing some);
-      * fewer accepting positional params than ``n`` AND no ``*args``
-        to absorb the overflow.
-
-    Optional positional params past ``n`` are fine.
-    """
-    import inspect
-
-    try:
-        params = list(inspect.signature(fn).parameters.values())
-    except (TypeError, ValueError) as exc:
-        return False, f"{fn!r} not introspectable: {exc!r}"
-
-    required_kwonly = [
-        p.name
-        for p in params
-        if p.kind == inspect.Parameter.KEYWORD_ONLY
-        and p.default is inspect.Parameter.empty
-    ]
-    if required_kwonly:
-        return False, (
-            f"has required keyword-only params {required_kwonly} "
-            f"that this patch's positional call does not pass"
-        )
-
-    has_varargs = any(
-        p.kind == inspect.Parameter.VAR_POSITIONAL for p in params
-    )
-    positional = [
-        p
-        for p in params
-        if p.kind
-        in (
-            inspect.Parameter.POSITIONAL_ONLY,
-            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-        )
-    ]
-    required_positional = [
-        p for p in positional if p.default is inspect.Parameter.empty
-    ]
-
-    if len(required_positional) > n:
-        return False, (
-            f"requires {len(required_positional)} positional args "
-            f"({tuple(p.name for p in required_positional)}), "
-            f"but patch passes {n}"
-        )
-    if not has_varargs and len(positional) < n:
-        return False, (
-            f"accepts only {len(positional)} positional args, "
-            f"but patch passes {n}"
-        )
-    return True, ""
-
-
 def _dataclass_has_fields(cls, required: frozenset[str]) -> tuple[bool, str]:
     """``cls`` must be a dataclass with every name in ``required`` as a field."""
     fields_attr = getattr(cls, "__dataclass_fields__", None)
@@ -348,31 +371,34 @@ def _check_symbols() -> tuple[bool, str]:
             convert_and_load_state_dict_in_model,
         )
         from transformers.integrations.accelerate import _get_device_map
-        from transformers.modeling_utils import (
+        from transformers.modeling_utils import (  # noqa: F401  install-time existence probes
             LoadStateDictConfig,
             PreTrainedModel,
+            _is_on_hf_mount,
+            _load_state_dict_into_zero3_model,
+            _safe_load_bytes,
             accelerate_disk_offload,
-            is_deepspeed_zero3_enabled,  # noqa: F401
-            load_state_dict,  # noqa: F401
+            is_deepspeed_zero3_enabled,
+            load_state_dict,
         )
-        from transformers.quantizers.base import HfQuantizer  # noqa: F401
+        from transformers.quantizers.base import HfQuantizer
         from transformers.utils.loading_report import LoadStateDictInfo
-        from transformers.utils.quantization_config import (
-            QuantizationMethod,  # noqa: F401
+        from transformers.utils.quantization_config import (  # noqa: F401
+            QuantizationMethod,
         )
     except Exception as e:
         return False, f"import failed: {e!r}"
 
     checks: list[tuple[bool, str]] = [
-        _signature_has_exact_params(
+        _signature_has_leading_params(
             PreTrainedModel._load_pretrained_model, _LOAD_PRETRAINED_MODEL_PARAMS
         ),
         _signature_accepts_kwargs(
             convert_and_load_state_dict_in_model, _CONVERT_AND_LOAD_REQUIRED_KWARGS
         ),
         _signature_accepts_kwargs(_get_device_map, _GET_DEVICE_MAP_REQUIRED_KWARGS),
-        _signature_accepts_n_positionals(
-            accelerate_disk_offload, _ACCELERATE_DISK_OFFLOAD_POSITIONAL
+        _signature_accepts_kwargs(
+            accelerate_disk_offload, _ACCELERATE_DISK_OFFLOAD_REQUIRED_KWARGS
         ),
         _dataclass_has_fields(LoadStateDictInfo, _LOAD_STATE_DICT_INFO_FIELDS),
         _dataclass_has_fields(LoadStateDictConfig, _LOAD_STATE_DICT_CONFIG_FIELDS),
@@ -386,6 +412,25 @@ def _check_symbols() -> tuple[bool, str]:
         return False, "LoadStateDictConfig has no is_quantized property"
     if not isinstance(PreTrainedModel.__dict__.get("tp_plan"), property):
         return False, "PreTrainedModel.tp_plan is no longer a property"
+    # Attribute names read at runtime by helpers in this module. A
+    # silent rename here would otherwise just fail-closed on the
+    # affected code path with no install-time signal.
+    for attr in ("source_patterns", "operations"):
+        if not hasattr(WeightConverter, attr):
+            return False, f"WeightConverter has no {attr!r} attribute"
+    # ``pre_quantized`` is an instance attribute set in
+    # ``HfQuantizer.__init__`` (``self.pre_quantized = kwargs.pop(...)``),
+    # so it is not visible on the class. Probe the __init__ source for
+    # the LHS assignment specifically -- a plain substring would also
+    # match the kwargs.pop key, so ``self.X = kwargs.pop("pre_quantized")``
+    # with a renamed attribute X would pass and silently disable
+    # streaming. The regex matches ``self.pre_quantized =`` only.
+    try:
+        src = inspect.getsource(HfQuantizer.__init__)
+    except (OSError, TypeError) as exc:
+        return False, f"could not inspect HfQuantizer.__init__: {exc!r}"
+    if not re.search(r"self\.pre_quantized\s*=", src):
+        return False, "HfQuantizer.__init__ no longer assigns self.pre_quantized"
 
     return True, ""
 
@@ -399,7 +444,11 @@ def _should_patch() -> bool:
     """
     if not _is_integrated_gpu():
         return False
-    if not _transformers_at_least_min():
+    ok, reason = _transformers_at_least_min()
+    if not ok:
+        logger.debug(
+            "Unsloth: integrated_gpu_loader will NOT patch (%s).", reason
+        )
         return False
     ok, reason = _check_symbols()
     if not ok:
@@ -433,6 +482,8 @@ def _as_set(value: Any) -> set:
     return set(value or ())
 
 
+# Not thread-safe; load runs on the main thread, so a race here at
+# worst produces a duplicate warning, never corruption.
 _PAGE_CACHE_FAIL_LOGGED = False
 
 
@@ -490,16 +541,17 @@ def _drop_file_page_cache(path: str) -> None:
 
 def _merge_loading_infos(model, per_shard_infos, expected_keys=None):
     """Combine per-shard ``LoadStateDictInfo`` into one matching a single-call
-    invocation. Per-shard ``missing_keys`` is seeded with the full model
-    state-dict and removes only what the shard loaded; intersecting across
-    shards yields the truly-missing set. Other fields are unioned;
+    invocation. Relies on the upstream contract that per-shard
+    ``LoadStateDictInfo.missing_keys`` is ``expected_keys − keys_loaded
+    _by_this_shard``; intersecting across shards therefore yields the
+    truly-missing set (mathematically equivalent to ``expected_keys −
+    union(loaded_per_shard)``). Revisit if upstream's per-shard
+    contract changes. Other fields are unioned;
     ``conversion_errors`` merges first-write-wins via ``ChainMap``.
 
-    ``expected_keys`` (optional): if provided, the empty/no-shard fallback
-    uses this set instead of rebuilding from ``model.state_dict()``. The
-    caller normally materialises ``expected_keys`` once at function
-    entry; passing it through lets us reuse that work and avoids an
-    extra ``state_dict()`` pass on the empty branch."""
+    ``expected_keys`` (optional): if provided, the empty/no-shard
+    fallback uses this set instead of rebuilding from
+    ``model.state_dict()``."""
     from transformers.utils.loading_report import LoadStateDictInfo
 
     if not per_shard_infos:
@@ -648,9 +700,9 @@ def _build_routed_get_device_map(original):
         # Single-GPU branch coerces to {"": cur}; multi-GPU branch keeps
         # balanced/sequential intent and only zeros the cpu bucket. Never
         # collapse a real multi-GPU placement to a single device.
-        try:
-            import torch
+        import torch
 
+        try:
             device_count = torch.cuda.device_count()
         except Exception:
             device_count = 1
@@ -659,8 +711,6 @@ def _build_routed_get_device_map(original):
             # ``current_device()`` (not hard-coded 0) so each DDP rank
             # picks up its own ``CUDA_VISIBLE_DEVICES`` index.
             try:
-                import torch
-
                 idx = torch.cuda.current_device()
             except Exception:
                 idx = 0
@@ -684,10 +734,12 @@ def _build_routed_get_device_map(original):
 
         # Multi-GPU integrated. Force cpu=0 so the original infer path
         # places everything on GPUs; quantizer validators that reject
-        # CPU-tagged maps then pass.
+        # CPU-tagged maps then pass. Through normal unsloth workflow no
+        # caller passes a non-zero ``cpu`` here, and on integrated-memory
+        # hosts host RAM is the same pool as GPU RAM, so zeroing it is
+        # the correct policy. (A user-supplied non-zero ``cpu`` is
+        # silently overwritten -- intentional.)
         try:
-            import torch
-
             adjusted = {} if max_memory is None else dict(max_memory)
             for i in range(device_count):
                 if i not in adjusted and str(i) not in adjusted:
@@ -808,7 +860,7 @@ def _streaming_load_pretrained_model(
     weights_only = bool(getattr(load_config, "weights_only", True))
     is_quantized = load_config.is_quantized
 
-    # Materialise expected_keys exactly like the original (5.5.0:4190).
+    # Materialise expected_keys exactly like the original loader.
     expected_keys = (
         list(model.state_dict().keys()) if expected_keys is None else expected_keys
     )
@@ -824,13 +876,13 @@ def _streaming_load_pretrained_model(
         # changes.)
         mutation_state.disk_offload_called = True
         disk_offload_index = accelerate_disk_offload(
-            model,
-            load_config.disk_offload_folder,
-            checkpoint_files,
-            load_config.device_map,
-            load_config.sharded_metadata,
-            load_config.dtype,
-            load_config.weight_mapping,
+            model=model,
+            disk_offload_folder=load_config.disk_offload_folder,
+            checkpoint_files=checkpoint_files,
+            device_map=load_config.device_map,
+            sharded_metadata=load_config.sharded_metadata,
+            dtype=load_config.dtype,
+            weight_mapping=load_config.weight_mapping,
         )
 
     # ---------- deepspeed-zero3 branch ----------
@@ -931,26 +983,38 @@ def _streaming_load_pretrained_model(
             shard_state_dict.clear()
             del shard_state_dict
             gc.collect()
+            # _fh.read() populated the kernel page cache; drop it so peak
+            # resident memory falls between shards on hf-mount and on
+            # disable_mmap=True loads (mirrors the mmap branch below).
+            _drop_file_page_cache(file)
             continue
-        with safe_open(file, framework="pt", device="cpu") as file_pointer:
-            shard_state_dict: dict[str, Any] = {}
-            for k in file_pointer.keys():
-                shard_state_dict[k] = file_pointer.get_slice(k)
-            li, disk_offload_index = _convert_one_shard(
-                model=model,
-                shard_state_dict=shard_state_dict,
-                load_config=load_config,
-                disk_offload_index=disk_offload_index,
-                mutation_state=mutation_state,
-            )
-            per_shard_infos.append(li)
-            # Drop our refs to the safetensors slices BEFORE the file
-            # closes so the mmap region has no live tensors when
-            # posix_fadvise runs.
-            shard_state_dict.clear()
-            del shard_state_dict
-        _drop_file_page_cache(file)
-        gc.collect()
+        # try/finally so the page-cache drop and slice cleanup run even
+        # if _convert_one_shard raises mid-conversion. mutation_state
+        # already records the partial mutation; this just keeps unwind
+        # peak memory bounded.
+        try:
+            with safe_open(file, framework="pt", device="cpu") as file_pointer:
+                shard_state_dict: dict[str, Any] = {}
+                try:
+                    for k in file_pointer.keys():
+                        shard_state_dict[k] = file_pointer.get_slice(k)
+                    li, disk_offload_index = _convert_one_shard(
+                        model=model,
+                        shard_state_dict=shard_state_dict,
+                        load_config=load_config,
+                        disk_offload_index=disk_offload_index,
+                        mutation_state=mutation_state,
+                    )
+                    per_shard_infos.append(li)
+                finally:
+                    # Drop refs to the safetensors slices BEFORE the
+                    # file closes so the mmap region has no live
+                    # tensors when posix_fadvise runs.
+                    shard_state_dict.clear()
+                    del shard_state_dict
+        finally:
+            _drop_file_page_cache(file)
+            gc.collect()
 
     return _merge_loading_infos(model, per_shard_infos, expected_keys), disk_offload_index
 
@@ -1044,91 +1108,102 @@ def _build_routed_load_pretrained_model(original):
 def apply_integrated_gpu_loader_patches() -> bool:
     """Idempotently install the routed wrappers when the gate fires.
 
-    Safe to call multiple times. Patch A (``_get_device_map``) is checked
-    and re-armed on every call; the ``_PATCH_FLAG_ATTR`` flag on
-    ``PreTrainedModel`` only short-circuits Patch B
-    (``_load_pretrained_model``). This split matters after a third-party
-    ``importlib.reload(transformers.integrations.accelerate)`` resets the
-    ``_get_device_map`` symbol -- re-invoking this function re-arms Patch
-    A even if PreTrainedModel still carries the stale flag from a prior
-    install. Reloading ``transformers.modeling_utils`` produces a fresh
-    ``PreTrainedModel`` class, so the flag is False on it and Patch B is
-    re-installed normally.
+    Safe to call multiple times. Patch A (``_get_device_map``) is
+    re-armed whenever ``accel_int._get_device_map`` lacks the
+    ``_is_unsloth_routed`` marker (e.g. after ``importlib.reload``);
+    the ``mu._get_device_map`` rebind is unconditional. Patch B
+    (``_load_pretrained_model``) is gated by ``_PATCH_FLAG_ATTR`` on
+    ``PreTrainedModel`` and a per-binding ``_is_unsloth_routed``
+    marker; reloading ``transformers.modeling_utils`` produces a
+    fresh class with the flag absent, so re-installation runs again.
+
+    Concurrent callers are serialised by ``_INSTALL_LOCK`` so two
+    threads cannot both pass the marker check and double-wrap.
     """
-    if not _should_patch():
-        return False
+    with _INSTALL_LOCK:
+        if not _should_patch():
+            return False
 
-    try:
-        import transformers
-        import transformers.integrations.accelerate as accel_int
-        import transformers.modeling_utils as mu
-    except Exception as exc:
-        logger.debug("integrated_gpu_loader: transformers import failed: %s", exc)
-        return False
-
-    # Warn loudly if the user forced patches on via the override despite
-    # being on a real discrete GPU. The streaming path is correct on dGPU
-    # but slower than upstream's caching_allocator_warmup; Patch A's
-    # multi-GPU branch sets max_memory["cpu"]=0 which silently breaks
-    # legitimate auto/balanced placements that include host-RAM offload.
-    if _integrated_gpu_override() is True and not _detect_integrated_gpu():
         try:
-            import torch
-            n = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        except Exception:
-            n = 0
-        logger.warning(
-            "Unsloth: integrated_gpu_loader patches FORCED on by "
-            "UNSLOTH_INTEGRATED_GPU_LOADER=1 even though this device is NOT "
-            "integrated (visible_cuda_devices=%d). The patches are designed "
-            "for unified-memory hosts (NVIDIA GB10 / Spark). On a real "
-            "discrete GPU the streaming loader works but is slower than the "
-            "original; Patch A's max_memory['cpu']=0 will also override any "
-            "legitimate CPU-offload device_map='auto' you may want. Unset "
-            "the env var to gate off automatically.",
-            n,
-        )
-
-    # Patch A is checked FIRST and idempotently re-armed every call. The
-    # _PATCH_FLAG_ATTR on PreTrainedModel guards Patch B only -- if a
-    # third party reloads transformers.integrations.accelerate, the flag
-    # would otherwise short-circuit re-arming Patch A.
-    if not getattr(accel_int._get_device_map, "_is_unsloth_routed", False):
-        accel_int._get_device_map = _build_routed_get_device_map(
-            accel_int._get_device_map
-        )
-    # transformers/modeling_utils.py imports the symbol locally at module
-    # load (5.5.0 line ~4113). ALWAYS rebind ``mu._get_device_map`` to
-    # the current ``accel_int._get_device_map`` -- not just when mu's
-    # binding lacks ``_is_unsloth_routed``. Otherwise after
-    # ``importlib.reload(transformers.integrations.accelerate)`` we
-    # could end up with mu pointing at a stale routed closure that
-    # closes over the OLD original, while accel_int has the new wrapper
-    # closing over the new original.
-    if hasattr(mu, "_get_device_map"):
-        mu._get_device_map = accel_int._get_device_map
-
-    # Patch B: skip only if the model class itself has been flagged.
-    # Re-arm if PreTrainedModel was reloaded (fresh class -> fresh attr).
-    if getattr(mu.PreTrainedModel, _PATCH_FLAG_ATTR, False):
-        return True
-
-    if not getattr(
-        mu.PreTrainedModel._load_pretrained_model, "_is_unsloth_routed", False
-    ):
-        mu.PreTrainedModel._load_pretrained_model = (
-            _build_routed_load_pretrained_model(
-                mu.PreTrainedModel._load_pretrained_model
+            import transformers
+            import transformers.integrations.accelerate as accel_int
+            import transformers.modeling_utils as mu
+        except Exception as exc:
+            logger.debug(
+                "integrated_gpu_loader: transformers import failed: %s", exc
             )
+            return False
+
+        # Warn loudly if the user forced patches on via the override
+        # despite being on a real discrete GPU. The streaming path is
+        # correct on dGPU but slower than upstream's
+        # caching_allocator_warmup; Patch A's multi-GPU branch forces
+        # ``max_memory["cpu"]=0`` which on a real dGPU silently breaks
+        # legitimate auto/balanced placements that include host-RAM
+        # offload.
+        if _integrated_gpu_override() is True and not _detect_integrated_gpu():
+            try:
+                import torch
+                n = torch.cuda.device_count() if torch.cuda.is_available() else 0
+            except Exception:
+                n = 0
+            logger.warning(
+                "Unsloth: integrated_gpu_loader patches FORCED on by "
+                "UNSLOTH_INTEGRATED_GPU_LOADER=1 even though this device is NOT "
+                "integrated (visible_cuda_devices=%d). The patches are designed "
+                "for unified-memory hosts (NVIDIA GB10 / Spark). On a real "
+                "discrete GPU the streaming loader works but is slower than the "
+                "original; Patch A's max_memory['cpu']=0 will also override any "
+                "legitimate CPU-offload device_map='auto' you may want. Unset "
+                "the env var to gate off automatically.",
+                n,
+            )
+
+        # Patch A: re-arm only when the marker is missing. The
+        # ``_PATCH_FLAG_ATTR`` on PreTrainedModel guards Patch B only;
+        # the device-map wrapper has its own marker so a third-party
+        # reload of ``transformers.integrations.accelerate`` re-arms
+        # without touching Patch B's flag.
+        if not getattr(accel_int._get_device_map, "_is_unsloth_routed", False):
+            accel_int._get_device_map = _build_routed_get_device_map(
+                accel_int._get_device_map
+            )
+        # ``transformers.modeling_utils`` imports ``_get_device_map``
+        # locally at module load. ALWAYS rebind ``mu._get_device_map``
+        # to the current ``accel_int._get_device_map`` -- not just when
+        # mu's binding lacks ``_is_unsloth_routed``. Otherwise after
+        # ``importlib.reload(transformers.integrations.accelerate)`` we
+        # could end up with mu pointing at a stale routed closure that
+        # closes over the OLD original, while accel_int has the new
+        # wrapper closing over the new original.
+        if hasattr(mu, "_get_device_map"):
+            mu._get_device_map = accel_int._get_device_map
+
+        # Patch B is gated by both the class-level _PATCH_FLAG_ATTR
+        # (below) and the per-binding _is_unsloth_routed marker (the
+        # check that follows). The redundancy survives a partial reload
+        # that clears one but not the other.
+        if getattr(mu.PreTrainedModel, _PATCH_FLAG_ATTR, False):
+            return True
+
+        if not getattr(
+            mu.PreTrainedModel._load_pretrained_model,
+            "_is_unsloth_routed",
+            False,
+        ):
+            mu.PreTrainedModel._load_pretrained_model = (
+                _build_routed_load_pretrained_model(
+                    mu.PreTrainedModel._load_pretrained_model
+                )
+            )
+
+        setattr(mu.PreTrainedModel, _PATCH_FLAG_ATTR, True)
+
+        logger.info(
+            "Unsloth: installed integrated-GPU loader patches "
+            "(transformers=%s, detected_integrated=%s, override=%r)",
+            transformers.__version__,
+            _detect_integrated_gpu(),
+            _integrated_gpu_override(),
         )
-
-    setattr(mu.PreTrainedModel, _PATCH_FLAG_ATTR, True)
-
-    logger.info(
-        "Unsloth: installed integrated-GPU loader patches "
-        "(transformers=%s, detected_integrated=%s, override=%r)",
-        transformers.__version__,
-        _detect_integrated_gpu(),
-        _integrated_gpu_override(),
-    )
-    return True
+        return True

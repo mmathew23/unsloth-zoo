@@ -317,7 +317,14 @@ except:
 try:
     from .integrated_gpu_loader import apply_integrated_gpu_loader_patches
     apply_integrated_gpu_loader_patches()
-except Exception:
-    pass
+except Exception as _igl_install_exc:
+    import logging as _logging
+    _logging.getLogger("unsloth_zoo.integrated_gpu_loader").debug(
+        "integrated_gpu_loader install failed: %r",
+        _igl_install_exc,
+        exc_info=True,
+    )
+    del _logging
+    del _igl_install_exc
 
 del os, warnings, re
