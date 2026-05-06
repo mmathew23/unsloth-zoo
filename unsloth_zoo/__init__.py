@@ -345,4 +345,23 @@ if not _SKIP_GPU_INIT:
     except:
         pass
 
+    # Install integrated-GPU loader patches for transformers >= 5.5.0 on
+    # unified-memory devices (Spark / GB10 / is_integrated=1). No-ops on
+    # discrete GPUs and on transformers < 5.5.0. GPU-only — never runs in
+    # MLX / Apple Silicon mode (gated by the surrounding _SKIP_GPU_INIT
+    # block). See unsloth_zoo/integrated_gpu_loader.py for the full
+    # rationale.
+    try:
+        from .integrated_gpu_loader import apply_integrated_gpu_loader_patches
+        apply_integrated_gpu_loader_patches()
+    except Exception as _igl_install_exc:
+        import logging as _logging
+        _logging.getLogger("unsloth_zoo.integrated_gpu_loader").debug(
+            "integrated_gpu_loader install failed: %r",
+            _igl_install_exc,
+            exc_info=True,
+        )
+        del _logging
+        del _igl_install_exc
+
     del os, warnings, re
