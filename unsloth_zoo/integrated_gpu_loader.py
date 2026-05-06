@@ -20,13 +20,6 @@ Wraps two transformers symbols when running on an integrated-memory GPU
 (NVIDIA GB10 / Spark, where ``torch.cuda.get_device_properties(0).is_integrated == 1``)
 and transformers >= ``_MIN_VERSION``:
 
-* ``transformers.integrations.accelerate._get_device_map`` — coerce
-  string device_maps so ``infer_auto_device_map`` doesn't scatter modules
-  to ``"cpu"`` (which on unified memory is the same pool the GPUs see).
-* ``transformers.modeling_utils.PreTrainedModel._load_pretrained_model``
-  — stream pre-quantized safetensors shards one at a time instead of
-  pre-allocating the full footprint and mmap'ing every shard upfront.
-
 Design constraints:
   * Patch ONLY when the hardware/env/version gates pass.
   * NEVER fall back to the original loader after possible model mutation.
@@ -35,10 +28,8 @@ Design constraints:
 
 Override the auto-detection with ``UNSLOTH_INTEGRATED_GPU_LOADER=1``
 (force on) or ``=0`` (force off).
-
-Background, regressions, and empirical results: see
-``docs/integrated_gpu_loader.md``.
 """
+
 from __future__ import annotations
 
 import functools
@@ -70,6 +61,7 @@ _INSTALL_LOCK = threading.Lock()
 # not exist in the child, so the lock would otherwise stay locked
 # forever.
 if hasattr(os, "register_at_fork"):
+
     def _reset_install_lock_after_fork() -> None:
         global _INSTALL_LOCK
         _INSTALL_LOCK = threading.Lock()
@@ -100,49 +92,59 @@ _LOAD_PRETRAINED_MODEL_PARAMS = (
     "expected_keys",
 )
 
-_CONVERT_AND_LOAD_REQUIRED_KWARGS = frozenset({
-    "model",
-    "state_dict",
-    "load_config",
-    "tp_plan",
-    "disk_offload_index",
-})
+_CONVERT_AND_LOAD_REQUIRED_KWARGS = frozenset(
+    {
+        "model",
+        "state_dict",
+        "load_config",
+        "tp_plan",
+        "disk_offload_index",
+    }
+)
 
-_GET_DEVICE_MAP_REQUIRED_KWARGS = frozenset({
-    "model",
-    "device_map",
-    "max_memory",
-    "hf_quantizer",
-})
+_GET_DEVICE_MAP_REQUIRED_KWARGS = frozenset(
+    {
+        "model",
+        "device_map",
+        "max_memory",
+        "hf_quantizer",
+    }
+)
 
-_LOAD_STATE_DICT_INFO_FIELDS = frozenset({
-    "missing_keys",
-    "unexpected_keys",
-    "mismatched_keys",
-    "error_msgs",
-    "conversion_errors",
-})
+_LOAD_STATE_DICT_INFO_FIELDS = frozenset(
+    {
+        "missing_keys",
+        "unexpected_keys",
+        "mismatched_keys",
+        "error_msgs",
+        "conversion_errors",
+    }
+)
 
-_LOAD_STATE_DICT_CONFIG_FIELDS = frozenset({
-    "device_map",
-    "disable_mmap",
-    "weights_only",
-    "hf_quantizer",
-    "weight_mapping",
-    "sharded_metadata",
-    "disk_offload_folder",
-    "dtype",
-})
+_LOAD_STATE_DICT_CONFIG_FIELDS = frozenset(
+    {
+        "device_map",
+        "disable_mmap",
+        "weights_only",
+        "hf_quantizer",
+        "weight_mapping",
+        "sharded_metadata",
+        "disk_offload_folder",
+        "dtype",
+    }
+)
 
-_ACCELERATE_DISK_OFFLOAD_REQUIRED_KWARGS = frozenset({
-    "model",
-    "disk_offload_folder",
-    "checkpoint_files",
-    "device_map",
-    "sharded_metadata",
-    "dtype",
-    "weight_mapping",
-})
+_ACCELERATE_DISK_OFFLOAD_REQUIRED_KWARGS = frozenset(
+    {
+        "model",
+        "disk_offload_folder",
+        "checkpoint_files",
+        "device_map",
+        "sharded_metadata",
+        "dtype",
+        "weight_mapping",
+    }
+)
 
 _STRING_DEVICE_MAPS = ("auto", "sequential", "balanced", "balanced_low_0")
 
@@ -202,8 +204,6 @@ def _detect_integrated_gpu(index: int = 0) -> bool:
 
 
 def _is_integrated_gpu(index: int = 0) -> bool:
-    """Composed gate used everywhere internally: env override wins, else
-    hardware detection."""
     override = _integrated_gpu_override()
     if override is not None:
         return override
@@ -211,10 +211,6 @@ def _is_integrated_gpu(index: int = 0) -> bool:
 
 
 def _transformers_at_least_min() -> tuple[bool, str]:
-    """``(ok, reason)`` for transformers >= ``_MIN_VERSION``. ``reason`` is
-    populated when the version probe itself fails (missing
-    ``packaging``, missing metadata) so ``_should_patch`` can log a
-    breadcrumb instead of failing silently."""
     try:
         from importlib.metadata import version
 
@@ -233,9 +229,7 @@ def _transformers_at_least_min() -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
-def _signature_has_leading_params(
-    fn, expected: tuple[str, ...]
-) -> tuple[bool, str]:
+def _signature_has_leading_params(fn, expected: tuple[str, ...]) -> tuple[bool, str]:
     """``fn``'s first ``len(expected)`` params must equal ``expected`` in
     order, AND every param after that must have a default. We re-call
     ``fn`` positionally with ``len(expected)`` args, so trailing
@@ -295,9 +289,7 @@ def _signature_accepts_kwargs(fn, required: frozenset[str]) -> tuple[bool, str]:
     except (TypeError, ValueError) as exc:
         return False, f"{fn!r} not introspectable: {exc!r}"
 
-    has_varkw = any(
-        p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
-    )
+    has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
     # 1) positional-only blockers: required names that cannot be passed
     #    by name, AND positional-only params with no default that we'd
@@ -348,7 +340,6 @@ def _signature_accepts_kwargs(fn, required: frozenset[str]) -> tuple[bool, str]:
 
 
 def _dataclass_has_fields(cls, required: frozenset[str]) -> tuple[bool, str]:
-    """``cls`` must be a dataclass with every name in ``required`` as a field."""
     fields_attr = getattr(cls, "__dataclass_fields__", None)
     if fields_attr is None:
         return False, f"{cls.__name__} is no longer a dataclass"
@@ -360,8 +351,6 @@ def _dataclass_has_fields(cls, required: frozenset[str]) -> tuple[bool, str]:
 
 
 def _check_symbols() -> tuple[bool, str]:
-    """Verify every transformers symbol/signature we depend on. Returns
-    ``(ok, reason)``; ``reason`` is empty on success."""
     try:
         from safetensors import safe_open  # noqa: F401
         from transformers.core_model_loading import (  # noqa: F401
@@ -446,9 +435,7 @@ def _should_patch() -> bool:
         return False
     ok, reason = _transformers_at_least_min()
     if not ok:
-        logger.debug(
-            "Unsloth: integrated_gpu_loader will NOT patch (%s).", reason
-        )
+        logger.debug("Unsloth: integrated_gpu_loader will NOT patch (%s).", reason)
         return False
     ok, reason = _check_symbols()
     if not ok:
@@ -476,9 +463,6 @@ def _is_safetensors_file(path: Any) -> bool:
 
 
 def _as_set(value: Any) -> set:
-    """Defensive set() wrapper — tolerates None and arbitrary iterables.
-    Used to normalize ``LoadStateDictInfo`` set-like fields whose runtime
-    type isn't strictly guaranteed by the upstream contract."""
     return set(value or ())
 
 
@@ -807,10 +791,6 @@ def _convert_one_shard(
     disk_offload_index,
     mutation_state: _StreamingMutationState,
 ):
-    """Single-shard ``convert_and_load_state_dict_in_model`` with mutation
-    bookkeeping. Marks ``model_mutation_started`` BEFORE the call so a
-    raise mid-conversion correctly disables the unsafe original-loader
-    fallback. Increments ``shards_completed`` on success."""
     from transformers.core_model_loading import convert_and_load_state_dict_in_model
 
     mutation_state.mark_model_mutation_started()
@@ -959,7 +939,9 @@ def _streaming_load_pretrained_model(
             per_shard_infos.append(li)
             del shard_state_dict
             gc.collect()
-        return _merge_loading_infos(model, per_shard_infos, expected_keys), disk_offload_index
+        return _merge_loading_infos(
+            model, per_shard_infos, expected_keys
+        ), disk_offload_index
 
     # safetensors path. Branch on disable_mmap / hf-mount: when either is
     # true, the original loader reads the file into memory via
@@ -1016,7 +998,9 @@ def _streaming_load_pretrained_model(
             _drop_file_page_cache(file)
             gc.collect()
 
-    return _merge_loading_infos(model, per_shard_infos, expected_keys), disk_offload_index
+    return _merge_loading_infos(
+        model, per_shard_infos, expected_keys
+    ), disk_offload_index
 
 
 def _streaming_decline_reason(load_config) -> str | None:
@@ -1108,15 +1092,6 @@ def _build_routed_load_pretrained_model(original):
 def apply_integrated_gpu_loader_patches() -> bool:
     """Idempotently install the routed wrappers when the gate fires.
 
-    Safe to call multiple times. Patch A (``_get_device_map``) is
-    re-armed whenever ``accel_int._get_device_map`` lacks the
-    ``_is_unsloth_routed`` marker (e.g. after ``importlib.reload``);
-    the ``mu._get_device_map`` rebind is unconditional. Patch B
-    (``_load_pretrained_model``) is gated by ``_PATCH_FLAG_ATTR`` on
-    ``PreTrainedModel`` and a per-binding ``_is_unsloth_routed``
-    marker; reloading ``transformers.modeling_utils`` produces a
-    fresh class with the flag absent, so re-installation runs again.
-
     Concurrent callers are serialised by ``_INSTALL_LOCK`` so two
     threads cannot both pass the marker check and double-wrap.
     """
@@ -1129,9 +1104,7 @@ def apply_integrated_gpu_loader_patches() -> bool:
             import transformers.integrations.accelerate as accel_int
             import transformers.modeling_utils as mu
         except Exception as exc:
-            logger.debug(
-                "integrated_gpu_loader: transformers import failed: %s", exc
-            )
+            logger.debug("integrated_gpu_loader: transformers import failed: %s", exc)
             return False
 
         # Warn loudly if the user forced patches on via the override
@@ -1144,6 +1117,7 @@ def apply_integrated_gpu_loader_patches() -> bool:
         if _integrated_gpu_override() is True and not _detect_integrated_gpu():
             try:
                 import torch
+
                 n = torch.cuda.device_count() if torch.cuda.is_available() else 0
             except Exception:
                 n = 0
