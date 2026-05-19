@@ -46,6 +46,8 @@ __all__ = [
     "UnslothGradientCheckpointer",
     "resolve_sac_context_fn",
     "set_sac_policy",
+    "get_sac_stats",
+    "reset_sac_stats",
     "resolve_gc_offload_backend",
     "set_offload_backend",
     "_bind_gradient_checkpointing_func",
@@ -76,6 +78,36 @@ except ImportError:
 # Op sets are resolved lazily on first SAC use, not at import time.
 _SAC_ATTENTION_OPS = None
 _SAC_MATMUL_OPS = None
+_SAC_ADD_OPS = None
+_SAC_STATS = {
+    "calls": 0,
+    "must_save": 0,
+    "prefer_save": 0,
+    "must_cpu_offload": 0,
+    "prefer_cpu_offload": 0,
+    "prefer_recompute": 0,
+    "ops": {},
+    "phases": {
+        "forward": {
+            "calls": 0,
+            "must_save": 0,
+            "prefer_save": 0,
+            "must_cpu_offload": 0,
+            "prefer_cpu_offload": 0,
+            "prefer_recompute": 0,
+            "ops": {},
+        },
+        "recompute": {
+            "calls": 0,
+            "must_save": 0,
+            "prefer_save": 0,
+            "must_cpu_offload": 0,
+            "prefer_cpu_offload": 0,
+            "prefer_recompute": 0,
+            "ops": {},
+        },
+    },
+}
 _GC_OFFLOAD_BACKENDS = {
     "unsloth_original",
     "unsloth_stream",
@@ -162,9 +194,86 @@ def _try_resolve_op(name):
         return None
 
 
+def _sac_profile_enabled():
+    return str(os.environ.get("UNSLOTH_SAC_PROFILE", "0")).strip().lower() not in (
+        "0", "false", "no", "off", ""
+    )
+
+
+def _record_sac_policy_decision(ctx, op, decision):
+    if not _sac_profile_enabled():
+        return
+    phase = "recompute" if getattr(ctx, "is_recompute", False) else "forward"
+    phase_stats = _SAC_STATS["phases"][phase]
+    _SAC_STATS["calls"] += 1
+    phase_stats["calls"] += 1
+    if decision == CheckpointPolicy.MUST_SAVE:
+        _SAC_STATS["must_save"] += 1
+        phase_stats["must_save"] += 1
+    elif decision == CheckpointPolicy.PREFER_SAVE:
+        _SAC_STATS["prefer_save"] += 1
+        phase_stats["prefer_save"] += 1
+    elif decision == CheckpointPolicy.MUST_CPU_OFFLOAD:
+        _SAC_STATS["must_cpu_offload"] += 1
+        phase_stats["must_cpu_offload"] += 1
+    elif decision == CheckpointPolicy.PREFER_CPU_OFFLOAD:
+        _SAC_STATS["prefer_cpu_offload"] += 1
+        phase_stats["prefer_cpu_offload"] += 1
+    else:
+        _SAC_STATS["prefer_recompute"] += 1
+        phase_stats["prefer_recompute"] += 1
+    name = str(op)
+    ops = _SAC_STATS["ops"]
+    ops[name] = ops.get(name, 0) + 1
+    phase_ops = phase_stats["ops"]
+    phase_ops[name] = phase_ops.get(name, 0) + 1
+
+
+def reset_sac_stats():
+    _SAC_STATS["calls"] = 0
+    _SAC_STATS["must_save"] = 0
+    _SAC_STATS["prefer_save"] = 0
+    _SAC_STATS["must_cpu_offload"] = 0
+    _SAC_STATS["prefer_cpu_offload"] = 0
+    _SAC_STATS["prefer_recompute"] = 0
+    _SAC_STATS["ops"] = {}
+    for phase_stats in _SAC_STATS["phases"].values():
+        phase_stats["calls"] = 0
+        phase_stats["must_save"] = 0
+        phase_stats["prefer_save"] = 0
+        phase_stats["must_cpu_offload"] = 0
+        phase_stats["prefer_cpu_offload"] = 0
+        phase_stats["prefer_recompute"] = 0
+        phase_stats["ops"] = {}
+
+
+def get_sac_stats():
+    return {
+        "calls": int(_SAC_STATS["calls"]),
+        "must_save": int(_SAC_STATS["must_save"]),
+        "prefer_save": int(_SAC_STATS["prefer_save"]),
+        "must_cpu_offload": int(_SAC_STATS["must_cpu_offload"]),
+        "prefer_cpu_offload": int(_SAC_STATS["prefer_cpu_offload"]),
+        "prefer_recompute": int(_SAC_STATS["prefer_recompute"]),
+        "ops": dict(_SAC_STATS["ops"]),
+        "phases": {
+            phase: {
+                "calls": int(stats["calls"]),
+                "must_save": int(stats["must_save"]),
+                "prefer_save": int(stats["prefer_save"]),
+                "must_cpu_offload": int(stats["must_cpu_offload"]),
+                "prefer_cpu_offload": int(stats["prefer_cpu_offload"]),
+                "prefer_recompute": int(stats["prefer_recompute"]),
+                "ops": dict(stats["ops"]),
+            }
+            for phase, stats in _SAC_STATS["phases"].items()
+        },
+    }
+
+
 def _ensure_sac_ops():
     """Lazily resolve op handles on first use."""
-    global _SAC_ATTENTION_OPS, _SAC_MATMUL_OPS
+    global _SAC_ATTENTION_OPS, _SAC_MATMUL_OPS, _SAC_ADD_OPS
     if _SAC_ATTENTION_OPS is not None:
         return
 
@@ -184,29 +293,174 @@ def _ensure_sac_ops():
     _SAC_MATMUL_OPS = set()
     for op_name in (
         "aten.mm.default",
+        "aten.mm.out",
         "aten.bmm.default",
+        "aten.bmm.out",
         "aten.addmm.default",
+        "aten.addmm.out",
     ):
         op = _try_resolve_op(op_name)
         if op is not None:
             _SAC_MATMUL_OPS.add(op)
 
+    _SAC_ADD_OPS = set()
+    for op_name in (
+        "aten.add.Tensor",
+    ):
+        op = _try_resolve_op(op_name)
+        if op is not None:
+            _SAC_ADD_OPS.add(op)
+
 
 def _sac_policy_attn_only(ctx, op, *args, **kwargs):
     if op in _SAC_ATTENTION_OPS:
-        return CheckpointPolicy.MUST_SAVE
-    return CheckpointPolicy.PREFER_RECOMPUTE
+        decision = CheckpointPolicy.MUST_SAVE
+    else:
+        decision = CheckpointPolicy.PREFER_RECOMPUTE
+    _record_sac_policy_decision(ctx, op, decision)
+    return decision
+
+
+def _sac_policy_attn_prefer_save(ctx, op, *args, **kwargs):
+    if op in _SAC_ATTENTION_OPS:
+        decision = CheckpointPolicy.PREFER_SAVE
+    else:
+        decision = CheckpointPolicy.PREFER_RECOMPUTE
+    _record_sac_policy_decision(ctx, op, decision)
+    return decision
+
+
+def _sac_policy_attn_must_save_budget(ctx, op, *args, **kwargs):
+    if op in _SAC_ATTENTION_OPS:
+        decision = CheckpointPolicy.MUST_SAVE
+    else:
+        # Under torch.compile, PREFER_SAVE can still be overridden by the
+        # AOTAutograd activation memory budget. PREFER_RECOMPUTE is treated by
+        # this runtime's partitioner as forced recompute, which is too strong
+        # for budgeted SAC.
+        decision = CheckpointPolicy.PREFER_SAVE
+    _record_sac_policy_decision(ctx, op, decision)
+    return decision
+
+
+def _sac_policy_budget_only(ctx, op, *args, **kwargs):
+    decision = CheckpointPolicy.PREFER_SAVE
+    _record_sac_policy_decision(ctx, op, decision)
+    return decision
+
+
+def _sac_policy_small_matmul_must_save_budget(ctx, op, *args, **kwargs):
+    max_out_features = int(os.environ.get("UNSLOTH_SAC_MATMUL_MAX_OUT_FEATURES", "4096"))
+    save_matmul = False
+    if op in _SAC_MATMUL_OPS:
+        out_features = _matmul_output_features(op, args, kwargs)
+        save_matmul = out_features is not None and out_features <= max_out_features
+    if save_matmul:
+        decision = CheckpointPolicy.MUST_SAVE
+    else:
+        decision = CheckpointPolicy.PREFER_SAVE
+    _record_sac_policy_decision(ctx, op, decision)
+    return decision
+
+
+def _sac_policy_attn_and_small_matmul_must_save_budget(ctx, op, *args, **kwargs):
+    max_out_features = int(os.environ.get("UNSLOTH_SAC_MATMUL_MAX_OUT_FEATURES", "4096"))
+    save_matmul = False
+    if op in _SAC_MATMUL_OPS:
+        out_features = _matmul_output_features(op, args, kwargs)
+        save_matmul = out_features is not None and out_features <= max_out_features
+    if op in _SAC_ATTENTION_OPS or save_matmul:
+        decision = CheckpointPolicy.MUST_SAVE
+    else:
+        decision = CheckpointPolicy.PREFER_SAVE
+    _record_sac_policy_decision(ctx, op, decision)
+    return decision
+
+
+def _sac_policy_attn_cpu_offload(ctx, op, *args, **kwargs):
+    if op in _SAC_ATTENTION_OPS:
+        decision = CheckpointPolicy.MUST_CPU_OFFLOAD
+    else:
+        decision = CheckpointPolicy.PREFER_RECOMPUTE
+    _record_sac_policy_decision(ctx, op, decision)
+    return decision
+
+
+def _sac_policy_attn_prefer_cpu_offload(ctx, op, *args, **kwargs):
+    if op in _SAC_ATTENTION_OPS:
+        decision = CheckpointPolicy.PREFER_CPU_OFFLOAD
+    else:
+        decision = CheckpointPolicy.PREFER_RECOMPUTE
+    _record_sac_policy_decision(ctx, op, decision)
+    return decision
+
+
+def _sac_policy_attn_and_add(ctx, op, *args, **kwargs):
+    if op in _SAC_ATTENTION_OPS or op in _SAC_ADD_OPS:
+        decision = CheckpointPolicy.MUST_SAVE
+    else:
+        decision = CheckpointPolicy.PREFER_RECOMPUTE
+    _record_sac_policy_decision(ctx, op, decision)
+    return decision
 
 
 def _sac_policy_attn_and_matmul(ctx, op, *args, **kwargs):
     if op in _SAC_ATTENTION_OPS or op in _SAC_MATMUL_OPS:
-        return CheckpointPolicy.MUST_SAVE
-    return CheckpointPolicy.PREFER_RECOMPUTE
+        decision = CheckpointPolicy.MUST_SAVE
+    else:
+        decision = CheckpointPolicy.PREFER_RECOMPUTE
+    _record_sac_policy_decision(ctx, op, decision)
+    return decision
+
+
+def _matmul_output_features(op, args, kwargs):
+    try:
+        if op is _try_resolve_op("aten.mm.default"):
+            return int(args[1].shape[-1])
+        if op is _try_resolve_op("aten.mm.out"):
+            out = kwargs.get("out") if kwargs else None
+            return int(out.shape[-1]) if out is not None else int(args[1].shape[-1])
+        if op is _try_resolve_op("aten.bmm.default"):
+            return int(args[1].shape[-1])
+        if op is _try_resolve_op("aten.bmm.out"):
+            out = kwargs.get("out") if kwargs else None
+            return int(out.shape[-1]) if out is not None else int(args[1].shape[-1])
+        if op is _try_resolve_op("aten.addmm.default"):
+            return int(args[2].shape[-1])
+        if op is _try_resolve_op("aten.addmm.out"):
+            out = kwargs.get("out") if kwargs else None
+            return int(out.shape[-1]) if out is not None else int(args[2].shape[-1])
+    except Exception:
+        return None
+    return None
+
+
+def _sac_policy_attn_and_small_matmul(ctx, op, *args, **kwargs):
+    max_out_features = int(os.environ.get("UNSLOTH_SAC_MATMUL_MAX_OUT_FEATURES", "4096"))
+    save_matmul = False
+    if op in _SAC_MATMUL_OPS:
+        out_features = _matmul_output_features(op, args, kwargs)
+        save_matmul = out_features is not None and out_features <= max_out_features
+    if op in _SAC_ATTENTION_OPS or save_matmul:
+        decision = CheckpointPolicy.MUST_SAVE
+    else:
+        decision = CheckpointPolicy.PREFER_RECOMPUTE
+    _record_sac_policy_decision(ctx, op, decision)
+    return decision
 
 
 _SAC_PRESETS = {
     "attn_only": _sac_policy_attn_only,
+    "attn_prefer_save": _sac_policy_attn_prefer_save,
+    "attn_must_save_budget": _sac_policy_attn_must_save_budget,
+    "budget_only": _sac_policy_budget_only,
+    "small_matmul_must_save_budget": _sac_policy_small_matmul_must_save_budget,
+    "attn_and_small_matmul_must_save_budget": _sac_policy_attn_and_small_matmul_must_save_budget,
+    "attn_cpu_offload": _sac_policy_attn_cpu_offload,
+    "attn_prefer_cpu_offload": _sac_policy_attn_prefer_cpu_offload,
+    "attn_and_add": _sac_policy_attn_and_add,
     "attn_and_matmul": _sac_policy_attn_and_matmul,
+    "attn_and_small_matmul": _sac_policy_attn_and_small_matmul,
 }
 
 
@@ -216,7 +470,9 @@ def resolve_sac_context_fn(policy):
     Args:
         policy: One of:
             - None → no SAC (returns None)
-            - str  → preset name ("attn_only", "attn_and_matmul")
+            - str  → preset name ("attn_only", "attn_prefer_save",
+              "attn_cpu_offload", "attn_prefer_cpu_offload",
+              "attn_and_add", "attn_and_matmul")
             - list of OpOverloads → ops whose outputs to save
             - callable(ctx, op, *args, **kwargs) → CheckpointPolicy
 
@@ -235,6 +491,13 @@ def resolve_sac_context_fn(policy):
 
     _ensure_sac_ops()
 
+    allow_cache_entry_mutation = None
+    env_allow_mutation = os.environ.get("UNSLOTH_SAC_ALLOW_CACHE_ENTRY_MUTATION")
+    if env_allow_mutation is not None:
+        allow_cache_entry_mutation = str(env_allow_mutation).strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+
     if isinstance(policy, str):
         if policy not in _SAC_PRESETS:
             raise ValueError(
@@ -242,6 +505,10 @@ def resolve_sac_context_fn(policy):
                 f"Available: {list(_SAC_PRESETS.keys())}"
             )
         policy_fn = _SAC_PRESETS[policy]
+        if allow_cache_entry_mutation is None:
+            # Inductor commonly lowers matmuls to `aten.mm.out`; PyTorch SAC
+            # otherwise rejects those saved outputs as mutated cache entries.
+            allow_cache_entry_mutation = policy == "attn_and_matmul"
     elif isinstance(policy, (list, tuple, set)):
         save_ops = set(policy)
         def policy_fn(ctx, op, *args, **kwargs):
@@ -255,8 +522,14 @@ def resolve_sac_context_fn(policy):
             "Unsloth: sac_policy must be None, a string, a list of ops, "
             f"or a callable, got {type(policy).__name__}"
         )
+    if allow_cache_entry_mutation is None:
+        allow_cache_entry_mutation = False
 
-    return functools.partial(create_selective_checkpoint_contexts, policy_fn)
+    return functools.partial(
+        create_selective_checkpoint_contexts,
+        policy_fn,
+        allow_cache_entry_mutation=allow_cache_entry_mutation,
+    )
 
 
 # Useful for more than just SAC
